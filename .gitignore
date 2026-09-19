@@ -1,0 +1,11 @@
+dist/
+node_modules/
+.env
+.env.*
+__*
+*/dist
+*/node_modules
+*/.env
+results
+.DS_Store
+*.DS_Store
