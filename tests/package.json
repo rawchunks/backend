@@ -1,0 +1,21 @@
+{
+  "name": "rawchunks-backend-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run --config vitest.config.mts",
+    "test:unit": "vitest run --config vitest.config.mts unit infrastructure/baseline.test.ts",
+    "test:gates": "vitest run --config vitest.config.mts gates infrastructure/readiness.test.ts",
+    "test:stress": "vitest run --config vitest.config.mts stress",
+    "test:live": "vitest run --config vitest.config.mts live",
+    "test:python": ".venv/bin/python -m pytest python -v",
+    "test:coverage": "vitest run --config vitest.config.mts --coverage",
+    "inspect:cluster": "node infrastructure/inspect-cluster.mjs"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.3.14",
+    "@vitest/coverage-v8": "3.2.4",
+    "vitest": "3.2.4",
+    "yaml": "2.8.1"
+  }
+}
