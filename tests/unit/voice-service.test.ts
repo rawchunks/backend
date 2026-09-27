@@ -1,0 +1,117 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../broker/valkey.js',()=>({}));
+vi.mock('../../generation/client.js',()=>({client:{}}));
+vi.mock('../../editing/service.js',()=>({sourceSettings:vi.fn()}));
+import { VoiceService } from '../../voice/service.js';
+import { audio, creator, sha, voiceFixture } from './voice-fixture.js';
+let f:ReturnType<typeof voiceFixture>,service:VoiceService;
+beforeEach(()=>{f=voiceFixture();service=new VoiceService(f.deps as any);});
+describe('voice input and durable registration',()=>{
+ it.each([{audioBuffer:Buffer.alloc(0)},{mimeType:'text/html'},{creator:''},{fileName:'voice.wav/child'},{fileName:''}])('rejects malformed input before storage %j',async extra=>{await expect(service.cloneVoiceFromAudio({...audio,...extra})).rejects.toThrow();expect(f.deps.upload).not.toHaveBeenCalled();});
+ it.each([null,{id:'song',url:''},{id:'song',url:null}])('rejects missing source %j',async source=>{f.deps.getSong.mockResolvedValue(source as any);await expect(service.cloneVoiceFromSong({songId:'song',creator})).rejects.toThrow('not found');});
+ it('requires song ownership before persisting an extraction receipt',async()=>{f.deps.getSong.mockResolvedValue({...await f.deps.getSong(),creator:`0x${'b'.repeat(40)}`});await expect(service.cloneVoiceFromSong({songId:'song',creator})).rejects.toThrow('own');expect(f.rows.size).toBe(0);});
+ it('compensates only a proven unregistered sample after registration failure',async()=>{f.deps.store.createVoiceDeduplicated.mockRejectedValue(new Error('db unavailable'));await expect(service.cloneVoiceFromAudio(audio)).rejects.toThrow('db unavailable');expect(f.deps.remove).toHaveBeenCalledOnce();});
+ it('preserves a committed sample when the registration response is lost',async()=>{f.deps.store.createVoiceDeduplicated.mockImplementation(async row=>{f.rows.set(row.id,row);throw new Error('lost response');});await expect(service.cloneVoiceFromAudio(audio)).rejects.toThrow('lost response');expect(f.deps.remove).not.toHaveBeenCalled();});
+ it('preserves sample when registration state cannot be read',async()=>{f.deps.store.createVoiceDeduplicated.mockRejectedValue(new Error('db unavailable'));f.deps.store.getVoiceById.mockRejectedValue(new Error('read unavailable'));await expect(service.cloneVoiceFromAudio(audio)).rejects.toThrow('db unavailable');expect(f.deps.remove).not.toHaveBeenCalled();});
+ it('normalizes EVM case and preserves explicit names',async()=>{const r=await service.cloneVoiceFromAudio({...audio,creator:creator.toUpperCase().replace('0X','0x'),name:'  Voice  '});expect(r.voice.creator).toBe(creator);expect(r.voice.name).toBe('  Voice  ');});
+ it('does not register a sample after upload failure',async()=>{f.deps.upload.mockRejectedValue(new Error('upload unavailable'));await expect(service.cloneVoiceFromAudio(audio)).rejects.toThrow('upload unavailable');expect(f.rows.size).toBe(0);});
+ it('requires an explicit voice mode and bounded strength',async()=>{const r=await service.cloneVoiceFromAudio(audio);await expect(service.resolveVoice(r.voice.id,'acestep-v15-xl-turbo',undefined as any,.5,creator)).rejects.toThrow('voiceMode');await expect(service.resolveVoice(r.voice.id,'acestep-v15-xl-turbo','reference',Infinity,creator)).rejects.toThrow('strength');});
+});
+
+describe('content aliases retain source recipes', () => {
+ const sourceMetadata = { caption: 'Source vocal', lyrics: '[Verse]\r\nExact words\n[Chorus]\nMore', raw_lyrics: '[Verse]\r\nExact words\n[Chorus]\nMore', bpm: 100, keyscale: 'C major', language: 'en', timesignature: '4', is_instrumental: false };
+ async function sourceAlias() {
+  const canonical = (await service.cloneVoiceFromAudio(audio)).voice;
+  f.deps.songMetadata = async () => sourceMetadata;
+  f.deps.store.listPendingVoices.mockImplementation(async () => [...f.rows.values()].filter(v => !['ready', 'error'].includes(v.status)));
+  service = new VoiceService(f.deps as any);
+  const receipt = (await service.cloneVoiceFromSong({ songId: 'song', creator, name: 'Source variant' })).voice;
+  f.deps.worker.queryResult.mockResolvedValue({ results: { [receipt.task_id!]: { status: 'ready', stems: { vocals: 'https://r2.test/isolated.wav' } } } } as any);
+  await service.reconcile();
+  return { canonical, receipt };
+ }
+ it('retains exact source metadata, distinct catalog IDs and canonical sample bytes after extraction', async () => {
+  const { canonical, receipt } = await sourceAlias();
+  const output = await service.getVoice(receipt.id);
+  expect(output).toMatchObject({ id: receipt.id, canonical_id: canonical.id, name: 'Source variant', sample_url: canonical.sample_url, hash: canonical.hash, metadata: sourceMetadata });
+  const catalog = await service.listVoices(creator);
+  expect(new Set(catalog.map(v => v.id))).toEqual(new Set([canonical.id, receipt.id]));
+  await service.reconcile();
+  expect(f.adapters.size).toBe(4);
+  expect([...f.adapters.values()].filter(a => a.settings.sample_metadata.lyrics === sourceMetadata.lyrics)).toHaveLength(2);
+  expect(f.rows.get(receipt.id).status).toBe('queued');
+  expect(f.deps.upload).toHaveBeenCalledOnce();
+ });
+ it('selects the source recipe for historical ID lookup and retries with its immutable dispatch identity', async () => {
+  const { canonical, receipt } = await sourceAlias();
+  await service.reconcile();
+  const variants = [...f.adapters.values()].filter(a => a.settings.sample_metadata.lyrics === sourceMetadata.lyrics);
+  for (const a of variants) f.adapters.set(a.id, { ...a, status: 'ready', artifact_url: `https://r2.test/${a.id}/manifest.json`, artifact_digest: sha(a.id) });
+  const resolved = await service.resolveVoice(receipt.id, 'acestep-v15-xl-sft', 'trained', .7, creator);
+  expect(resolved.canonicalId).toBe(canonical.id);
+  expect(resolved.adapterId).toBe(variants.find(a => a.model.endsWith('sft'))!.id);
+  await expect(service.resolveVoice(canonical.id, 'acestep-v15-xl-sft', 'trained', .7, creator)).rejects.toThrow('not ready');
+  await expect(service.resolveVoice(receipt.id, 'acestep-v15-xl-sft', 'trained', .7, `0x${'b'.repeat(40)}`)).rejects.toThrow('own');
+  const turbo = variants.find(a => a.model.endsWith('turbo'))!;
+  f.adapters.set(turbo.id, { ...turbo });
+  f.deps.worker.train.mockRejectedValueOnce(new Error('response lost'));
+  await service.reconcile(); await service.reconcile();
+  const calls = f.deps.worker.train.mock.calls.filter(call => call[1].idempotencyKey === turbo.task_id);
+  expect(calls.length).toBeGreaterThan(0);
+  expect(new Set(calls.map(call => call[0].source_audio_url))).toEqual(new Set([canonical.sample_url]));
+  expect(calls.every(call => call[0].sample_metadata.lyrics === sourceMetadata.lyrics)).toBe(true);
+ });
+ it('collapses equivalent source choices but retains original IDs and one shared recipe per model', async () => {
+  const { canonical, receipt } = await sourceAlias();
+  const stored = f.rows.get(receipt.id);
+  f.rows.set('equivalent-source', { ...stored, id: 'equivalent-source', name: 'Other filename', metadata: { ...stored.metadata, source_song_id: 'other-song' } });
+  f.rows.set('equal-upload', { ...f.rows.get(canonical.id), id: 'equal-upload', canonical_id: canonical.id });
+  await service.reconcile();
+  const catalog = await service.listVoices(creator);
+  expect(catalog).toHaveLength(2);
+  expect(catalog.filter(v => v.metadata.lyrics === sourceMetadata.lyrics)).toHaveLength(1);
+  expect(f.adapters.size).toBe(4);
+  expect((await service.getVoice('equivalent-source'))?.metadata.lyrics).toBe(sourceMetadata.lyrics);
+  expect((await service.resolveVoice('equal-upload', 'acestep-v15-xl-turbo', 'reference', .5, creator)).canonicalId).toBe(canonical.id);
+ });
+ it('rejects inherited adapter IDs when their actual conditioning differs', async () => {
+  const { canonical, receipt } = await sourceAlias();
+  const bare = [...f.adapters.values()];
+  for (const adapter of bare) f.adapters.set(adapter.id, { ...adapter, status: 'ready', artifact_url: `https://r2.test/${adapter.id}/manifest.json`, artifact_digest: sha(adapter.id) });
+  const source = f.rows.get(receipt.id);
+  f.rows.set(receipt.id, { ...source, metadata: { ...source.metadata, adapter_ids: f.rows.get(canonical.id).metadata.adapter_ids } });
+  expect((await service.getVoice(receipt.id))?.availability.turbo.status).toBe('unavailable');
+  await expect(service.resolveVoice(receipt.id, 'acestep-v15-xl-turbo', 'trained', .5, creator)).rejects.toThrow('not ready');
+  await service.reconcile();
+  expect(f.rows.get(receipt.id).metadata.adapter_ids).not.toEqual(f.rows.get(canonical.id).metadata.adapter_ids);
+  expect(f.adapters.size).toBe(4);
+ });
+ it('keeps one bare upload variant when a conditioned source registered the canonical sample first', async () => {
+  f.deps.songMetadata = async () => sourceMetadata;
+  f.deps.store.listPendingVoices.mockImplementation(async () => [...f.rows.values()].filter(v => !['ready', 'error'].includes(v.status)));
+  service = new VoiceService(f.deps as any);
+  const source = (await service.cloneVoiceFromSong({ songId: 'song', creator })).voice;
+  f.deps.worker.queryResult.mockResolvedValue({ results: { [source.task_id!]: { status: 'ready', stems: { vocals: 'https://r2.test/isolated.wav' } } } } as any);
+  await service.reconcile(); await service.reconcile();
+  const uploads = await Promise.all(Array.from({ length: 20 }, () => service.cloneVoiceFromAudio(audio)));
+  const upload = uploads[0].voice;
+  expect(new Set(uploads.map(v => v.voice.id)).size).toBe(1);
+  expect(upload.id).not.toBe(source.id);
+  expect(upload).toMatchObject({ canonical_id: source.id, metadata: { source: 'upload' } });
+  expect(upload.metadata.lyrics).toBeUndefined();
+  expect(f.rows.size).toBe(2);
+  expect(f.deps.upload).toHaveBeenCalledOnce();
+  await service.reconcile();
+  expect(f.adapters.size).toBe(4);
+  expect([...f.adapters.values()].filter(a => Object.keys(a.settings.sample_metadata).length === 0)).toHaveLength(2);
+  expect((await service.getVoice(source.id))?.metadata).toMatchObject(sourceMetadata);
+  expect(await service.listVoices(creator)).toHaveLength(2);
+  expect((await service.resolveVoice(upload.id, 'acestep-v15-xl-turbo', 'reference', .5, creator)).canonicalId).toBe(source.id);
+  const register = f.deps.store.createVoiceDeduplicated.getMockImplementation()!;
+  f.deps.store.createVoiceDeduplicated.mockImplementationOnce(async row => { await register(row); throw new Error('lost alias response'); });
+  await expect(service.cloneVoiceFromAudio(audio)).rejects.toThrow('lost alias response');
+  expect((await service.cloneVoiceFromAudio(audio)).voice.id).toBe(upload.id);
+  expect(f.rows.size).toBe(2);
+  expect(f.deps.remove).not.toHaveBeenCalled();
+ });
+});
