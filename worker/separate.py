@@ -1,0 +1,186 @@
+"""Durable queued Demucs separation through the shared GPU executor."""
+from __future__ import annotations
+import asyncio
+import ipaddress
+import http.client
+import os
+import socket
+from socket import getaddrinfo as resolve_host
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Literal, Optional
+from functools import partial
+
+from fastapi import Depends, Header, HTTPException, Request
+from pydantic import BaseModel
+import torch
+import demucs.api
+from acestep.api.gpu import run_gpu
+from acestep.api.jobs.durable import QueueFull
+
+MAX_AUDIO_BYTES = 50 * 1024 * 1024  # Existing API audio upload boundary.
+DOWNLOAD_TIMEOUT_SECONDS = 30  # Network I/O bound, not a GPU job deadline.
+_demucs_separator = None
+
+def get_separator():
+    global _demucs_separator
+    if _demucs_separator is None:
+        _demucs_separator = demucs.api.Separator(model='htdemucs',device='cuda' if torch.cuda.is_available() else 'cpu')
+    return _demucs_separator
+
+class SeparateRequest(BaseModel):
+    src_audio_path: str
+    stem_type: Optional[Literal['all','vocals','drums','bass','other','instrumental']] = 'all'
+    wait: bool = True
+
+def _public_url(src):
+    parsed = urllib.parse.urlsplit(src)
+    if parsed.scheme not in ('http','https') or not parsed.hostname or parsed.username or parsed.password:
+        raise HTTPException(400,'Invalid source audio URL')
+    try:
+        answers = resolve_host(parsed.hostname,parsed.port or (443 if parsed.scheme=='https' else 80),type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise RuntimeError('Source audio host could not be resolved') from exc
+    if not answers or any(not ipaddress.ip_address(item[4][0]).is_global for item in answers):
+        raise HTTPException(403,'Source audio URL must resolve to a public address')
+    return parsed, answers[0][4][0]
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self,request):
+        parsed,address=_public_url(request.full_url)
+        def connection(host,**kwargs):
+            conn=http.client.HTTPConnection(host,**kwargs)
+            conn._create_connection=lambda target,timeout=None,source_address=None: socket.create_connection((address,parsed.port or 80),timeout,source_address)
+            return conn
+        return self.do_open(connection,request)
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self,request):
+        parsed,address=_public_url(request.full_url)
+        def connection(host,**kwargs):
+            conn=http.client.HTTPSConnection(host,**kwargs)
+            conn._create_connection=lambda target,timeout=None,source_address=None: socket.create_connection((address,parsed.port or 443),timeout,source_address)
+            return conn
+        kwargs={'context':self._context}
+        if hasattr(self,'_check_hostname'):kwargs['check_hostname']=self._check_hostname
+        return self.do_open(connection,request,**kwargs)
+
+class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _public_url(newurl)
+        return super().redirect_request(req,fp,code,msg,headers,newurl)
+
+def _download(src,target):
+    _public_url(src)
+    deadline = time.monotonic()+DOWNLOAD_TIMEOUT_SECONDS
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),_SafeRedirect(),_PinnedHTTPHandler(),_PinnedHTTPSHandler())
+    req = urllib.request.Request(src,headers={'User-Agent':'rawchunks-audio-worker'})
+    try:
+        with opener.open(req,timeout=DOWNLOAD_TIMEOUT_SECONDS) as response, open(target,'xb') as out:
+            length = response.headers.get('Content-Length')
+            if length is not None and int(length)>MAX_AUDIO_BYTES:
+                raise HTTPException(413,'Source audio exceeds 50 MiB')
+            mime = response.headers.get('Content-Type','').split(';')[0].strip().lower()
+            if mime and not (mime.startswith('audio/') or mime=='application/octet-stream'):
+                raise HTTPException(400,'Source response is not audio')
+            size = 0
+            while True:
+                remaining = deadline-time.monotonic()
+                if remaining<=0: raise TimeoutError('Source audio download deadline exceeded')
+                # Bound each body read as well as the complete transfer.
+                raw_socket = getattr(getattr(getattr(response,'fp',None),'raw',None),'_sock',None)
+                if raw_socket is not None: raw_socket.settimeout(remaining)
+                chunk = response.read(min(1024*1024,MAX_AUDIO_BYTES-size+1))
+                if not chunk: break
+                size += len(chunk)
+                if size>MAX_AUDIO_BYTES: raise HTTPException(413,'Source audio exceeds 50 MiB')
+                out.write(chunk)
+    except BaseException:
+        try: target.unlink()
+        except FileNotFoundError: pass
+        raise
+
+def _local_source(src,temp_dir):
+    parsed = urllib.parse.urlsplit(src)
+    if parsed.path in ('/v1/audio','/audio') and parsed.query:
+        params = urllib.parse.parse_qs(parsed.query,keep_blank_values=True)
+        if set(params) - {'path','download'} or len(params.get('path',[])) != 1:
+            raise HTTPException(400,'Invalid audio path query')
+        src = params['path'][0]
+    elif parsed.scheme:
+        raise HTTPException(400,'Unsupported source audio scheme')
+    candidate = Path(src).resolve(strict=False)
+    try: candidate.relative_to(temp_dir.resolve())
+    except ValueError: raise HTTPException(403,'Source audio is outside the audio directory')
+    if not candidate.is_file(): raise HTTPException(404,'Source audio file not found')
+    if candidate.stat().st_size>MAX_AUDIO_BYTES: raise HTTPException(413,'Source audio exceeds 50 MiB')
+    return candidate
+
+def _execute(temp_dir,source,job_id,stem_type):
+    separator = get_separator()
+    _, separated = separator.separate_audio_file(str(source))
+    order = ['vocals','drums','bass','other','instrumental'] if stem_type in ('all',None) else [stem_type]
+    if all(name in separated for name in ('drums','bass','other')):
+        separated['instrumental'] = separated['drums']+separated['bass']+separated['other']
+    stems = {}; paths = []
+    try:
+        for name in order:
+            if name not in separated:
+                if stem_type not in ('all',None): raise RuntimeError(f'Separator did not produce {name}')
+                continue
+            path = temp_dir/f'{job_id}_{name}.wav'
+            demucs.api.save_audio(separated[name],str(path),samplerate=separator.samplerate)
+            paths.append(str(path)); stems[name] = '/v1/audio?'+urllib.parse.urlencode({'path':str(path)})
+        return {'task_id':job_id,'status':'ready','stems':stems,'audio_paths':paths,'metas':{'caption':','.join(stems)}}
+    except BaseException:
+        for path in paths:
+            try: Path(path).unlink()
+            except FileNotFoundError: pass
+        raise
+
+async def execute_separation_job(state,store,job_id,req):
+    store.mark_running(job_id)
+    temp_dir = Path(state.temp_audio_dir); temp_dir.mkdir(parents=True,exist_ok=True)
+    src = req['src_audio_path']; remote = urllib.parse.urlsplit(src).scheme in ('http','https')
+    # Raw task IDs never form filesystem names; caller idempotency keys are
+    # accepted by the queue only when safe for public task identifiers.
+    input_path = temp_dir/f'{job_id}_input.audio'
+    try:
+        try: input_path.unlink()
+        except FileNotFoundError: pass
+        source = await asyncio.to_thread(_download,src,input_path) if remote else _local_source(src,temp_dir)
+        if remote: source = input_path
+        result = await run_gpu(state,_execute,temp_dir,source,job_id,req.get('stem_type','all'))
+        store.mark_succeeded(job_id,result)
+    except BaseException as exc:
+        store.mark_failed(job_id,str(exc))
+        raise
+    finally:
+        if remote:
+            try: input_path.unlink()
+            except FileNotFoundError: pass
+
+def register_separate_route(app,verify_api_key,wrap_response,store):
+    @app.post('/separate')
+    @app.post('/v1/separate')
+    async def separate_endpoint(req:SeparateRequest,request:Request,
+            idempotency_key:Optional[str]=Header(None),_:None=Depends(verify_api_key)):
+        if not req.src_audio_path: raise HTTPException(400,'src_audio_path is required')
+        src=req.src_audio_path
+        if urllib.parse.urlsplit(src).scheme not in ('http','https'):
+            _local_source(src,Path(request.app.state.temp_audio_dir))
+        else:
+            try: await asyncio.to_thread(_public_url,src)
+            except HTTPException: raise
+            except Exception as exc: raise HTTPException(500,f'Separation failed: {exc}') from exc
+        try:
+            record,_=app.state.job_queue.admit(req,kind='separate',job_id=idempotency_key)
+        except QueueFull as exc: raise HTTPException(429,'Server busy: queue is full') from exc
+        except ValueError as exc: raise HTTPException(409,str(exc)) from exc
+        if not req.wait:
+            return wrap_response({'task_id': record.job_id, 'status': record.status})
+        record = await app.state.job_queue.wait(record.job_id)
+        if record.status=='failed': raise HTTPException(500,f'Separation failed: {record.error}')
+        return wrap_response(record.result)
