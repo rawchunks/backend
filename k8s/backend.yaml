@@ -1,0 +1,152 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: rawchunks
+  labels:
+    app: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/backend@sha256:3474901340e903a7f158a6e6c88b136f9a061138e793f871b4c887aefd738b15
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3005
+              name: http
+          env:
+            - name: PORT
+              value: "3005"
+            - name: HOST
+              value: 0.0.0.0
+            - name: ACESTEP_API_URL
+              value: http://acestep-service.rawchunks.svc.cluster.local:8001
+            - name: ACESTEP_TRAINING_URL
+              value: http://acestep-training.rawchunks.svc.cluster.local:8001
+            - name: VOICE_PREPARATION_ENABLED
+              value: "true"
+            - name: SONG_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: SONG_DATABASE_URL
+            - name: USER_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: USER_DATABASE_URL
+            - name: ACESTEP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: ACESTEP_API_KEY
+            - name: GOOGLE_GENERATIVE_AI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: GOOGLE_GENERATIVE_AI_API_KEY
+            - name: CORS_ORIGINS
+              value: https://rawchunks.space,https://www.rawchunks.space,https://app.rawchunks.space,https://www.app.rawchunks.space,http://localhost:3001
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          envFrom:
+            - secretRef:
+                name: backend-secrets
+          volumeMounts:
+            - name: temporary
+              mountPath: /tmp
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+            timeoutSeconds: 2
+      volumes:
+        - name: temporary
+          emptyDir:
+            sizeLimit: 2Gi
+      terminationGracePeriodSeconds: 60
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: rawchunks
+  labels:
+    app: api
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
+spec:
+  type: LoadBalancer
+  selector:
+    app: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3005
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+  namespace: rawchunks
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: api
