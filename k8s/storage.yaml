@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: checkpoints
+spec:
+  accessModes:
+    - ReadWriteOnce
+  capacity:
+    storage: 200Gi
+  storageClassName: premium-rwo
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: pd.csi.storage.gke.io
+    fsType: ext4
+    volumeHandle: projects/gen-lang-client-0035632562/zones/us-central1-f/disks/rawchunks-checkpoints
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: topology.gke.io/zone
+              operator: In
+              values:
+                - us-central1-f
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: checkpoints
+  namespace: rawchunks
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 200Gi
+  storageClassName: premium-rwo
+  volumeName: checkpoints
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: acestep-checkpoints-pvc
+  namespace: rawchunks
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 200Gi
+  storageClassName: premium-rwo
+  volumeName: pvc-92cf1f8d-0d62-450a-9580-3ab2b9027345

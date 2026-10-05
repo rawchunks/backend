@@ -1,0 +1,84 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: acestep-model-downloader
+  namespace: rawchunks
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      name: acestep-model-downloader
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector:
+        cloud.google.com/gke-nodepool: default-pool
+      volumes:
+        - name: checkpoints
+          persistentVolumeClaim:
+            claimName: checkpoints
+      containers:
+        - name: downloader
+          image: python:3.11-slim@sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              pip install --no-cache-dir huggingface_hub==0.36.0
+              
+              python3 - << 'EOF'
+              import os
+              import sys
+              from huggingface_hub import snapshot_download
+
+              token = os.environ.get("HF_TOKEN")
+              if not token:
+                  print("ERROR: HF_TOKEN environment variable not set")
+                  sys.exit(1)
+
+              models = [
+                  ("ACE-Step/acestep-v15-xl-turbo", "/checkpoints/acestep-v15-xl-turbo"),
+                  ("ACE-Step/acestep-v15-xl-base", "/checkpoints/acestep-v15-xl-base"),
+                  ("ACE-Step/acestep-v15-xl-sft", "/checkpoints/acestep-v15-xl-sft"),
+                  ("ACE-Step/acestep-5Hz-lm-0.6B", "/checkpoints/acestep-5Hz-lm-0.6B"),
+                  ("ACE-Step/Ace-Step1.5", "/checkpoints/Ace-Step1.5"),
+              ]
+
+              for repo_id, local_dir in models:
+                  print(f"\n--- Downloading {repo_id} to {local_dir} ---")
+                  snapshot_download(
+                      repo_id=repo_id,
+                      local_dir=local_dir,
+                      token=token,
+                      resume_download=True,
+                      max_workers=8
+                  )
+                  print(f"✓ {repo_id} successfully downloaded to {local_dir}")
+
+              print("\n=== All ACE-Step 1.5 XL Checkpoints Downloaded Successfully! ===")
+              EOF
+
+              ls -lh /checkpoints
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: acestep-secrets
+                  key: HF_TOKEN
+          volumeMounts:
+            - name: checkpoints
+              mountPath: /checkpoints
+          resources:
+            requests:
+              cpu: "2000m"
+              memory: "4Gi"
+            limits:
+              cpu: "4000m"
+              memory: "8Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
