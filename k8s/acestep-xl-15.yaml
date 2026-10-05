@@ -1,0 +1,364 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: acestep-xl-15-turbo
+  namespace: rawchunks
+  labels:
+    app: acestep-xl-15-turbo
+spec:
+  replicas: 1
+  progressDeadlineSeconds: 1200
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: acestep-xl-15-turbo
+  template:
+    metadata:
+      labels:
+        app: acestep-xl-15-turbo
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-nodepool: resident
+        cloud.google.com/gke-accelerator: nvidia-tesla-a100
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: checkpoints
+          persistentVolumeClaim:
+            claimName: checkpoints
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      containers:
+        - name: worker
+          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/acestep-xl-15@sha256:c8c3b65a24a1ecd30aed29ebe0b0259f2e253e8855cdbd32a26df3ddbe5f02f9
+          imagePullPolicy: IfNotPresent
+          command:
+            - uv
+            - run
+            - --no-sync
+            - python
+            - -m
+            - acestep.api_server
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8001"
+          ports:
+            - containerPort: 8001
+              name: http
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: acestep-secrets
+                  key: HF_TOKEN
+            - name: ACESTEP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: acestep-secrets
+                  key: ACESTEP_API_KEY
+            - name: CHECKPOINTS_DIR
+              value: /checkpoints
+            - name: HF_HOME
+              value: /checkpoints
+            - name: ACESTEP_CHECKPOINTS_DIR
+              value: /checkpoints
+            - name: DEFAULT_DIT_MODEL
+              value: acestep-v15-xl-turbo
+            - name: DEFAULT_LM_MODEL
+              value: acestep-5Hz-lm-0.6B
+            - name: ACESTEP_CONFIG_PATH
+              value: acestep-v15-xl-turbo
+            - name: ACESTEP_CONFIG_PATH2
+              value: acestep-v15-xl-sft
+            - name: ACESTEP_CONFIG_PATH3
+              value: acestep-v15-xl-base
+            - name: ACESTEP_NO_INIT
+              value: "false"
+            - name: HF_ENABLE_PARALLEL_LOADING
+              value: "true"
+            - name: ACESTEP_LM_MODEL_PATH
+              value: acestep-5Hz-lm-0.6B
+            - name: ACESTEP_CONFIG_TURBO
+              value: acestep-v15-xl-turbo
+            - name: ACESTEP_OFFLOAD_TO_CPU
+              value: "true"
+            - name: ACESTEP_OFFLOAD_DIT_TO_CPU
+              value: "false"
+            - name: ACESTEP_LM_OFFLOAD_TO_CPU
+              value: "true"
+            - name: ACESTEP_SAVE_MEMORY
+              value: "true"
+            - name: ACESTEP_ON_DEMAND_MODEL_LOAD
+              value: "false"
+            - name: ACESTEP_QUEUE_WORKERS
+              value: "1"
+            - name: ACESTEP_API_WORKERS
+              value: "1"
+            - name: ACESTEP_TMPDIR
+              value: /checkpoints/runtime
+            - name: VALKEY_REQUESTS_SERVICE_URI
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: VALKEY_REQUESTS_SERVICE_URI
+            - name: ACESTEP_ROLE
+              value: generation
+            - name: ACESTEP_QUEUE_NAMESPACE
+              value: rawchunks:worker
+            - name: ACESTEP_TRAINING_URL
+              value: http://acestep-training.rawchunks.svc.cluster.local:8001
+          volumeMounts:
+            - name: checkpoints
+              mountPath: /checkpoints
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              nvidia.com/gpu: 1
+              memory: 40Gi
+              cpu: 6000m
+            limits:
+              nvidia.com/gpu: 1
+              memory: 64Gi
+              cpu: 10000m
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 120
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            failureThreshold: 5
+            timeoutSeconds: 5
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: acestep-xl-15
+  namespace: rawchunks
+  labels:
+    app: acestep-xl-15
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8001
+      targetPort: 8001
+      name: http
+  selector:
+    app: acestep-xl-15-turbo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: acestep-service
+  namespace: rawchunks
+  labels:
+    app: acestep-service
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8001
+      targetPort: 8001
+      name: http
+  selector:
+    app: acestep-xl-15-turbo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: acestep-training
+  namespace: rawchunks
+  labels:
+    app: acestep-training
+spec:
+  replicas: 1
+  progressDeadlineSeconds: 1200
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: acestep-training
+  template:
+    metadata:
+      labels:
+        app: acestep-training
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-nodepool: default-pool
+        cloud.google.com/gke-accelerator: nvidia-l4
+        topology.kubernetes.io/zone: us-central1-a
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: checkpoints
+          persistentVolumeClaim:
+            claimName: acestep-checkpoints-pvc
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      containers:
+        - name: worker
+          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/acestep-xl-15@sha256:c8c3b65a24a1ecd30aed29ebe0b0259f2e253e8855cdbd32a26df3ddbe5f02f9
+          imagePullPolicy: IfNotPresent
+          command:
+            - uv
+            - run
+            - --no-sync
+            - python
+            - -m
+            - acestep.api_server
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8001"
+          ports:
+            - containerPort: 8001
+              name: http
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: acestep-secrets
+                  key: HF_TOKEN
+            - name: ACESTEP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: acestep-secrets
+                  key: ACESTEP_API_KEY
+            - name: CHECKPOINTS_DIR
+              value: /checkpoints
+            - name: HF_HOME
+              value: /checkpoints
+            - name: ACESTEP_CHECKPOINTS_DIR
+              value: /checkpoints
+            - name: DEFAULT_DIT_MODEL
+              value: acestep-v15-xl-turbo
+            - name: DEFAULT_LM_MODEL
+              value: acestep-5Hz-lm-0.6B
+            - name: ACESTEP_CONFIG_PATH
+              value: acestep-v15-xl-turbo
+            - name: ACESTEP_NO_INIT
+              value: "true"
+            - name: HF_ENABLE_PARALLEL_LOADING
+              value: "true"
+            - name: ACESTEP_LM_MODEL_PATH
+              value: acestep-5Hz-lm-0.6B
+            - name: ACESTEP_OFFLOAD_TO_CPU
+              value: "true"
+            - name: ACESTEP_OFFLOAD_DIT_TO_CPU
+              value: "false"
+            - name: ACESTEP_LM_OFFLOAD_TO_CPU
+              value: "true"
+            - name: ACESTEP_SAVE_MEMORY
+              value: "true"
+            - name: ACESTEP_ON_DEMAND_MODEL_LOAD
+              value: "false"
+            - name: ACESTEP_QUEUE_WORKERS
+              value: "1"
+            - name: ACESTEP_API_WORKERS
+              value: "1"
+            - name: ACESTEP_TMPDIR
+              value: /checkpoints/runtime
+            - name: VALKEY_REQUESTS_SERVICE_URI
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: VALKEY_REQUESTS_SERVICE_URI
+            - name: ACESTEP_ROLE
+              value: training
+            - name: ACESTEP_QUEUE_NAMESPACE
+              value: rawchunks:training
+            - name: ACESTEP_TRAINING_ARTIFACT_ROOT
+              value: /checkpoints/runtime/training
+          volumeMounts:
+            - name: checkpoints
+              mountPath: /checkpoints
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              nvidia.com/gpu: 1
+              memory: 32Gi
+              cpu: 4000m
+            limits:
+              nvidia.com/gpu: 1
+              memory: 48Gi
+              cpu: 10000m
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 120
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            failureThreshold: 5
+            timeoutSeconds: 5
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: acestep-training
+  namespace: rawchunks
+  labels:
+    app: acestep-training
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8001
+      targetPort: 8001
+      name: http
+  selector:
+    app: acestep-training
