@@ -60,8 +60,8 @@ describe('consent persistence', () => {
     await expect(putUserConsent(consent({ message }))).rejects.toThrow('signature and signed message');
     expect(sql).not.toHaveBeenCalled();
   });
-  it('requires a real counterpart when no pair exists', async () => {
-    await expect(putUserConsent(consent({ svmAddress: undefined }))).rejects.toThrow('Wallet pair not found');
+  it('requires an EVM counterpart for an unknown Solana account', async () => {
+    await expect(putUserConsent(consent({ address: svm, svmAddress: undefined }))).rejects.toThrow('Wallet pair not found');
     expect(sql).toHaveBeenCalledTimes(1);
   });
   it('registers the supplied pair before recording first consent', async () => {
@@ -82,7 +82,7 @@ describe('consent persistence', () => {
   it('stores the supplied signature, message, version and metadata against the exact pair', async () => {
     sql.mockResolvedValueOnce([row()]).mockResolvedValueOnce([row()]);
     expect(await putUserConsent(consent())).toMatchObject({ evmAddress: normalized, svmAddress: svm, policyVersion: '1.0.0', signature: proof, message: 'signed terms' });
-    expect(query(1)).toContain('WHERE evm_address = ? AND svm_address = ?');
+    expect(query(1)).toContain('WHERE evm_address = ? AND svm_address IS NOT DISTINCT FROM ?');
     expect(sql.mock.calls[1].slice(1)).toEqual(['1.0.0', proof, 'signed terms', JSON.stringify({ signedAt: date, disclaimerType: 'generation' }), normalized, svm]);
     expect(sql).toHaveBeenCalledTimes(2);
   });

@@ -20,10 +20,15 @@ describe('API routing and readiness', () => {
     expect(res.statusCode).toBe(503);
     expect(res.json().services?.databases).not.toBe('connected');
   });
-  it('rejects credentialed requests from an unrelated Origin', async () => {
+  it('allows API access from any frontend origin without enabling browser credentials', async () => {
     const app = await boot();
-    const res = await app.inject({ url: '/health', headers: { origin: 'https://attacker.invalid' } });
-    expect(res.headers['access-control-allow-origin']).not.toBe('https://attacker.invalid');
+    for (const origin of ['https://app.rawchunks.space', 'https://rawchunks.vercel.app', 'https://another-host.invalid', 'http://localhost:3001']) {
+      const res = await app.inject({ method: 'OPTIONS', url: '/api/user/consent', headers: { origin, 'access-control-request-method': 'POST', 'access-control-request-headers': 'content-type,x-session-user-address' } });
+      expect(res.statusCode).toBe(204);
+      expect(res.headers['access-control-allow-origin']).toBe('*');
+      expect(res.headers['access-control-allow-credentials']).toBeUndefined();
+      expect(res.headers['access-control-allow-headers']).toContain('x-session-user-address');
+    }
   });
   it.each(['/sync', '/api/sync'])('has no reconciliation route at %s', async url => {
     const app = await boot();

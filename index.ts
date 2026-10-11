@@ -38,8 +38,7 @@ async function main() {
 
   // Register CORS
   await app.register(cors, {
-    origin: (process.env.CORS_ORIGINS || 'https://rawchunks.space,https://app.rawchunks.space,https://www.app.rawchunks.space,https://api.rawchunks.space,http://localhost:3001').split(',').map(origin => origin.trim()).filter(Boolean),
-    credentials: true,
+    origin: '*',
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   });
 

@@ -6,7 +6,7 @@ vi.mock('../../databases/client.js', async () => {
 });
 import { databaseCause, clearPostgres, closePostgres, fixtures as f, initializePostgres, postgres } from '../support/database-postgres.js';
 import { runMigrations } from '../../databases/migrate.js';
-import { getUserConsent, getWalletPair, putUserConsent, putWalletPair } from '../../databases/users.js';
+import { getUserConsent, getWalletPair, putUserConsent, putWalletPair, updateProfile } from '../../databases/users.js';
 import { createSong, deleteSong, getFullSongProject, getSongById, listAllSongs, listSongsByCreator, updateSong } from '../../databases/songs.js';
 import { createStem, listStemsBySong, updateStemMixer } from '../../databases/stems.js';
 import { activateTake, createTake, deleteTake, listTakesBySong, listTakesByStem } from '../../databases/takes.js';
@@ -128,6 +128,25 @@ describe('production DDL and queries on disposable PostgreSQL engines', () => {
     expect(consent.message).toBe(message);
     expect(await getUserConsent(f.svm)).toMatchObject({ signature, metadata: { signedAt, disclaimerType: 'generation' } });
     expect((await postgres.user.query('SELECT consented_at FROM wallet_pairs')).rows[0].consented_at).toBeTruthy();
+  });
+  it('records first consent for an EVM account without a Solana counterpart', async () => {
+    const input = { address: f.evm, signature: 'isolated-fixture', message: 'Isolated signed policy', disclaimerType: 'ai_passthrough' };
+    await putUserConsent(input);
+    expect(await getUserConsent(f.evm)).toMatchObject({ evmAddress: f.evm, svmAddress: '', signature: input.signature, message: input.message });
+    await putUserConsent({ ...input, message: 'Updated isolated signed policy' });
+    expect((await postgres.user.query('SELECT svm_address, consent_message FROM wallet_pairs')).rows).toEqual([{ svm_address: null, consent_message: 'Updated isolated signed policy' }]);
+  });
+  it('records consent for a profile whose Solana counterpart is null', async () => {
+    await updateProfile({ address: f.evm, nickname: 'Existing profile' });
+    await putUserConsent({ address: f.evm, signature: 'isolated-fixture', message: 'Isolated signed policy' });
+    expect(await getUserConsent(f.evm)).toMatchObject({ evmAddress: f.evm, signature: 'isolated-fixture' });
+    expect((await getWalletPair(f.evm))?.nickname).toBe('Existing profile');
+  });
+  it('links a supplied counterpart when a profile exists without Solana', async () => {
+    await updateProfile({ address: f.evm, nickname: 'Existing profile' });
+    await putUserConsent({ address: f.evm, svmAddress: f.svm, signature: 'isolated-fixture', message: 'Isolated signed policy' });
+    expect(await getUserConsent(f.svm)).toMatchObject({ evmAddress: f.evm, svmAddress: f.svm });
+    expect((await getWalletPair(f.evm))?.nickname).toBe('Existing profile');
   });
   it('real paired creator listing merges EVM and case-sensitive Solana songs', async () => {
     await putWalletPair({ evmAddress: f.evm, svmAddress: f.svm });

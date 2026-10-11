@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: api
-          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/backend@sha256:3474901340e903a7f158a6e6c88b136f9a061138e793f871b4c887aefd738b15
+          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/backend@sha256:af7e052e6ba7e81af7e165de2bca86b22fa094bfcfdddcdad0e7a586c4ef11bb
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 3005
@@ -53,8 +53,6 @@ spec:
                 secretKeyRef:
                   name: backend-secrets
                   key: GOOGLE_GENERATIVE_AI_API_KEY
-            - name: CORS_ORIGINS
-              value: https://rawchunks.space,https://www.rawchunks.space,https://app.rawchunks.space,https://www.app.rawchunks.space,http://localhost:3001
           readinessProbe:
             httpGet:
               path: /health

@@ -161,7 +161,8 @@ export async function putUserConsent(input: RecordConsentInput): Promise<UserCon
   const parsed = parseAddress(input.address);
   if (!input.signature?.trim() || input.signature === '0x' || !input.message?.trim()) throw new RequestError('A signature and signed message are required');
   let pair = await getWalletPair(parsed.value);
-  if (!pair && input.svmAddress) {
+  if (!pair && parsed.kind === 'evm' && !input.svmAddress) pair = await updateProfile({ address: parsed.value });
+  if (!pair?.svmAddress && input.svmAddress) {
     const evm = parseAddress(parsed.kind === 'evm' ? parsed.value : input.metadata?.evmAddress);
     const svm = parseAddress(input.svmAddress);
     if (evm.kind !== 'evm' || svm.kind !== 'svm' || parsed.value !== evm.value && parsed.value !== svm.value) throw new RequestError('Invalid wallet pair');
@@ -173,7 +174,7 @@ export async function putUserConsent(input: RecordConsentInput): Promise<UserCon
   const updated = await userSql`
     UPDATE public.wallet_pairs SET consented_at = NOW(), consent_version = ${version},
       consent_signature = ${input.signature}, consent_message = ${input.message}, consent_metadata = ${metadata}::jsonb
-    WHERE evm_address = ${pair.evmAddress} AND svm_address = ${pair.svmAddress} RETURNING *
+    WHERE evm_address = ${pair.evmAddress} AND svm_address IS NOT DISTINCT FROM ${pair.svmAddress || null} RETURNING *
   `;
   const record = consentFromRow(updated[0]);
   if (!record) throw new RequestError('Account pair changed while recording consent', 409);
