@@ -9,3 +9,5 @@ __*
 results
 .DS_Store
 *.DS_Store
+tests/reports
+.pytest_cache
