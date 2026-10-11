@@ -1,0 +1,23 @@
+{
+  "name": "mpp-x402",
+  "version": "0.1.0",
+  "description": "MPP upto and batch-settlement methods backed by genuine x402 authorizations",
+  "type": "module",
+  "sideEffects": false,
+  "license": "MIT",
+  "files": ["dist", "README.md", "LICENSE"],
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./client": { "types": "./dist/client/index.d.ts", "default": "./dist/client/index.js" },
+    "./server": { "types": "./dist/server/index.d.ts", "default": "./dist/server/index.js" }
+  },
+  "scripts": {
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tests/tsconfig.json",
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx --test tests/flows.ts",
+    "prepack": "npm run check && npm run test && npm run build"
+  },
+  "peerDependencies": { "mppx": "0.13.4", "@x402/core": "2.28.0" },
+  "devDependencies": { "@x402/evm": "2.28.0", "@types/node": "^26.6.4", "tsx": "^4.23.15", "typescript": "^7.0.2", "viem": "2.57.4" },
+  "engines": { "node": ">=22" }
+}
