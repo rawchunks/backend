@@ -132,6 +132,7 @@ export async function putWalletPair(input: {
 }): Promise<WalletPair> {
   const evm = parseAddress(input.evmAddress), svm = parseAddress(input.svmAddress);
   if (evm.kind !== 'evm' || svm.kind !== 'svm') throw new Error('evmAddress must be EVM (0x...) and svmAddress must be Solana base58');
+  // Completing an EVM-only or legacy pending pair retains its signed policy.
   const rows = await userSql`
     INSERT INTO public.wallet_pairs (evm_address, svm_address, nickname, avatar)
     VALUES (${evm.value}, ${svm.value}, ${input.nickname ?? null}, ${input.avatar ?? null})
@@ -139,11 +140,11 @@ export async function putWalletPair(input: {
       svm_address = EXCLUDED.svm_address,
       nickname = COALESCE(EXCLUDED.nickname, wallet_pairs.nickname),
       avatar = COALESCE(EXCLUDED.avatar, wallet_pairs.avatar),
-      consented_at = CASE WHEN wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consented_at END,
-      consent_version = CASE WHEN wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_version END,
-      consent_signature = CASE WHEN wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_signature END,
-      consent_message = CASE WHEN wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_message END,
-      consent_metadata = CASE WHEN wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_metadata END
+      consented_at = CASE WHEN wallet_pairs.svm_address IS NOT NULL AND LEFT(wallet_pairs.svm_address, 12) <> 'svm_pending_' AND wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consented_at END,
+      consent_version = CASE WHEN wallet_pairs.svm_address IS NOT NULL AND LEFT(wallet_pairs.svm_address, 12) <> 'svm_pending_' AND wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_version END,
+      consent_signature = CASE WHEN wallet_pairs.svm_address IS NOT NULL AND LEFT(wallet_pairs.svm_address, 12) <> 'svm_pending_' AND wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_signature END,
+      consent_message = CASE WHEN wallet_pairs.svm_address IS NOT NULL AND LEFT(wallet_pairs.svm_address, 12) <> 'svm_pending_' AND wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_message END,
+      consent_metadata = CASE WHEN wallet_pairs.svm_address IS NOT NULL AND LEFT(wallet_pairs.svm_address, 12) <> 'svm_pending_' AND wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_metadata END
     RETURNING *
   `;
   const pair = pairFromRow(rows[0]);

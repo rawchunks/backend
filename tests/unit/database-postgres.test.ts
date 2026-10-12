@@ -142,6 +142,27 @@ describe('production DDL and queries on disposable PostgreSQL engines', () => {
     expect(await getUserConsent(f.evm)).toMatchObject({ evmAddress: f.evm, signature: 'isolated-fixture' });
     expect((await getWalletPair(f.evm))?.nickname).toBe('Existing profile');
   });
+  it.each([null, 'svm_pending_aaaaaaaa'])('retains EVM consent when completing an initial pair from %s', async counterpart => {
+    await updateProfile({ address: f.evm });
+    if (counterpart) await postgres.user.query('UPDATE wallet_pairs SET svm_address=$1 WHERE evm_address=$2', [counterpart, f.evm]);
+    const signed = await putUserConsent({ address: f.evm, signature: 'isolated-fixture', message: 'Original signed policy', policyVersion: '1.0.0', disclaimerType: 'ai_passthrough', metadata: { signedAt: '2026-10-11T10:00:00.000Z' } });
+    await putWalletPair({ evmAddress: f.evm, svmAddress: f.svm });
+    await putWalletPair({ evmAddress: f.evm, svmAddress: f.svm });
+    for (const address of [f.evm, f.svm]) {
+      expect(await getUserConsent({ address, policyVersion: '1.0.0', disclaimerType: 'ai_passthrough' })).toEqual({ ...signed, svmAddress: f.svm });
+    }
+    expect(await getUserConsent(`0x${'b'.repeat(40)}`)).toBeNull();
+    expect(await getUserConsent({ address: f.svm, policyVersion: '2.0.0' })).toBeNull();
+  });
+  it('clears consent when replacing an established Solana counterpart', async () => {
+    await putWalletPair({ evmAddress: f.evm, svmAddress: f.svm });
+    await putUserConsent({ address: f.evm, signature: 'isolated-fixture', message: 'Original signed policy' });
+    const replacement = '11111111111111111111111111111111';
+    await putWalletPair({ evmAddress: f.evm, svmAddress: replacement });
+    expect(await getUserConsent(f.evm)).toBeNull();
+    expect(await getUserConsent(replacement)).toBeNull();
+    expect(await getUserConsent(f.svm)).toBeNull();
+  });
   it('links a supplied counterpart when a profile exists without Solana', async () => {
     await updateProfile({ address: f.evm, nickname: 'Existing profile' });
     await putUserConsent({ address: f.evm, svmAddress: f.svm, signature: 'isolated-fixture', message: 'Isolated signed policy' });
