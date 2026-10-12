@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { listStemsBySong } from './stems.js';
 import { listTakesBySong, deleteTake } from './takes.js';
 import { RequestError, readUser, readSong, readTake, checkUser } from './users.js';
+import { requireSessionPayment, extractSessionToken, parseComposeToken, settleStreamCheckpoint, type SessionPaymentConfig } from '../broker/payment.js';
 import {
   createAlbum,
   getAlbumById,
@@ -67,6 +68,55 @@ function failure(request: FastifyRequest, reply: FastifyReply, error: unknown, m
   const invalid = error instanceof z.ZodError || cause?.code === '23514' || cause?.code === '23502' || cause?.code === '23503' || /^(Invalid wallet address|Wallet pair not found|EVM address must|SVM address must)/.test(cause?.message || '');
   const status = cause?.code === '23505' ? 409 : invalid ? 400 : 500;
   return reply.status(status).send({ error: status === 409 ? 'Record conflicts with existing data' : invalid ? 'Invalid request' : message });
+}
+
+export async function resolveSongStreamPayment(request: FastifyRequest): Promise<SessionPaymentConfig | null> {
+  const { id } = request.params as { id: string };
+  const song = await getSongById(id);
+  if (!song) {
+    throw new RequestError('Song not found', 404);
+  }
+  (request as any).song = song;
+
+  const token = extractSessionToken(request);
+  const payload = token ? parseComposeToken(token) : null;
+  const userAddress = (request.headers['x-session-user-address'] as string | undefined) || payload?.sub;
+
+  let isCreator = false;
+  if (userAddress) {
+    let parsedUser: string = userAddress;
+    let parsedCreator: string = song.creator;
+    try {
+      parsedUser = parseAddress(userAddress).value;
+      parsedCreator = parseAddress(song.creator).value;
+    } catch {}
+
+    if (parsedUser.toLowerCase() === parsedCreator.toLowerCase() || parsedUser === parsedCreator) {
+      isCreator = true;
+    } else {
+      const pair = await getWalletPair(parsedUser);
+      if (pair) {
+        isCreator = Boolean(
+          (pair.svmAddress && (song.creator === pair.svmAddress || parsedCreator === pair.svmAddress)) ||
+          (pair.evmAddress && (song.creator.toLowerCase() === pair.evmAddress.toLowerCase() || parsedCreator.toLowerCase() === pair.evmAddress.toLowerCase()))
+        );
+      }
+    }
+  }
+
+  if (isCreator) {
+    return null;
+  }
+
+  const priceUsd = song.stream_price;
+  const amountWei = Math.round(priceUsd * 1_000_000).toString();
+
+  return {
+    amountWei,
+    priceUsd,
+    action: 'stream-playback',
+    creatorAddress: song.creator,
+  };
 }
 
 export const databaseRouter: FastifyPluginAsync = async app => {
@@ -156,9 +206,79 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       const { id } = request.params as { id: string };
       await requireSongReader(request, id);
       const project = await getFullSongProject(id);
-      return project.song ? reply.send(project) : reply.status(404).send({ error: 'Song not found' });
+      if (!project.song) return reply.status(404).send({ error: 'Song not found' });
+      return reply.send(project);
     } catch (error) { return failure(request, reply, error, 'Failed to retrieve song'); }
   });
+
+  const streamSongHandler = async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const { id } = request.params as { id: string };
+      const song = (request as any).song || (await getSongById(id));
+      if (!song) return reply.status(404).send({ error: 'Song not found' });
+
+      const isCreator = reply.getHeader('x-creator-exempt') === 'true';
+      const paymentIntentId = (request as any).paymentIntentId || null;
+
+      if (request.headers.accept?.includes('application/json')) {
+        return reply.send({
+          id: song.id,
+          title: song.title,
+          url: song.url,
+          duration: song.duration,
+          creator: song.creator,
+          isCreator,
+          paymentIntentId,
+          streamPriceUsd: isCreator ? 0 : song.stream_price,
+          streamPriceWei: isCreator ? '0' : Math.round(song.stream_price * 1_000_000).toString(),
+        });
+      }
+
+      return reply.redirect(song.url);
+    } catch (error) { return failure(request, reply, error, 'Failed to stream song'); }
+  };
+
+  const streamCheckpointHandler = async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const { id } = request.params as { id: string };
+      const song = await getSongById(id);
+      if (!song) return reply.status(404).send({ error: 'Song not found' });
+
+      const body = request.body as {
+        paymentIntentId?: string;
+        listenedSeconds?: number;
+      } | undefined;
+
+      const paymentIntentId = body?.paymentIntentId;
+      const listenedSeconds = Number(body?.listenedSeconds || 0);
+
+      if (!paymentIntentId) {
+        return reply.status(400).send({ error: 'paymentIntentId is required for stream checkpoint' });
+      }
+
+      const network = (request.headers['x-network-id'] as string) || 'base-mainnet';
+
+      const result = await settleStreamCheckpoint({
+        paymentIntentId,
+        network,
+        listenedSeconds,
+        streamPriceUsd: song.stream_price,
+        creatorAddress: song.creator,
+      });
+
+      return reply.send({
+        success: Boolean(result),
+        result,
+      });
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to settle stream checkpoint');
+    }
+  };
+
+  app.get('/songs/:id/stream', { preHandler: [requireSessionPayment(resolveSongStreamPayment, { metered: true })] }, streamSongHandler);
+  app.get('/stream/:id', { preHandler: [requireSessionPayment(resolveSongStreamPayment, { metered: true })] }, streamSongHandler);
+  app.post('/songs/:id/stream/checkpoint', streamCheckpointHandler);
+  app.post('/stream/:id/checkpoint', streamCheckpointHandler);
   app.get('/songs/:id/stems', async (request, reply) => {
     try { const { id } = request.params as { id: string }; await requireSongReader(request, id); return reply.send(await listStemsBySong(id)); }
     catch (error) { return failure(request, reply, error, 'Failed to retrieve stems'); }
