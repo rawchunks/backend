@@ -94,7 +94,42 @@ const applySchema = z.object({
   srcAudioUrl: z.string().refine((value) => !/^[a-z][a-z\d+.-]*:/i.test(value) || /^https?:\/\//i.test(value)).optional(),
 });
 
+import { requireSessionPayment } from '../broker/payment.js';
+
+const PAID_EDIT_ACTIONS: Record<string, string> = {
+  '/extract': 'edit-extract',
+  '/repaint': 'edit-repaint',
+  '/layer': 'edit-layer',
+  '/extend': 'edit-extend',
+  '/remix': 'edit-remix',
+  '/separate': 'edit-separate',
+  '/apply': 'edit-apply',
+};
+
+const resolveEditAction = (url: string, routeUrl?: string): string | null => {
+  if (routeUrl && PAID_EDIT_ACTIONS[routeUrl]) return PAID_EDIT_ACTIONS[routeUrl];
+  for (const [path, action] of Object.entries(PAID_EDIT_ACTIONS)) {
+    if (url.endsWith(path)) return action;
+  }
+  return null;
+};
+
 export const editingRouter: FastifyPluginAsync = async (fastify) => {
+  fastify.addHook('preHandler', async (request, reply) => {
+    if (request.method === 'POST') {
+      const action = resolveEditAction(request.url, request.routeOptions?.url);
+      if (action) {
+        const handler = requireSessionPayment({ amountWei: '20000', priceUsd: 0.02, action });
+        await handler(request, reply);
+        if (reply.sent) return;
+        if (request.body && typeof request.body === 'object' && !(request.body as any).userAddress) {
+          const authed = request.headers['x-session-user-address'];
+          if (typeof authed === 'string') (request.body as any).userAddress = authed;
+        }
+      }
+    }
+  });
+
   fastify.addHook('preHandler', async (request, reply) => {
     try {
       const params = request.params as Record<string, string>;
@@ -309,7 +344,7 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
 
   const handleActivate = async (request: any, reply: any) => {
     try {
-      const { songId, stemId, takeId, userAddress, action, composition } = z.object({ songId: z.string().min(1), stemId: z.string().optional(), takeId: z.string().min(1), userAddress: z.string().min(10).optional(), action: z.enum(['base', 'merge']).optional(), composition: z.object({ placements: z.array(z.object({takeId:z.string().min(1),shift:z.number().finite()})).optional(), takeIds: z.array(z.string().min(1)).min(1), region: z.object({ start: z.number().finite().min(0), end: z.number().finite().positive() }), original: z.boolean(), commitId: z.string().nullable(), srcAudioUrl: z.url() }).optional() }).parse(request.body);
+      const { songId, stemId, takeId, userAddress, action, composition } = z.object({ songId: z.string().min(1), stemId: z.string().optional(), takeId: z.string().min(1), userAddress: z.string().min(10).optional(), action: z.enum(['base', 'merge']).optional(), composition: z.object({ placements: z.array(z.object({ takeId: z.string().min(1), shift: z.number().finite() })).optional(), takeIds: z.array(z.string().min(1)).min(1), region: z.object({ start: z.number().finite().min(0), end: z.number().finite().positive() }), original: z.boolean(), commitId: z.string().nullable(), srcAudioUrl: z.url() }).optional() }).parse(request.body);
       const result = action ? await service.switchActiveTake(songId, stemId || null, takeId, userAddress, action, composition) : await service.switchActiveTake(songId, stemId || null, takeId, userAddress);
       return reply.send(result);
     } catch (err: any) {

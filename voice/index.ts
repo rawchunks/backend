@@ -20,6 +20,10 @@ function errorReply(reply: any, error: any, fallback: string) {
   return reply.status(oversized ? 413 : malformed ? 400 : 500).send({ error: oversized ? 'Audio file exceeds upload limit' : malformed ? (error instanceof VoiceInputError ? error.message : 'Invalid multipart request') : fallback });
 }
 
+import { requireSessionPayment } from '../broker/payment.js';
+
+const voicePrice = { amountWei: '50000', priceUsd: 0.05, action: 'voice-train' };
+
 export default async function voiceRoutes(app: FastifyInstance) {
   const streamState = stateStreams(app);
   // Flow (i): Save Voice from an existing generated song
@@ -29,7 +33,7 @@ export default async function voiceRoutes(app: FastifyInstance) {
       name?: string;
       creator: string;
     };
-  }>('/', async (req, reply) => {
+  }>('/', { preHandler: [requireSessionPayment(voicePrice)] }, async (req, reply) => {
     const { songId, name, creator } = req.body || {};
     if (!validText(songId) || !validText(creator) || (name !== undefined && typeof name !== 'string')) {
       return reply.status(400).send({ error: 'songId and creator are required' });
@@ -49,7 +53,7 @@ export default async function voiceRoutes(app: FastifyInstance) {
   });
 
   // Flow (ii): Pre-generation Voice Upload in Studio
-  app.post('/upload', async (req, reply) => {
+  app.post('/upload', { preHandler: [requireSessionPayment(voicePrice)] }, async (req, reply) => {
     try {
       const userAddress = readUser(req);
       let data: MultipartFile | undefined;

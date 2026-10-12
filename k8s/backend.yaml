@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: api
-          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/backend@sha256:af7e052e6ba7e81af7e165de2bca86b22fa094bfcfdddcdad0e7a586c4ef11bb
+          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/backend@sha256:b5116dc65b8ece9b639725a0ca627f113df08ae4c139c937496243b94d197b51
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 3005
@@ -53,6 +53,18 @@ spec:
                 secretKeyRef:
                   name: backend-secrets
                   key: GOOGLE_GENERATIVE_AI_API_KEY
+            - name: RAWCHUNKS_TREASURY_ADDRESS
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: RAWCHUNKS_TREASURY_ADDRESS
+            - name: RAWCHUNKS_SOLANA_TREASURY_ADDRESS
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: RAWCHUNKS_SOLANA_TREASURY_ADDRESS
+            - name: COMPOSE_API_URL
+              value: "https://api.compose.market"
           readinessProbe:
             httpGet:
               path: /health

@@ -19,10 +19,23 @@ function storeCover(bytes: Buffer, mimeType: string) {
   return uploadToR2('songs', `covers/${randomUUID()}`, bytes, mimeType);
 }
 
+import { requireSessionPayment } from '../broker/payment.js';
+
+const generationPricing = (request: any) => {
+  const isMaster = request.body?.modelVariant === 'sft';
+  return isMaster
+    ? { amountWei: '100000', priceUsd: 0.10, action: 'generation-master' }
+    : { amountWei: '50000', priceUsd: 0.05, action: 'generation-fast' };
+};
+
 export const generationRouter: FastifyPluginAsync = async (fastify) => {
   const streamState = stateStreams(fastify);
-  fastify.post('/generate', async (request, reply) => {
+  fastify.post('/generate', { preHandler: [requireSessionPayment(generationPricing)] }, async (request, reply) => {
     try {
+      if (request.body && typeof request.body === 'object' && !(request.body as any).creatorAddress) {
+        const authedUser = request.headers['x-session-user-address'];
+        if (typeof authedUser === 'string') (request.body as any).creatorAddress = authedUser;
+      }
       const parsed = generateSchema.parse(request.body);
       const result = await generationService.initiateGeneration(parsed);
       return reply.status(202).send(result);
