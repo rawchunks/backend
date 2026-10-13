@@ -10,10 +10,11 @@ const R2_PUBLIC_DOMAINS: Record<R2Bucket, string> = {
   versions: 'https://pub-fe479ba223594154bafa46e42d2fc7c6.r2.dev',
   loras: 'https://pub-1b122472089542a8826ac7f695328c46.r2.dev',
 };
-const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID || '25180ed0105cf8123089b02749e1e4b7';
-const CF_TOKEN = process.env.CF_GLOBAL_TOKEN || process.env.CF_API_TOKEN || '';
 // Cloudflare's REST object upload endpoint supports at most 300 MB.
 const MAX_OBJECT_BYTES = 300_000_000;
+
+function cfAccountId(): string { return process.env.CF_ACCOUNT_ID!; }
+function cfToken(): string | undefined { return process.env.CF_GLOBAL_TOKEN || process.env.CF_API_TOKEN; }
 
 function bucketDomain(bucket: R2Bucket): string {
   if (!Object.hasOwn(R2_PUBLIC_DOMAINS, bucket)) throw new Error('Unknown R2 bucket');
@@ -28,10 +29,10 @@ function objectKey(key: string): string {
 function encodedKey(key: string): string { return key.split('/').map(encodeURIComponent).join('/'); }
 function apiUrl(bucket: R2Bucket, key?: string): string {
   bucketDomain(bucket);
-  return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(CF_ACCOUNT_ID)}/r2/buckets/${bucket}/objects${key === undefined ? '' : `/${encodedKey(key)}`}`;
+  return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(cfAccountId())}/r2/buckets/${bucket}/objects${key === undefined ? '' : `/${encodedKey(key)}`}`;
 }
 function timeoutMs(): number {
-  const value = Number(process.env.R2_REQUEST_TIMEOUT_MS || 30_000);
+  const value = Number(process.env.R2_REQUEST_TIMEOUT_MS || 120_000);
   if (!Number.isSafeInteger(value) || value <= 0 || value > 2_147_483_647) throw new Error('R2_REQUEST_TIMEOUT_MS must be a positive finite integer');
   return value;
 }
@@ -63,7 +64,7 @@ export async function uploadToR2(bucket: R2Bucket, key: string, data: Buffer | U
   const url = apiUrl(bucket, cleanKey);
   if (!(data instanceof Uint8Array) || !data.byteLength || data.byteLength > MAX_OBJECT_BYTES) throw new Error('Invalid or oversized R2 upload body');
   if (typeof contentType !== 'string' || !/^[\w!#$&^.+-]+\/[\w!#$&^.+-]+(?:\s*;[^\r\n]*)?$/.test(contentType)) throw new Error('Invalid upload content type');
-  await request(url, { method: 'PUT', headers: { Authorization: `Bearer ${CF_TOKEN}`, 'Content-Type': contentType }, body: data as any }, async res => {
+  await request(url, { method: 'PUT', headers: { Authorization: `Bearer ${cfToken()}`, 'Content-Type': contentType }, body: data as any }, async res => {
     const result = await providerResult(res, `Failed to upload object to R2 bucket "${bucket}"`);
     if (!result.result || result.result.key !== cleanKey) throw new Error('R2 upload did not acknowledge the requested object');
   });
@@ -93,7 +94,7 @@ function isPrivateHost(host: string): boolean {
 function sourceLocation(sourceUrl: string): { url: URL; workerOrigin: string } {
   if (typeof sourceUrl !== 'string' || !sourceUrl.trim()) throw new Error('Audio source URL is required');
   if (/%(?![\da-f]{2})/i.test(sourceUrl)) throw new URIError('Malformed URL encoding');
-  const worker = new URL(process.env.ACESTEP_API_URL || 'http://acestep-service.rawchunks.svc.cluster.local:8001');
+  const worker = new URL(process.env.ACESTEP_API_URL!);
   let url: URL;
   if (/^\/(?:api\/audio|v1\/audio|audio)(?:[/?]|$)/.test(sourceUrl)) {
     url = new URL(sourceUrl, worker);
@@ -111,37 +112,37 @@ export async function readAudio(sourceUrl: string, fallbackContentType = 'audio/
   let { url, workerOrigin } = sourceLocation(sourceUrl);
   let redirectCount = 0;
   const download = async (): Promise<{ buffer: Buffer; contentType: string }> => {
-  const headers: Record<string, string> = {};
-  if (process.env.ACESTEP_API_KEY && url.origin === workerOrigin) headers.Authorization = `Bearer ${process.env.ACESTEP_API_KEY}`;
-  return request(url.toString(), { headers, redirect: 'manual' }, async res => {
-    if ([301, 302, 303, 307, 308].includes(res.status)) {
-      const location = res.headers.get('location');
-      if (!location || ++redirectCount > 10) throw new Error('Invalid or excessive audio redirect');
-      const next = sourceLocation(new URL(location, url).toString());
-      url = next.url;
-      void res.body?.cancel().catch(() => {});
-      return download();
-    }
-    if (!res.ok) throw new Error(`Failed to fetch source audio: ${res.statusText}`);
-    const contentType = res.headers.get('content-type') || fallbackContentType;
-    if (!/^audio\//i.test(contentType) && !/^application\/octet-stream(?:;|$)/i.test(contentType)) throw new Error('Source response is not audio');
-    const length = res.headers.get('content-length');
-    if (length !== null && (!/^\d+$/.test(length) || Number(length) > MAX_OBJECT_BYTES)) throw new Error('Oversized or invalid source audio length');
-    const chunks: Uint8Array[] = []; let size = 0;
-    if (res.body) {
-      const reader = res.body.getReader();
-      try {
-        while (true) {
-          const chunk = await reader.read(); if (chunk.done) break;
-          size += chunk.value.byteLength;
-          if (size > MAX_OBJECT_BYTES) { await reader.cancel(); throw new Error('Source audio exceeds upload limit'); }
-          chunks.push(chunk.value);
-        }
-      } finally { reader.releaseLock(); }
-    } else { const chunk = new Uint8Array(await res.arrayBuffer()); size = chunk.byteLength; chunks.push(chunk); }
-    if (!size || size > MAX_OBJECT_BYTES) throw new Error('Empty or oversized source audio');
-    return { buffer: Buffer.concat(chunks), contentType };
-  });
+    const headers: Record<string, string> = {};
+    if (process.env.ACESTEP_API_KEY && url.origin === workerOrigin) headers.Authorization = `Bearer ${process.env.ACESTEP_API_KEY}`;
+    return request(url.toString(), { headers, redirect: 'manual' }, async res => {
+      if ([301, 302, 303, 307, 308].includes(res.status)) {
+        const location = res.headers.get('location');
+        if (!location || ++redirectCount > 10) throw new Error('Invalid or excessive audio redirect');
+        const next = sourceLocation(new URL(location, url).toString());
+        url = next.url;
+        void res.body?.cancel().catch(() => { });
+        return download();
+      }
+      if (!res.ok) throw new Error(`Failed to fetch source audio: ${res.statusText}`);
+      const contentType = res.headers.get('content-type') || fallbackContentType;
+      if (!/^audio\//i.test(contentType) && !/^application\/octet-stream(?:;|$)/i.test(contentType)) throw new Error('Source response is not audio');
+      const length = res.headers.get('content-length');
+      if (length !== null && (!/^\d+$/.test(length) || Number(length) > MAX_OBJECT_BYTES)) throw new Error('Oversized or invalid source audio length');
+      const chunks: Uint8Array[] = []; let size = 0;
+      if (res.body) {
+        const reader = res.body.getReader();
+        try {
+          while (true) {
+            const chunk = await reader.read(); if (chunk.done) break;
+            size += chunk.value.byteLength;
+            if (size > MAX_OBJECT_BYTES) { await reader.cancel(); throw new Error('Source audio exceeds upload limit'); }
+            chunks.push(chunk.value);
+          }
+        } finally { reader.releaseLock(); }
+      } else { const chunk = new Uint8Array(await res.arrayBuffer()); size = chunk.byteLength; chunks.push(chunk); }
+      if (!size || size > MAX_OBJECT_BYTES) throw new Error('Empty or oversized source audio');
+      return { buffer: Buffer.concat(chunks), contentType };
+    });
   };
   return download();
 }
@@ -156,7 +157,7 @@ export async function persistAudioToR2(bucket: R2Bucket, key: string, sourceUrl:
 
 export async function deleteFromR2(bucket: R2Bucket, key: string): Promise<boolean> {
   const cleanKey = objectKey(key);
-  return request(apiUrl(bucket, cleanKey), { method: 'DELETE', headers: { Authorization: `Bearer ${CF_TOKEN}` } }, async res => {
+  return request(apiUrl(bucket, cleanKey), { method: 'DELETE', headers: { Authorization: `Bearer ${cfToken()}` } }, async res => {
     if (!res.ok) return false;
     const data = await providerResult(res, 'Failed to delete R2 object');
     return data.result?.key === cleanKey;
@@ -167,7 +168,7 @@ export async function listR2Objects(bucket: R2Bucket): Promise<R2ObjectInfo[]> {
   const results: R2ObjectInfo[] = []; const cursors = new Set<string>(); let cursor: string | undefined;
   do {
     const url = new URL(apiUrl(bucket)); url.searchParams.set('per_page', '1000'); if (cursor) url.searchParams.set('cursor', cursor);
-    const data = await request(url.toString(), { method: 'GET', headers: { Authorization: `Bearer ${CF_TOKEN}` } }, res => providerResult(res, `Failed to list objects in R2 bucket "${bucket}"`));
+    const data = await request(url.toString(), { method: 'GET', headers: { Authorization: `Bearer ${cfToken()}` } }, res => providerResult(res, `Failed to list objects in R2 bucket "${bucket}"`));
     if (!Array.isArray(data.result)) throw new Error('Invalid R2 object listing');
     for (const item of data.result) {
       if (!item || typeof item.key !== 'string' || !item.key || (item.size !== undefined && (!Number.isSafeInteger(item.size) || item.size < 0)) || (item.last_modified !== undefined && typeof item.last_modified !== 'string') || (item.etag !== undefined && typeof item.etag !== 'string')) throw new Error('Invalid R2 object metadata');

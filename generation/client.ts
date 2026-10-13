@@ -3,7 +3,7 @@ import { resolve } from 'path';
 
 dotenv.config({ path: resolve(process.cwd(), '.env') });
 
-const ACESTEP_API_URL = process.env.ACESTEP_API_URL || 'http://acestep-service.rawchunks.svc.cluster.local:8001';
+const ACESTEP_API_URL = process.env.ACESTEP_API_URL || '';
 const ACESTEP_API_KEY = process.env.ACESTEP_API_KEY || '';
 
 export interface Release {
@@ -50,10 +50,9 @@ export interface Release {
   chunk_mask_mode?: 'explicit' | 'auto';
 }
 
-/** Checkpoint-specific noise schedule, as documented by the bundled inference API. */
+/** Checkpoint-specific noise schedule, as documented by the ACE-Step 1.5 XL inference API (shift = 3.0 across all XL variants). */
 export function refinementShift(model: string): number {
-  if (model === 'acestep-v15-xl-turbo') return 3.0;
-  if (model === 'acestep-v15-xl-sft' || model === 'acestep-v15-xl-base') return 1.0;
+  if (model === 'acestep-v15-xl-turbo' || model === 'acestep-v15-xl-sft' || model === 'acestep-v15-xl-base') return 3.0;
   throw Object.assign(new Error(`No documented refinement schedule for ${model}`), { statusCode: 400 });
 }
 
@@ -84,7 +83,7 @@ export function cleanAudioPath(rawPath?: string): string | undefined {
   let path = rawPath;
   for (let depth = 0; depth < 16; depth++) {
     try {
-      const url = new URL(path, 'http://worker.local');
+      const url = new URL(path, 'https://api.rawchunks.space');
       if (!['/v1/audio', '/api/audio'].includes(url.pathname)) break;
       const encoded = url.search.slice(1).split('&').find((part) => part.split('=')[0] === 'path');
       if (!encoded) break;

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { response } from '../support/voice-storage-broker.js';
 import { deleteFromR2, getR2Url, hasR2Object, listR2Objects, persistAudioToR2, uploadToR2 } from '../../storage/r2.js';
 let fetchMock: ReturnType<typeof vi.fn>;
-beforeEach(() => { fetchMock = vi.fn(); vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => { const res = await fetchMock(url, init); return res instanceof Response ? res.clone() : res; }); });
+beforeEach(() => { vi.stubEnv('CF_ACCOUNT_ID', 'test-account'); vi.stubEnv('CF_GLOBAL_TOKEN', 'test-cloudflare-key'); vi.stubEnv('CF_API_TOKEN', 'test-cloudflare-key'); vi.stubEnv('ACESTEP_API_URL', 'http://worker.invalid:8001'); vi.stubEnv('ACESTEP_API_KEY', 'test-worker-key'); fetchMock = vi.fn(); vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => { const res = await fetchMock(url, init); return res instanceof Response ? res.clone() : res; }); });
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 const cloudApi = 'https://api.cloudflare.com/client/v4/accounts/test-account/r2/buckets';
 const domain = 'https://pub-62c17ba4ea004db3bee5152452c65d61.r2.dev';
@@ -54,9 +54,9 @@ describe('R2 transport and persistence behavior (mock fetch)', () => {
     vi.stubEnv('ACESTEP_API_KEY', ''); fetchMock.mockImplementation(async (_url: string, init?: RequestInit) => init?.method === 'PUT' ? response({ success: true, result: { key: 'x' } }) : response('audio', { headers: { 'content-type': 'audio/wav' } }));
     await persistAudioToR2('songs', 'x', '/audio/x'); expect(fetchMock.mock.calls[0][1].headers).toEqual({});
   });
-  it('uses cluster worker default if no ACESTEP URL is configured', async () => {
-    vi.stubEnv('ACESTEP_API_URL', ''); fetchMock.mockImplementation(async (_url: string, init?: RequestInit) => init?.method === 'PUT' ? response({ success: true, result: { key: 'x' } }) : response('audio', { headers: { 'content-type': 'audio/wav' } }));
-    await persistAudioToR2('songs', 'x', '/audio/x'); expect(fetchMock.mock.calls[0][0]).toBe('http://acestep-service.rawchunks.svc.cluster.local:8001/audio/x');
+  it('rejects relative audio source when no ACESTEP URL is configured', async () => {
+    vi.stubEnv('ACESTEP_API_URL', '');
+    await expect(persistAudioToR2('songs', 'x', '/audio/x')).rejects.toThrow();
   });
   it('copies unrelated pub-prefixed sources without worker credentials', async () => {
     fetchMock.mockResolvedValueOnce(response('audio', { headers: { 'content-type': 'audio/wav' } })).mockResolvedValueOnce(response({ success: true, result: { key: 'x' } }));
@@ -139,7 +139,7 @@ describe('R2 transport and persistence behavior (mock fetch)', () => {
   it.each([
     ['global token precedence', { CF_GLOBAL_TOKEN: 'global-test', CF_API_TOKEN: 'api-test', CF_ACCOUNT_ID: 'account-test' }, 'global-test', 'account-test'],
     ['API token fallback', { CF_GLOBAL_TOKEN: '', CF_API_TOKEN: 'api-test', CF_ACCOUNT_ID: 'account-test' }, 'api-test', 'account-test'],
-    ['empty token and default account', { CF_GLOBAL_TOKEN: '', CF_API_TOKEN: '', CF_ACCOUNT_ID: '' }, '', '25180ed0105cf8123089b02749e1e4b7'],
+    ['empty token and empty account', { CF_GLOBAL_TOKEN: '', CF_API_TOKEN: '', CF_ACCOUNT_ID: '' }, '', ''],
   ])('captures credentials at import with %s', async (_label, env, token, account) => {
     Object.entries(env).forEach(([key, value]) => vi.stubEnv(key, value)); vi.resetModules();
     const isolated = await import('../../storage/r2.js'); fetchMock.mockResolvedValue(response({ success: true, result: { key: 'x' } }));
