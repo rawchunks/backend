@@ -68,8 +68,15 @@ def prepare_llm_generation_inputs(
     sample_mode = bool(req.sample_mode)
     has_sample_query = bool(req.sample_query and req.sample_query.strip())
     use_format = bool(req.use_format)
-    use_cot_caption = bool(req.use_cot_caption)
-    use_cot_language = bool(req.use_cot_language)
+    is_non_thinking_edit = (
+        not thinking
+        and not sample_mode
+        and not has_sample_query
+        and not use_format
+        and getattr(req, "task_type", "") in ("repaint", "lego", "extract", "complete")
+    )
+    use_cot_caption = False if is_non_thinking_edit else bool(req.use_cot_caption)
+    use_cot_language = False if is_non_thinking_edit else bool(req.use_cot_language)
     full_analysis_only = bool(req.full_analysis_only)
 
     if req.task_type in ("cover", "cover-nofsq") and selected_handler_device == "mps":
