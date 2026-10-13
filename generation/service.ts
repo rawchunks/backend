@@ -79,7 +79,7 @@ export class Service {
       instrumental: !!params.instrumental, sample_mode: sampleMode, sample_query: sampleMode ? params.prompt : undefined,
       vocal_language: params.vocalLanguage, bpm: params.bpm, key_scale: params.keyScale, seed: params.seed,
       use_format: false, use_cot_caption: false, use_cot_language: false, use_random_seed: params.seed === undefined,
-      batch_size: 1, inference_steps: steps, guidance_scale: sft ? 5.5 : 1.0, shift: refinementShift(model), audio_format: 'wav',
+      batch_size: 1, inference_steps: steps, guidance_scale: sft ? 7.0 : 1.0, shift: refinementShift(model), audio_format: 'wav',
       ...(params.audioDuration === undefined ? {} : { audio_duration: params.audioDuration }),
     };
     let voiceProvenance: Record<string, unknown> | undefined;
