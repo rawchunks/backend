@@ -3,6 +3,29 @@ import { sql } from 'drizzle-orm';
 import { songs } from './songs.js';
 import { stems } from './stems.js';
 
+export interface AlignedWord {
+  text: string;
+  start: number;
+  end: number;
+  loss?: number;
+}
+
+export interface AlignedLine {
+  index: number;
+  text: string;
+  isTag?: boolean;
+  start: number | null;
+  end: number | null;
+  words: AlignedWord[];
+}
+
+export interface LyricsAlignment {
+  source: 'scribe_v2' | 'forced_alignment';
+  updatedAt: string;
+  lines: AlignedLine[];
+  words: AlignedWord[];
+}
+
 export interface TakeProvenance {
   taskId: string;
   sourceUrl: string;
