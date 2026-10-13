@@ -88,7 +88,7 @@ function known(item){return item&&!(item.status===0&&item.result==='[]'&&item.st
 export function audioUrl(raw){
  if(typeof raw!=='string'||!raw)return undefined;let path=raw;
  for(let depth=0;depth<16;depth++){
-  const url=new URL(path,'http://worker.local');if(!['/v1/audio','/api/audio'].includes(url.pathname))break;
+  const url=new URL(path,'https://api.rawchunks.space');if(!['/v1/audio','/api/audio'].includes(url.pathname))break;
   const next=url.searchParams.get('path');if(!next||next===path)break;path=next;
  }
  if(path.startsWith('/app/ACE-Step-1.5/'))path=path.slice('/app/ACE-Step-1.5/'.length);
