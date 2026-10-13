@@ -64,8 +64,11 @@ function floatWave(data: Buffer): Buffer {
 
 export function sliceWave(data: Buffer, region: { start: number; end: number }): Buffer {
   const source = readWave(data);
-  if (!Number.isFinite(region.start) || !Number.isFinite(region.end) || region.start < 0 || region.end <= region.start || region.end > source.duration) throw new Error('Invalid extract audio interval');
-  return encodeWave(source, source.samples.subarray(Math.round(region.start * source.rate) * source.frameBytes, Math.round(region.end * source.rate) * source.frameBytes));
+  const latentStepToleranceSec = source.rate >= 1000 ? 0.05 : 0;
+  if (!Number.isFinite(region.start) || !Number.isFinite(region.end) || region.start < 0 || region.end <= region.start || region.end > source.duration + latentStepToleranceSec) throw new Error('Invalid extract audio interval');
+  const startFrame = Math.min(source.frames, Math.round(region.start * source.rate)), endFrame = Math.min(source.frames, Math.round(region.end * source.rate));
+  if (endFrame <= startFrame) throw new Error('Invalid extract audio interval');
+  return encodeWave(source, source.samples.subarray(startFrame * source.frameBytes, endFrame * source.frameBytes));
 }
 
 export function padWave(data: Buffer, duration: number): Buffer {
@@ -76,16 +79,82 @@ export function padWave(data: Buffer, duration: number): Buffer {
   return encodeWave(source, samples);
 }
 
-export function spliceWave(sourceData: Buffer, generatedData: Buffer, region: { start: number; end: number }, offset = region.start): Buffer {
+export function silentWave(data: Buffer): Buffer {
+  const source = readWave(data);
+  const samples = Buffer.alloc(source.samples.length, source.format === 1 && source.bits === 8 ? 128 : 0);
+  return encodeWave(source, samples);
+}
+
+function readSampleValue(wave: Wave, buf: Buffer, frame: number, channel: number): number {
+  const bytesPerSample = wave.bits / 8;
+  const offset = (frame * wave.channels + channel) * bytesPerSample;
+  if (wave.format === 3) return wave.bits === 64 ? buf.readDoubleLE(offset) : buf.readFloatLE(offset);
+  if (wave.bits === 8) return (buf[offset] - 128) / 128;
+  return buf.readIntLE(offset, bytesPerSample) / 2 ** (wave.bits - 1);
+}
+
+function writeSampleValue(wave: Wave, buf: Buffer, frame: number, channel: number, value: number): void {
+  const bytesPerSample = wave.bits / 8;
+  const offset = (frame * wave.channels + channel) * bytesPerSample;
+  const clamped = Math.max(-1, Math.min(1, value));
+  if (wave.format === 3) {
+    if (wave.bits === 64) buf.writeDoubleLE(clamped, offset);
+    else buf.writeFloatLE(clamped, offset);
+    return;
+  }
+  if (wave.bits === 8) {
+    buf[offset] = Math.max(0, Math.min(255, Math.round(clamped * 128 + 128)));
+    return;
+  }
+  const scale = 2 ** (wave.bits - 1);
+  const intVal = Math.max(-scale, Math.min(scale - 1, Math.round(clamped * scale)));
+  buf.writeIntLE(intVal, offset, bytesPerSample);
+}
+
+export function spliceWave(sourceData: Buffer, generatedData: Buffer, region: { start: number; end: number }, offset = region.start, crossfadeSec = 0.025): Buffer {
   const source = readWave(sourceData), generated = readWave(generatedData);
   if ([source.format, source.channels, source.rate, source.bits].some((value, index) => value !== [generated.format, generated.channels, generated.rate, generated.bits][index])) throw new Error('Source and generated WAV format must match');
   if (!Number.isFinite(region.start) || !Number.isFinite(region.end) || region.start < 0 || region.end <= region.start || region.start > source.duration) throw new Error('Invalid edit audio interval');
-  const startFrame = Math.round(region.start * source.rate), endFrame = Math.round(region.end * source.rate);
-  const generatedStart = Math.round(offset * source.rate), generatedEnd = generatedStart + endFrame - startFrame;
+  const startFrame = Math.round(region.start * source.rate);
+  let endFrame = Math.round(region.end * source.rate);
+  const generatedStart = Math.round(offset * source.rate);
+  let generatedEnd = generatedStart + endFrame - startFrame;
+  const latentStepTolerance = Math.floor(source.rate * 0.05);
+  if (generated.frames < generatedEnd && generatedEnd - generated.frames <= latentStepTolerance && generated.frames > generatedStart) {
+    generatedEnd = generated.frames;
+    endFrame = startFrame + (generatedEnd - generatedStart);
+  }
   if (!Number.isFinite(offset) || offset < 0 || generated.frames < generatedEnd) throw new Error('Generated audio does not cover the selected edit interval');
   const frames = Math.max(source.frames, endFrame), samples = Buffer.alloc(frames * source.frameBytes);
   source.samples.copy(samples);
   generated.samples.copy(samples, startFrame * source.frameBytes, generatedStart * source.frameBytes, generatedEnd * source.frameBytes);
+
+  const regionFrames = endFrame - startFrame;
+  const maxCf = source.rate >= 1000 && crossfadeSec > 0 ? Math.min(Math.round(crossfadeSec * source.rate), Math.floor(regionFrames / 4)) : 0;
+  if (maxCf > 0) {
+    const leftCf = startFrame > 0 ? Math.min(maxCf, startFrame, source.frames - startFrame) : 0;
+    for (let i = 0; i < leftCf; i++) {
+      const alpha = 0.5 * (1 - Math.cos((Math.PI * (i + 1)) / (leftCf + 1)));
+      const sFrame = startFrame + i;
+      const gFrame = generatedStart + i;
+      for (let ch = 0; ch < source.channels; ch++) {
+        const srcVal = readSampleValue(source, source.samples, sFrame, ch);
+        const genVal = readSampleValue(generated, generated.samples, gFrame, ch);
+        writeSampleValue(source, samples, sFrame, ch, (1 - alpha) * srcVal + alpha * genVal);
+      }
+    }
+    const rightCf = endFrame < source.frames ? Math.min(maxCf, source.frames - endFrame, regionFrames) : 0;
+    for (let i = 0; i < rightCf; i++) {
+      const alpha = 0.5 * (1 + Math.cos((Math.PI * (i + 1)) / (rightCf + 1)));
+      const sFrame = endFrame - rightCf + i;
+      const gFrame = generatedEnd - rightCf + i;
+      for (let ch = 0; ch < source.channels; ch++) {
+        const srcVal = readSampleValue(source, source.samples, sFrame, ch);
+        const genVal = readSampleValue(generated, generated.samples, gFrame, ch);
+        writeSampleValue(source, samples, sFrame, ch, (1 - alpha) * srcVal + alpha * genVal);
+      }
+    }
+  }
   return encodeWave(source, samples);
 }
 
@@ -126,3 +195,36 @@ export async function composeEdit(sourceData: Buffer, generatedData: Buffer, reg
   if ([source.format, source.channels, source.rate, source.bits].some((value, index) => value !== [generated.format, generated.channels, generated.rate, generated.bits][index])) generatedDataWave = await transcode(generatedData, source);
   return spliceWave(sourceDataWave, generatedDataWave, region, offset);
 }
+
+export async function mixWaves(buffers: Buffer[]): Promise<Buffer> {
+  if (!buffers.length) throw new Error('At least one audio buffer is required to mix');
+  const firstDecoded = await decodeWave(buffers[0]);
+  if (buffers.length === 1) return firstDecoded;
+  const base = readWave(firstDecoded);
+  const waves: Wave[] = [base];
+  let maxFrames = base.frames;
+  for (let i = 1; i < buffers.length; i++) {
+    let decoded = await decodeWave(buffers[i]);
+    let wave = readWave(decoded);
+    if ([base.format, base.channels, base.rate, base.bits].some((value, idx) => value !== [wave.format, wave.channels, wave.rate, wave.bits][idx])) {
+      decoded = await transcode(buffers[i], base);
+      wave = readWave(decoded);
+    }
+    waves.push(wave);
+    if (wave.frames > maxFrames) maxFrames = wave.frames;
+  }
+  const samples = Buffer.alloc(maxFrames * base.frameBytes, base.format === 1 && base.bits === 8 ? 128 : 0);
+  for (let frame = 0; frame < maxFrames; frame++) {
+    for (let ch = 0; ch < base.channels; ch++) {
+      let sum = 0;
+      for (const wave of waves) {
+        if (frame < wave.frames) {
+          sum += readSampleValue(wave, wave.samples, frame, ch);
+        }
+      }
+      writeSampleValue(base, samples, frame, ch, sum);
+    }
+  }
+  return encodeWave(base, samples);
+}
+
