@@ -10,6 +10,7 @@ import { randomUUID } from 'node:crypto';
 const baseSchema = {
   songId: z.string().min(1),
   stemId: z.string().optional(),
+  sourceTakeId: z.string().optional(),
   userAddress: z.string().min(10),
   srcAudioUrl: z.string().refine((value) => !/^[a-z][a-z\d+.-]*:/i.test(value) || /^https?:\/\//i.test(value)).optional(),
   modelQuality: z.enum(['turbo', 'sft', 'base']).optional(),
@@ -17,6 +18,7 @@ const baseSchema = {
   seed: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
   bpm: z.number().finite().min(30).max(300).optional(),
   keyScale: z.string().optional(),
+  timeSignature: z.string().optional(),
   vocalLanguage: z.string().optional(),
 };
 
@@ -37,11 +39,16 @@ const repaintSchema = z.object({
 const layerSchema = z.object({
   ...baseSchema,
   prompt: z.string().min(1),
+  lyrics: z.string().optional(),
   globalCaption: z.string().optional(),
   trackName: z.string().optional(),
   trackClasses: z.array(z.string()).optional(),
   audioDuration: z.number().finite().min(5).optional(),
   legoContextTrackIds: z.array(z.string()).optional(),
+  start: z.number().finite().min(0).optional(),
+  end: z.number().finite().min(0).optional(),
+  repaintingStart: z.number().finite().min(0).optional(),
+  repaintingEnd: z.number().finite().min(0).optional(),
 });
 
 const commitSchema = z.object({
@@ -57,14 +64,26 @@ const extendSchema = z.object({
   prompt: z.string().optional(),
   lyrics: z.string().optional(),
   audioDuration: z.number().finite().min(5),
+  start: z.number().finite().min(0).optional(),
+  end: z.number().finite().min(0).optional(),
+  repaintingStart: z.number().finite().min(0).optional(),
+  repaintingEnd: z.number().finite().min(0).optional(),
+  repaintMode: z.enum(['conservative', 'balanced', 'aggressive']).optional(),
+  repaintStrength: z.number().finite().min(0).max(1).optional(),
+  repaintLatentCrossfadeFrames: z.number().finite().int().min(0).optional(),
   repaintWavCrossfadeSec: z.number().finite().min(0).optional(),
 });
 
 const remixSchema = z.object({
   ...baseSchema,
   prompt: z.string().min(1),
+  lyrics: z.string().optional(),
   coverStrength: z.number().finite().min(0).max(1).optional(),
   coverNoiseStrength: z.number().finite().min(0).max(1).optional(),
+  start: z.number().finite().min(0).optional(),
+  end: z.number().finite().min(0).optional(),
+  repaintingStart: z.number().finite().min(0).optional(),
+  repaintingEnd: z.number().finite().min(0).optional(),
 });
 
 const separateSchema = z.object({
@@ -77,6 +96,8 @@ const applySchema = z.object({
   task: z.enum(['repaint', 'lego', 'complete', 'extend', 'cover', 'extract']),
   prompt: z.string().optional(),
   lyrics: z.string().optional(),
+  start: z.number().finite().min(0).optional(),
+  end: z.number().finite().min(0).optional(),
   repaintingStart: z.number().finite().min(0).optional(),
   repaintingEnd: z.number().finite().min(0).optional(),
   audioDuration: z.number().finite().min(5).optional(),
@@ -170,7 +191,14 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
   });
   fastify.post('/extract', async (request, reply) => {
     try {
-      const params = z.object({ songId: z.string().min(1), stemId: z.string().optional(), start: z.number().finite().min(0), end: z.number().finite().min(0) }).refine(params => params.end > params.start).parse(request.body);
+      const params = z.object({
+        songId: z.string().min(1),
+        stemId: z.string().optional(),
+        sourceTakeId: z.string().optional(),
+        srcAudioUrl: z.string().refine((value) => !/^[a-z][a-z\d+.-]*:/i.test(value) || /^https?:\/\//i.test(value)).optional(),
+        start: z.number().finite().min(0),
+        end: z.number().finite().min(0),
+      }).refine(params => params.end > params.start).parse(request.body);
       return reply.code(201).send(await service.extractSection({ ...params, userAddress: readUser(request) }));
     } catch (error: any) { return reply.code(error instanceof z.ZodError ? 400 : error.statusCode ?? 400).send({ error: error.message }); }
   });
@@ -182,10 +210,16 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
         modelVariant: p.modelVariant,
         songId: p.songId,
         stemId: p.stemId,
+        sourceTakeId: p.sourceTakeId,
         userAddress: p.userAddress,
         task: 'repaint',
         prompt: p.prompt,
         lyrics: p.lyrics,
+        seed: p.seed,
+        bpm: p.bpm,
+        keyScale: p.keyScale,
+        timeSignature: p.timeSignature,
+        vocalLanguage: p.vocalLanguage,
         repaintingStart: p.start,
         repaintingEnd: p.end,
         repaintMode: p.repaintMode || p.repaint_mode,
@@ -209,14 +243,23 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
         modelVariant: p.modelVariant,
         songId: p.songId,
         stemId: p.stemId,
+        sourceTakeId: p.sourceTakeId,
         userAddress: p.userAddress,
         task: 'lego',
         prompt: p.prompt,
+        lyrics: p.lyrics,
+        seed: p.seed,
+        bpm: p.bpm,
+        keyScale: p.keyScale,
+        timeSignature: p.timeSignature,
+        vocalLanguage: p.vocalLanguage,
         globalCaption: p.globalCaption,
         trackName: p.trackName,
         trackClasses: p.trackClasses,
         audioDuration: p.audioDuration,
         legoContextTrackIds: p.legoContextTrackIds,
+        repaintingStart: p.repaintingStart ?? p.start,
+        repaintingEnd: p.repaintingEnd ?? p.end,
         srcAudioUrl: p.srcAudioUrl,
       });
       return reply.status(202).send(res);
@@ -247,6 +290,7 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
         modelVariant: p.modelVariant,
         songId: p.songId,
         stemId: p.stemId,
+        sourceTakeId: p.sourceTakeId,
         userAddress: p.userAddress,
         task: 'extend',
         prompt: p.prompt,
@@ -254,8 +298,14 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
         seed: p.seed,
         bpm: p.bpm,
         keyScale: p.keyScale,
+        timeSignature: p.timeSignature,
         vocalLanguage: p.vocalLanguage,
         audioDuration: p.audioDuration,
+        repaintingStart: p.repaintingStart ?? p.start,
+        repaintingEnd: p.repaintingEnd ?? p.end,
+        repaintMode: p.repaintMode,
+        repaintStrength: p.repaintStrength,
+        repaintLatentCrossfadeFrames: p.repaintLatentCrossfadeFrames,
         repaintWavCrossfadeSec: p.repaintWavCrossfadeSec,
         srcAudioUrl: p.srcAudioUrl,
       });
@@ -274,11 +324,20 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
         modelVariant: p.modelVariant,
         songId: p.songId,
         stemId: p.stemId,
+        sourceTakeId: p.sourceTakeId,
         userAddress: p.userAddress,
         task: 'cover',
         prompt: p.prompt,
+        lyrics: p.lyrics,
+        seed: p.seed,
+        bpm: p.bpm,
+        keyScale: p.keyScale,
+        timeSignature: p.timeSignature,
+        vocalLanguage: p.vocalLanguage,
         coverStrength: p.coverStrength,
         coverNoiseStrength: p.coverNoiseStrength,
+        repaintingStart: p.repaintingStart ?? p.start,
+        repaintingEnd: p.repaintingEnd ?? p.end,
         srcAudioUrl: p.srcAudioUrl,
       });
       return reply.status(202).send(res);
@@ -307,7 +366,11 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
   fastify.post('/apply', async (request, reply) => {
     try {
       const parsed = applySchema.parse(request.body);
-      const result = await service.dispatchEditTask(parsed);
+      const result = await service.dispatchEditTask({
+        ...parsed,
+        repaintingStart: parsed.repaintingStart ?? parsed.start,
+        repaintingEnd: parsed.repaintingEnd ?? parsed.end,
+      });
       return reply.status(202).send(result);
     } catch (err: any) {
       request.log.error(err);
@@ -387,6 +450,35 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
     try {
       const history = await service.getTimelineHistory(songId);
       return reply.send(history);
+    } catch (err: any) {
+      return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({ error: err.message });
+    }
+  });
+
+  fastify.get('/lyrics/:songId', async (request, reply) => {
+    const { songId } = request.params as { songId: string };
+    const { language } = (request.query ?? {}) as { language?: string };
+    try {
+      const result = await service.getSongLyrics(songId, language);
+      return reply.send(result);
+    } catch (err: any) {
+      return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({ error: err.message });
+    }
+  });
+
+  fastify.post('/lyrics/:songId', async (request, reply) => {
+    const { songId } = request.params as { songId: string };
+    const body = (request.body ?? {}) as {
+      vocalLanguage?: string;
+      lyrics?: string;
+      mode?: 'extract' | 'align';
+    };
+    try {
+      const result = await service.extractSongLyrics(songId, body.vocalLanguage, {
+        mode: body.mode,
+        lyrics: body.lyrics,
+      });
+      return reply.send(result);
     } catch (err: any) {
       return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({ error: err.message });
     }
