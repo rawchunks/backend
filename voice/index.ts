@@ -42,7 +42,7 @@ export default async function voiceRoutes(app: FastifyInstance) {
     try {
       const userAddress = readUser(req);
       validateVoiceCreator(creator);
-      checkUser(userAddress, creator);
+      await checkUser(userAddress, creator);
       const { song } = await readSong(req, songId);
       const result = await voiceService.cloneVoiceFromSong({ songId, name, creator: song.creator });
       return reply.status(202).send(result);
@@ -70,7 +70,7 @@ export default async function voiceRoutes(app: FastifyInstance) {
       const name = multipartText(data.fields.name);
       if (!validText(creator)) throw new VoiceInputError('creator is required');
       validateVoiceCreator(creator);
-      checkUser(userAddress, creator);
+      await checkUser(userAddress, creator);
       validateVoiceFormat(buffer!, data.filename, data.mimetype);
 
       const result = await voiceService.cloneVoiceFromAudio({
@@ -102,7 +102,7 @@ export default async function voiceRoutes(app: FastifyInstance) {
     try {
       const userAddress = readUser(req);
       validateVoiceCreator(creator);
-      checkUser(userAddress, creator);
+      await checkUser(userAddress, creator);
       const voices = await voiceService.listVoices(creator);
       return reply.send({ voices });
     } catch (err: any) {
@@ -116,12 +116,12 @@ export default async function voiceRoutes(app: FastifyInstance) {
       const user = readUser(req);
       const voice = await voiceService.getVoice(req.params.id);
       if (!voice) return reply.status(404).send({ error: 'Voice not found' });
-      checkUser(user, voice.creator);
+      await checkUser(user, voice.creator);
       return streamState(req, reply, {
         read: async () => {
           const current = await voiceService.getVoice(req.params.id);
           if (!current) throw new Error('Voice not found');
-          checkUser(user, current.creator);
+          await checkUser(user, current.creator);
           return { voice: current, status: current.status, ...(current.error ? { error: current.error } : {}) };
         },
         terminal: state => ['ready', 'error'].includes(state.status),
@@ -143,7 +143,7 @@ export default async function voiceRoutes(app: FastifyInstance) {
       if (!voice) {
         return reply.status(404).send({ error: 'Voice not found' });
       }
-      checkUser(userAddress, voice.creator);
+      await checkUser(userAddress, voice.creator);
       return reply.send({ voice });
     } catch (err: any) {
       req.log.error(err);

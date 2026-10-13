@@ -80,26 +80,46 @@ export async function resolveSongStreamPayment(request: FastifyRequest): Promise
 
   const token = extractSessionToken(request);
   const payload = token ? parseComposeToken(token) : null;
-  const userAddress = (request.headers['x-session-user-address'] as string | undefined) || payload?.sub;
+  const userAddress = (request.headers['x-session-user-address'] as string | undefined)
+    || (request.headers['x-user-address'] as string | undefined)
+    || (request.headers['x-account-address'] as string | undefined)
+    || (request.query as Record<string, string>)?.userAddress
+    || payload?.sub;
 
   let isCreator = false;
-  if (userAddress) {
-    let parsedUser: string = userAddress;
-    let parsedCreator: string = song.creator;
+  if (userAddress && song.creator) {
+    let parsedUser: string = userAddress.trim();
+    let parsedCreator: string = song.creator.trim();
     try {
       parsedUser = parseAddress(userAddress).value;
+    } catch {}
+    try {
       parsedCreator = parseAddress(song.creator).value;
     } catch {}
 
     if (parsedUser.toLowerCase() === parsedCreator.toLowerCase() || parsedUser === parsedCreator) {
       isCreator = true;
     } else {
-      const pair = await getWalletPair(parsedUser);
-      if (pair) {
-        isCreator = Boolean(
-          (pair.svmAddress && (song.creator === pair.svmAddress || parsedCreator === pair.svmAddress)) ||
-          (pair.evmAddress && (song.creator.toLowerCase() === pair.evmAddress.toLowerCase() || parsedCreator.toLowerCase() === pair.evmAddress.toLowerCase()))
-        );
+      try {
+        const pair = await getWalletPair(parsedUser);
+        if (pair) {
+          isCreator = Boolean(
+            (pair.svmAddress && (song.creator === pair.svmAddress || parsedCreator === pair.svmAddress)) ||
+            (pair.evmAddress && (song.creator.toLowerCase() === pair.evmAddress.toLowerCase() || parsedCreator.toLowerCase() === pair.evmAddress.toLowerCase()))
+          );
+        }
+      } catch {}
+
+      if (!isCreator) {
+        try {
+          const creatorPair = await getWalletPair(parsedCreator);
+          if (creatorPair) {
+            isCreator = Boolean(
+              (creatorPair.svmAddress && (userAddress === creatorPair.svmAddress || parsedUser === creatorPair.svmAddress)) ||
+              (creatorPair.evmAddress && (userAddress.toLowerCase() === creatorPair.evmAddress.toLowerCase() || parsedUser.toLowerCase() === creatorPair.evmAddress.toLowerCase()))
+            );
+          }
+        } catch {}
       }
     }
   }
@@ -148,7 +168,7 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       const parsed = profileBody.parse(request.body || {});
       const userAddress = readUser(request);
       const targetAddress = parsed.address || userAddress;
-      checkUser(userAddress, targetAddress);
+      await checkUser(userAddress, targetAddress);
       const pair = await updateProfile({
         address: targetAddress,
         nickname: parsed.nickname,
@@ -175,7 +195,7 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       const parsed = consentBody.parse(request.body);
       const userAddress = readUser(request);
       const signingAddress = parsed.address ?? parsed.evmAddress ?? parsed.svmAddress!;
-      checkUser(userAddress, signingAddress);
+      await checkUser(userAddress, signingAddress);
       const record = await putUserConsent({
         address: signingAddress, svmAddress: parsed.svmAddress, chainId: parsed.chainId,
         disclaimerType: parsed.disclaimerType, policyVersion: parsed.policyVersion, signature: parsed.signature,
@@ -191,7 +211,7 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       const query = listQuery.parse(request.query);
       if (query.creator) {
         address.parse(query.creator);
-        checkUser(readUser(request), query.creator);
+        await checkUser(readUser(request), query.creator);
         const rows = query.limit === undefined && query.offset === undefined
           ? await listSongsByCreator(query.creator)
           : await listSongsByCreator(query.creator, query.limit, query.offset);

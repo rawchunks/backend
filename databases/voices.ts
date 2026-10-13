@@ -1,6 +1,7 @@
 import { eq, desc, inArray, and, isNull, notInArray, sql } from 'drizzle-orm';
 import { songDb } from './client.js';
 import { voices, voiceAdapters, type Voice, type NewVoice, type VoiceAdapter, type NewVoiceAdapter } from './schema/voices.js';
+import { getWalletPair } from './users.js';
 const owner = (address: string) => /^0x/i.test(address) ? address.toLowerCase() : address;
 
 export async function createVoice(data: NewVoice): Promise<Voice> {
@@ -64,7 +65,20 @@ export async function createVoiceFromSource(data: NewVoice): Promise<Voice> {
   return committed;
 }
 export async function listVoicesByCreator(creatorAddress: string): Promise<Voice[]> {
-  return songDb.select().from(voices).where(eq(voices.creator, owner(creatorAddress))).orderBy(desc(voices.created_at));
+  const normalized = owner(creatorAddress);
+  const addresses = [normalized];
+  try {
+    const pair = await getWalletPair(normalized);
+    if (pair) {
+      if (pair.evmAddress && !addresses.includes(pair.evmAddress.toLowerCase())) {
+        addresses.push(pair.evmAddress.toLowerCase());
+      }
+      if (pair.svmAddress && !addresses.includes(pair.svmAddress)) {
+        addresses.push(pair.svmAddress);
+      }
+    }
+  } catch {}
+  return songDb.select().from(voices).where(inArray(voices.creator, addresses)).orderBy(desc(voices.created_at));
 }
 export async function listPendingVoices(limit = 20, statuses?: Voice['status'][]): Promise<Voice[]> {
   return songDb.select().from(voices).where(statuses ? inArray(voices.status, statuses) : notInArray(voices.status, ['ready', 'error'])).orderBy(sql`${voices.metadata}->>'reconciled_at' asc nulls first`, voices.created_at).limit(limit);

@@ -198,26 +198,35 @@ export async function checkUserConsent(address: string): Promise<{ hasConsented:
 }
 
 export function readUser(request: FastifyRequest): string {
-  const value = request.headers['x-session-user-address'];
+  const value = (request.headers['x-session-user-address'] as string | undefined)
+    || (request.headers['x-user-address'] as string | undefined)
+    || (request.headers['x-account-address'] as string | undefined)
+    || (request.query as Record<string, string>)?.userAddress;
   if (value === undefined) throw new RequestError('userAddress header is required');
   try { return parseAddress(value).value; }
   catch { throw new RequestError('Invalid userAddress header'); }
 }
-export function checkUser(userAddress: string, raw: string): void {
+export async function checkUser(userAddress: string, raw: string): Promise<void> {
   let value: string;
   try { value = parseAddress(raw).value; }
   catch { throw new RequestError('Invalid userAddress'); }
-  if (value !== userAddress) throw new RequestError('userAddress does not match this resource', 403);
+  if (value === userAddress) return;
+  try {
+    const pair = await getWalletPair(userAddress);
+    if (pair && (value === pair.svmAddress || value === parseAddress(pair.evmAddress).value)) {
+      return;
+    }
+    const targetPair = await getWalletPair(value);
+    if (targetPair && (userAddress === targetPair.svmAddress || userAddress === parseAddress(targetPair.evmAddress).value)) {
+      return;
+    }
+  } catch {}
+  throw new RequestError('userAddress does not match this resource', 403);
 }
 export async function readSong(request: FastifyRequest, songId: string) {
   const userAddress = readUser(request), song = await getSongById(songId);
   if (!song) throw new RequestError('Song not found', 404);
-  if (parseAddress(song.creator).value !== userAddress) {
-    const pair = await getWalletPair(userAddress);
-    if (!pair || song.creator !== pair.svmAddress && parseAddress(song.creator).value !== pair.evmAddress) {
-      throw new RequestError('userAddress does not match this resource', 403);
-    }
-  }
+  await checkUser(userAddress, song.creator);
   return { userAddress, song };
 }
 export async function readTake(request: FastifyRequest, takeId: string, songId?: string) {

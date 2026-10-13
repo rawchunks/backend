@@ -1,7 +1,8 @@
-import { eq, desc, and } from 'drizzle-orm';
+import { eq, desc, and, inArray } from 'drizzle-orm';
 import { songDb } from './client.js';
 import { albums, type Album, type NewAlbum } from './schema/albums.js';
 import { songs } from './schema/songs.js';
+import { getWalletPair } from './users.js';
 
 export async function createAlbum(data: NewAlbum): Promise<Album> {
   const [album] = await songDb.insert(albums).values(data).returning();
@@ -15,10 +16,22 @@ export async function getAlbumById(id: string): Promise<Album | null> {
 
 export async function listAlbumsByCreator(creator: string): Promise<Album[]> {
   const normalized = creator.startsWith('0x') ? creator.toLowerCase() : creator;
+  const addresses = [normalized];
+  try {
+    const pair = await getWalletPair(normalized);
+    if (pair) {
+      if (pair.evmAddress && !addresses.includes(pair.evmAddress.toLowerCase())) {
+        addresses.push(pair.evmAddress.toLowerCase());
+      }
+      if (pair.svmAddress && !addresses.includes(pair.svmAddress)) {
+        addresses.push(pair.svmAddress);
+      }
+    }
+  } catch {}
   return songDb
     .select()
     .from(albums)
-    .where(eq(albums.creator, normalized))
+    .where(inArray(albums.creator, addresses))
     .orderBy(desc(albums.created_at));
 }
 

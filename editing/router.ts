@@ -140,7 +140,7 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
         const { userAddress, song } = await readSong(request, songId);
         if (request.method !== 'GET' && song?.metadata_cid) return reply.status(409).send({ error: 'Open an editable version before changing this song' });
         const supplied = body?.userAddress ?? query.userAddress;
-        if (typeof supplied === 'string') checkUser(userAddress, supplied);
+        if (typeof supplied === 'string') await checkUser(userAddress, supplied);
       } else if (params.id) {
         const { song } = await readTake(request, params.id);
         if (request.method !== 'GET' && song?.metadata_cid) return reply.status(409).send({ error: 'Open an editable version before changing this song' });
