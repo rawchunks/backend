@@ -55,18 +55,22 @@ export async function activateTake(songId: string, stemId: string | null, takeId
     // Persist the lane, selected take, playback URLs and history in one Neon
     // transaction. A failed write leaves the original arrangement intact.
     const target = and(eq(takes.song_id, songId), eq(takes.id, takeId));
-    const scope = and(eq(takes.song_id, songId), sql`${takes.stem_id} is not distinct from ${stemId}`);
+    const scope = merge.master
+      ? and(eq(takes.song_id, songId), sql`(${takes.stem_id} is null or ${takes.stem_id} is not distinct from ${stemId} or ${takes.stem_id} like 'stem-master%' or ${takes.stem_id} like 'stm-master%')`)
+      : and(eq(takes.song_id, songId), sql`${takes.stem_id} is not distinct from ${stemId}`);
     const statements: any[] = [songDb.select({ id: songs.id }).from(songs).where(eq(songs.id, songId)).for('update')];
     if (merge.take) statements.push(songDb.insert(takes).values({ ...merge.take, is_active: false }).onConflictDoNothing());
     if (merge.consume?.length) statements.push(songDb.delete(takes).where(and(eq(takes.song_id, songId), inArray(takes.id, merge.consume))));
     for (const candidate of merge.remaining ?? []) statements.push(songDb.update(takes).set({ provenance: candidate.provenance }).where(and(eq(takes.song_id, songId), eq(takes.id, candidate.id))));
     if (merge.url) statements.push(songDb.update(takes).set({ url: merge.url, ...(merge.provenance ? { provenance: merge.provenance } : {}) }).where(target));
     if (merge.stem) {
-      statements.push(songDb.insert(stems).values(merge.stem).onConflictDoNothing());
-      statements.push(songDb.update(takes).set({ stem_id: merge.stem.id }).where(target));
+      statements.push(songDb.insert(stems).values(merge.stem).onConflictDoUpdate({
+        target: stems.id,
+        set: { url: merge.stem.url, is_muted: false },
+      }));
     }
     statements.push(songDb.update(takes).set({ is_active: false }).where(scope));
-    statements.push(songDb.update(takes).set({ is_active: true }).where(target));
+    statements.push(songDb.update(takes).set({ is_active: true, ...(stemId !== null ? { stem_id: stemId } : {}) }).where(target));
     if (stemId !== null) statements.push(songDb.update(stems).set({ url: sql`(select url from takes where id = ${takeId} and song_id = ${songId})` }).where(and(eq(stems.id, stemId), eq(stems.song_id, songId))));
     if (merge.master) statements.push(songDb.update(songs).set({ url: sql`(select url from takes where id = ${takeId} and song_id = ${songId})`, ...(merge.duration === undefined ? {} : { duration: merge.duration }) }).where(eq(songs.id, songId)));
     statements.push(songDb.insert(commits).values(merge.commit));
@@ -96,3 +100,14 @@ export async function deleteTake(id: string, songId?: string, inactiveOnly = fal
   const result = await songDb.delete(takes).where(and(eq(takes.id, id), songId === undefined ? undefined : eq(takes.song_id, songId), inactiveOnly ? eq(takes.is_active, false) : undefined)).returning({ id: takes.id });
   return result.length > 0;
 }
+
+export async function updateTakeLyrics(id: string, songId: string, lyrics: string | null, provenance?: Take['provenance']): Promise<void> {
+  await songDb
+    .update(takes)
+    .set({
+      lyrics,
+      ...(provenance !== undefined ? { provenance } : {}),
+    })
+    .where(and(eq(takes.id, id), eq(takes.song_id, songId)));
+}
+
