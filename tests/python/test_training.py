@@ -341,3 +341,22 @@ def test_dataset_cancellation_blocks_persistence_builder_and_terminal_success(tr
     assert builder.samples is original_samples
     assert runtime.dataset_json_path == "original.json"
     store.mark_succeeded.assert_not_called()
+
+
+def test_cross_pod_audio_cache_and_peer_fetch(training, monkeypatch, tmp_path):
+    wav_file = tmp_path / "sample-cross-pod.wav"
+    wav_file.write_bytes(b"RIFF-cross-pod-audio")
+    kv = {}
+    client = types.SimpleNamespace(
+        set=lambda k, v, ex=None: kv.__setitem__(k, v),
+        get=lambda k: kv.get(k),
+    )
+    store = types.SimpleNamespace(client=client)
+    monkeypatch.setattr(training, "_pod_audio_origin", lambda: "http://10.56.4.9:8001")
+    training.cache_audio_file(store, wav_file)
+    assert kv[f"rawchunks:worker:audio-owner:{wav_file.name}"] == f"http://10.56.4.9:8001|{wav_file}"
+    assert f"rawchunks:worker:audio:{wav_file.name}" in kv
+
+    # From another pod, peer fetch succeeds first; fallback to Valkey works if peer is same origin
+    assert training.fetch_cached_audio_bytes(store, wav_file) == b"RIFF-cross-pod-audio"
+

@@ -20,8 +20,8 @@ import demucs.api
 from acestep.api.gpu import run_gpu
 from acestep.api.jobs.durable import QueueFull
 
-MAX_AUDIO_BYTES = 50 * 1024 * 1024  # Existing API audio upload boundary.
-DOWNLOAD_TIMEOUT_SECONDS = 30  # Network I/O bound, not a GPU job deadline.
+MAX_AUDIO_BYTES = 200 * 1024 * 1024  # Existing API audio upload boundary.
+DOWNLOAD_TIMEOUT_SECONDS = 90  # Network I/O bound, not a GPU job deadline.
 _demucs_separator = None
 
 def get_separator():
@@ -102,7 +102,7 @@ def _download(src,target):
         except FileNotFoundError: pass
         raise
 
-def _local_source(src,temp_dir):
+def _local_source(src,temp_dir,store=None):
     parsed = urllib.parse.urlsplit(src)
     if parsed.path in ('/v1/audio','/audio') and parsed.query:
         params = urllib.parse.parse_qs(parsed.query,keep_blank_values=True)
@@ -114,25 +114,40 @@ def _local_source(src,temp_dir):
     candidate = Path(src).resolve(strict=False)
     try: candidate.relative_to(temp_dir.resolve())
     except ValueError: raise HTTPException(403,'Source audio is outside the audio directory')
+    if not candidate.is_file() and store is not None:
+        try:
+            from acestep.api.training import fetch_cached_audio_bytes
+            raw = fetch_cached_audio_bytes(store, candidate)
+            if raw:
+                candidate.parent.mkdir(parents=True,exist_ok=True)
+                candidate.write_bytes(raw)
+        except Exception:
+            pass
     if not candidate.is_file(): raise HTTPException(404,'Source audio file not found')
     if candidate.stat().st_size>MAX_AUDIO_BYTES: raise HTTPException(413,'Source audio exceeds 50 MiB')
     return candidate
 
 def _execute(temp_dir,source,job_id,stem_type):
+    from concurrent.futures import ThreadPoolExecutor
     separator = get_separator()
     _, separated = separator.separate_audio_file(str(source))
     order = ['vocals','drums','bass','other','instrumental'] if stem_type in ('all',None) else [stem_type]
     if all(name in separated for name in ('drums','bass','other')):
         separated['instrumental'] = separated['drums']+separated['bass']+separated['other']
-    stems = {}; paths = []
+    stems = {}; paths = []; tasks = []
     try:
         for name in order:
             if name not in separated:
                 if stem_type not in ('all',None): raise RuntimeError(f'Separator did not produce {name}')
                 continue
             path = temp_dir/f'{job_id}_{name}.wav'
-            demucs.api.save_audio(separated[name],str(path),samplerate=separator.samplerate)
             paths.append(str(path)); stems[name] = '/v1/audio?'+urllib.parse.urlencode({'path':str(path)})
+            tasks.append((separated[name], str(path)))
+        if len(tasks) > 1:
+            with ThreadPoolExecutor(max_workers=min(5, len(tasks))) as pool:
+                list(pool.map(lambda item: demucs.api.save_audio(item[0], item[1], samplerate=separator.samplerate), tasks))
+        elif tasks:
+            demucs.api.save_audio(tasks[0][0], tasks[0][1], samplerate=separator.samplerate)
         return {'task_id':job_id,'status':'ready','stems':stems,'audio_paths':paths,'metas':{'caption':','.join(stems)}}
     except BaseException:
         for path in paths:
@@ -150,9 +165,12 @@ async def execute_separation_job(state,store,job_id,req):
     try:
         try: input_path.unlink()
         except FileNotFoundError: pass
-        source = await asyncio.to_thread(_download,src,input_path) if remote else _local_source(src,temp_dir)
+        source = await asyncio.to_thread(_download,src,input_path) if remote else _local_source(src,temp_dir,store)
         if remote: source = input_path
         result = await run_gpu(state,_execute,temp_dir,source,job_id,req.get('stem_type','all'))
+        from acestep.api.training import cache_audio_file
+        for audio_path in (result.get('audio_paths') or []):
+            cache_audio_file(store, audio_path)
         store.mark_succeeded(job_id,result)
     except BaseException as exc:
         store.mark_failed(job_id,str(exc))
@@ -170,7 +188,7 @@ def register_separate_route(app,verify_api_key,wrap_response,store):
         if not req.src_audio_path: raise HTTPException(400,'src_audio_path is required')
         src=req.src_audio_path
         if urllib.parse.urlsplit(src).scheme not in ('http','https'):
-            _local_source(src,Path(request.app.state.temp_audio_dir))
+            _local_source(src,Path(request.app.state.temp_audio_dir),store)
         else:
             try: await asyncio.to_thread(_public_url,src)
             except HTTPException: raise

@@ -125,6 +125,85 @@ def initialize_training_runtime(state):
     state.training_ready = True
 
 
+def _pod_audio_origin() -> Optional[str]:
+    try:
+        import socket
+        ip = socket.gethostbyname(socket.gethostname())
+        if not ip or ip.startswith("127."):
+            return None
+        port = int(os.getenv("ACESTEP_API_PORT", "8001"))
+        return f"http://{ip}:{port}"
+    except Exception:
+        return None
+
+
+def cache_audio_file(store, file_path: str | Path, ttl_seconds: int = 900) -> None:
+    try:
+        client = getattr(store, "client", None)
+        path = Path(file_path)
+        if client is None or not path.is_file():
+            return
+        origin = _pod_audio_origin()
+        if origin:
+            try:
+                client.set(f"rawchunks:worker:audio-owner:{path.name}", f"{origin}|{path}", ex=ttl_seconds)
+            except Exception:
+                pass
+        raw = path.read_bytes()
+        import base64
+        encoded = base64.b64encode(raw).decode("ascii")
+
+        def _write_valkey() -> None:
+            try:
+                client.set(f"rawchunks:worker:audio:{path.name}", encoded, ex=ttl_seconds)
+            except Exception:
+                pass
+
+        if len(raw) <= 256 * 1024:
+            _write_valkey()
+        else:
+            import threading
+            threading.Thread(target=_write_valkey, daemon=True).start()
+    except Exception:
+        pass
+
+
+def fetch_cached_audio_bytes(store, target_path: str | Path) -> Optional[bytes]:
+    client = getattr(store, "client", None)
+    name = Path(target_path).name
+    if not name or client is None:
+        return None
+    try:
+        owner_entry = client.get(f"rawchunks:worker:audio-owner:{name}")
+        if owner_entry and "|" in str(owner_entry):
+            owner_origin, owner_path = str(owner_entry).split("|", 1)
+            local_origin = _pod_audio_origin()
+            if owner_origin and owner_origin != local_origin:
+                import httpx
+                api_key = os.getenv("ACESTEP_API_KEY", "").strip()
+                headers = {"x-rawchunks-peer-hop": "1"}
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                resp = httpx.get(
+                    f"{owner_origin}/v1/audio",
+                    params={"path": owner_path},
+                    headers=headers,
+                    timeout=15.0,
+                )
+                if resp.status_code == 200 and resp.content:
+                    return resp.content
+    except Exception:
+        pass
+    try:
+        import base64
+        encoded = client.get(f"rawchunks:worker:audio:{name}")
+        if encoded:
+            return base64.b64decode(encoded)
+    except Exception:
+        pass
+    return None
+
+
 def register_role_middleware(app):
     """Forward the original bytes once. Missing training service fails closed."""
     @app.middleware("http")
@@ -148,7 +227,30 @@ def register_role_middleware(app):
                 return Response("Training service is unavailable", status_code=503)
         if current == "training" and not is_training and path not in ("/health", "/v1/stats", "/query_result"):
             return Response("Endpoint is unavailable on the training role", status_code=409)
-        return await call_next(request)
+        response = await call_next(request)
+        if (
+            current == "generation"
+            and path == "/v1/audio"
+            and request.method == "GET"
+            and response.status_code == 404
+            and request.headers.get("x-rawchunks-peer-hop") != "1"
+        ):
+            target = request.query_params.get("path", "")
+            name = Path(target).name
+            store = getattr(request.app.state, "job_store", None)
+            if name and store is not None:
+                try:
+                    raw = await asyncio.to_thread(fetch_cached_audio_bytes, store, target)
+                    if raw:
+                        temp_dir = getattr(request.app.state, "temp_audio_dir", None)
+                        if temp_dir:
+                            local_path = Path(temp_dir) / name
+                            local_path.parent.mkdir(parents=True, exist_ok=True)
+                            local_path.write_bytes(raw)
+                        return Response(raw, status_code=200, media_type="audio/wav")
+                except Exception:
+                    pass
+        return response
 
 
 def _job_root(state, task_id: str) -> Path:
