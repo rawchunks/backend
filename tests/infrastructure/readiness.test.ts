@@ -26,25 +26,50 @@ describe('Deployment configuration', () => {
     expect(env.ACESTEP_NO_INIT).toBe('false');
     expect(env.HF_ENABLE_PARALLEL_LOADING).toBe('true');
   });
-  it('keeps all three XL models resident on the dedicated GPU node', () => {
-    const worker = deployments.find(x => x.metadata.name === 'acestep-xl-15-turbo')!;
-    const pod = worker.spec.template.spec;
-    const env = Object.fromEntries(pod.containers[0].env.map((entry: any) => [entry.name, entry.value]));
-    expect([env.ACESTEP_CONFIG_PATH, env.ACESTEP_CONFIG_PATH2, env.ACESTEP_CONFIG_PATH3]).toEqual([
-      'acestep-v15-xl-turbo', 'acestep-v15-xl-sft', 'acestep-v15-xl-base',
+  it('keeps all three XL models resident on dedicated L4 GPU nodes with zero CPU offload and queue-depth autoscaling', () => {
+    const expectedPools = [
+      { name: 'acestep-xl-15-turbo', model: 'acestep-v15-xl-turbo', namespace: 'rawchunks:worker:turbo', claim: 'checkpoints' },
+      { name: 'acestep-xl-15-sft', model: 'acestep-v15-xl-sft', namespace: 'rawchunks:worker:sft', claim: 'checkpoints-sft' },
+      { name: 'acestep-xl-15-base', model: 'acestep-v15-xl-base', namespace: 'rawchunks:worker:base', claim: 'checkpoints-base' },
+    ];
+    for (const pool of expectedPools) {
+      const worker = deployments.find(x => x.metadata.name === pool.name)!;
+      expect(worker).toBeTruthy();
+      const pod = worker.spec.template.spec;
+      const env = Object.fromEntries(pod.containers[0].env.map((entry: any) => [entry.name, entry.value]));
+      expect(env.DEFAULT_DIT_MODEL).toBe(pool.model);
+      expect(env.ACESTEP_CONFIG_PATH).toBe(pool.model);
+      expect(env.ACESTEP_OFFLOAD_TO_CPU).toBe('false');
+      expect(env.ACESTEP_OFFLOAD_DIT_TO_CPU).toBe('false');
+      expect(env.ACESTEP_LM_OFFLOAD_TO_CPU).toBe('false');
+      expect(env.ACESTEP_SAVE_MEMORY).toBe('false');
+      expect(env.ACESTEP_COMPILE_MODEL).toBe('true');
+      expect(env.ACESTEP_LORA_HOT_CACHE).toBe('true');
+      expect(env.ACESTEP_ON_DEMAND_MODEL_LOAD).toBe('false');
+      expect(env.ACESTEP_MAX_EXECUTORS).toBe('32');
+      expect(env.ACESTEP_QUEUE_NAMESPACE).toBe(pool.namespace);
+      expect(pod.nodeSelector['cloud.google.com/gke-nodepool']).toBe('gpu-l4-warm');
+      expect(pod.nodeSelector['cloud.google.com/gke-accelerator']).toBe('nvidia-l4');
+      expect(pod.volumes.find((v: any) => v.name === 'checkpoints')?.persistentVolumeClaim?.claimName).toBe(pool.claim);
+    }
+    const scalers = resources.filter(x => x.kind === 'ScaledObject');
+    expect(scalers.map(x => x.spec.scaleTargetRef.name)).toEqual([
+      'acestep-xl-15-turbo',
+      'acestep-xl-15-sft',
+      'acestep-xl-15-base',
+      'acestep-training',
     ]);
-    expect(env.ACESTEP_OFFLOAD_DIT_TO_CPU).toBe('false');
-    expect(env.ACESTEP_ON_DEMAND_MODEL_LOAD).toBe('false');
-    expect(pod.nodeSelector['cloud.google.com/gke-nodepool']).toBe('resident');
-    expect(pod.nodeSelector['cloud.google.com/gke-accelerator']).toBe('nvidia-tesla-a100');
   });
-  it('retains checkpoint storage in the GPU node zone', () => {
-    const volume = resources.find(x => x.kind === 'PersistentVolume' && x.metadata.name === 'checkpoints')!;
-    const claim = resources.find(x => x.kind === 'PersistentVolumeClaim' && x.metadata.name === 'checkpoints')!;
-    const zone = volume.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0];
-    expect(volume.spec.persistentVolumeReclaimPolicy).toBe('Retain');
-    expect(volume.spec.csi.volumeHandle).toContain(`/zones/${zone}/disks/`);
-    expect(claim.spec.volumeName).toBe(volume.metadata.name);
+  it('retains dedicated checkpoint storage per warm pool in the GPU node zone', () => {
+    for (const name of ['checkpoints', 'checkpoints-sft', 'checkpoints-base']) {
+      const volume = resources.find(x => x.kind === 'PersistentVolume' && x.metadata.name === name)!;
+      const claim = resources.find(x => x.kind === 'PersistentVolumeClaim' && x.metadata.name === name)!;
+      const zone = volume.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0];
+      expect(zone).toMatch(/^us-central1-[ab]$/);
+      expect(volume.spec.persistentVolumeReclaimPolicy).toBe('Retain');
+      expect(volume.spec.csi.volumeHandle).toContain(`/zones/${zone}/disks/`);
+      expect(claim.spec.volumeName).toBe(volume.metadata.name);
+    }
   });
   it('disables container privilege escalation and runs the API as non-root', () => {
     for (const { container } of containers) {
