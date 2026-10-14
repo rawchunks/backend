@@ -1407,3 +1407,86 @@ def test_stale_executor_cannot_publish_completion(durable):
             store.mark_succeeded("stale-notice", {})
         assert subscription.get_message(timeout=.05) is None
         assert store.get("stale-notice").status != "succeeded"
+
+
+def test_multi_executor_concurrency_and_selective_orphan_recovery(durable):
+    from acestep.api.jobs.durable import DurableQueue
+    from acestep.api.jobs.store import _JobStore
+    base_store, _ = durable
+    s1 = _JobStore(client=base_store.client, namespace="rawchunks:multi")
+    s2 = _JobStore(client=base_store.client, namespace="rawchunks:multi")
+    s3 = _JobStore(client=base_store.client, namespace="rawchunks:multi")
+    q1 = DurableQueue(s1, maxsize=10, max_executors=2)
+    q2 = DurableQueue(s2, maxsize=10, max_executors=2)
+    q3 = DurableQueue(s3, maxsize=10, max_executors=2)
+    assert q1.acquire()
+    assert q2.acquire()
+    assert not q3.acquire()
+    q1.admit({"prompt": "one"}, job_id="job-1")
+    q1.admit({"prompt": "two"}, job_id="job-2")
+    c1 = q1.claim()
+    c2 = q2.claim()
+    assert c1 is not None and c1[0] == "job-1"
+    assert c2 is not None and c2[0] == "job-2"
+    s1.mark_running("job-1")
+    s2.mark_running("job-2")
+    # Simulate worker 2 crashing (its lease expires), while worker 1 stays alive
+    s2.client.delete(q2._owner_lease_key)
+    q1.renew()
+    # job-2 is recovered back to queued while job-1 stays running on worker 1
+    assert s1.get("job-1").status == "running"
+    assert s1.get("job-2").status == "queued"
+    s1.mark_succeeded("job-1", {"ok": True})
+    q1.ack("job-1")
+    reclaimed = q1.claim()
+    assert reclaimed is not None and reclaimed[0] == "job-2"
+    s1.mark_succeeded("job-2", {"ok": True})
+    q1.ack("job-2")
+    assert s1.get_stats() == {"total": 2, "queued": 0, "running": 0, "succeeded": 2, "failed": 0}
+
+
+def test_hot_lora_cache_reuses_loaded_adapter():
+    from types import SimpleNamespace
+    from acestep.api.gpu import apply_job_lora
+    events = []
+    handler = SimpleNamespace(
+        _lora_hot_cache_enabled=True,
+        _hot_cached_lora_path=None,
+        _rawchunks_manual_lora={},
+        lora_loaded=False,
+        model=object(),
+    )
+    def unload_lora():
+        events.append("unload")
+        handler.lora_loaded = False
+        return "✅ unloaded"
+    def load_lora(path):
+        events.append(f"load:{path}")
+        handler.lora_loaded = True
+        return "✅ loaded"
+    def set_lora_scale(scale):
+        events.append(f"scale:{scale}")
+        return "✅ scaled"
+    def set_use_lora(enabled):
+        events.append(f"use:{enabled}")
+        return "✅ toggled"
+    handler.unload_lora = unload_lora
+    handler.load_lora = load_lora
+    handler.set_lora_scale = set_lora_scale
+    handler.set_use_lora = set_use_lora
+
+    # First job with /voice-a loads from disk
+    restore1 = apply_job_lora(handler, SimpleNamespace(lora_path="/voice-a", lora_alpha=0.8))
+    restore1()
+    # Second job with same /voice-a reuses hot adapter without unload/load!
+    restore2 = apply_job_lora(handler, SimpleNamespace(lora_path="/voice-a", lora_alpha=0.9))
+    restore2()
+    # Third job with no LoRA simply ensures use_lora(False)
+    restore3 = apply_job_lora(handler, SimpleNamespace(lora_path=None))
+    restore3()
+    assert events == [
+        "load:/voice-a", "scale:0.8", "use:True", "use:False",
+        "scale:0.9", "use:True", "use:False",
+        "use:False",
+    ]
+
