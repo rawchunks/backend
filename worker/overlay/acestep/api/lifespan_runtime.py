@@ -123,7 +123,8 @@ def initialize_lifespan_runtime(
     max_workers = int(os.getenv("ACESTEP_API_WORKERS", "1"))
     if max_workers != 1:
         raise RuntimeError("One GPU executor is required")
-    executor = ThreadPoolExecutor(max_workers=1)
+    queue_workers = max(1, int(os.getenv("ACESTEP_QUEUE_WORKERS", "1")))
+    executor = ThreadPoolExecutor(max_workers=queue_workers)
 
     app.state.job_queue = DurableQueue(store, maxsize=queue_maxsize)
     app.state.job_queue.app_state = app.state

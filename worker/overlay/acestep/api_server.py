@@ -190,7 +190,12 @@ sys.stderr = _stderr_proxy
 def create_app() -> FastAPI:
     from acestep.api.training import role, register_role_middleware, initialize_training_runtime
     namespace = os.getenv("ACESTEP_QUEUE_NAMESPACE", "rawchunks:training" if role() == "training" else "rawchunks:worker")
-    if namespace not in ("rawchunks:worker", "rawchunks:training") or namespace != ("rawchunks:training" if role() == "training" else "rawchunks:worker"):
+    valid_namespace = (
+        namespace == "rawchunks:training"
+        if role() == "training"
+        else (namespace == "rawchunks:worker" or namespace.startswith("rawchunks:worker:"))
+    )
+    if not valid_namespace:
         raise RuntimeError("ACESTEP_QUEUE_NAMESPACE must match the service role")
     store = _JobStore(namespace=namespace)
 

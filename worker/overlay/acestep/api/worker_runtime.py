@@ -40,15 +40,18 @@ async def _queue_worker_loop(*,app_state,store,run_one_job,cleanup_job_temp_file
     except asyncio.CancelledError: raise
     except BaseException: queue.fatal_lease_loss()
 def start_worker_tasks(*,app_state,store,worker_count,run_one_job,cleanup_job_temp_files,cleanup_interval_seconds):
-    if worker_count != 1 or os.getenv('ACESTEP_API_WORKERS','1') != '1':
+    if worker_count < 1 or os.getenv('ACESTEP_API_WORKERS','1') != '1':
         raise RuntimeError('Durable GPU scheduling requires one worker and one executor')
     queue = app_state.job_queue
     if not queue.acquire(): raise RuntimeError('Another GPU executor owns the Valkey lease')
-    worker = asyncio.create_task(_queue_worker_loop(app_state=app_state,store=store,run_one_job=run_one_job,cleanup_job_temp_files=cleanup_job_temp_files))
+    workers = [
+        asyncio.create_task(_queue_worker_loop(app_state=app_state,store=store,run_one_job=run_one_job,cleanup_job_temp_files=cleanup_job_temp_files))
+        for _ in range(worker_count)
+    ]
     app_state.lease_heartbeat = asyncio.create_task(_heartbeat(queue))
     cleanup = asyncio.create_task(run_job_store_cleanup_loop(store,cleanup_interval_seconds))
-    app_state.worker_tasks=[worker];app_state.cleanup_task=cleanup;app_state.durable_queue=queue
-    return [worker],cleanup
+    app_state.worker_tasks=workers;app_state.cleanup_task=cleanup;app_state.durable_queue=queue
+    return workers,cleanup
 async def stop_worker_tasks(*,workers,cleanup_task,executor):
     cleanup_task.cancel()
     for worker in workers: worker.cancel()
