@@ -24,7 +24,7 @@ const snapshot={timestamp:new Date().toISOString(),context:current,namespace,
   containers:x.status.containerStatuses?.map(c=>({name:c.name,imageID:c.imageID,restarts:c.restartCount,ready:c.ready,lastReason:c.lastState?.terminated?.reason}))})),
  services:all.filter(x=>x.kind==='Service').map(x=>({name:x.metadata.name,type:x.spec.type,selector:x.spec.selector,ports:x.spec.ports})),
  storage:all.filter(x=>x.kind==='PersistentVolumeClaim').map(x=>({name:x.metadata.name,phase:x.status.phase,capacity:x.status.capacity,accessModes:x.spec.accessModes})),
- endpoints:all.filter(x=>x.kind==='EndpointSlice').map(x=>({service:x.metadata.labels['kubernetes.io/service-name'],ready:x.endpoints.filter(e=>e.conditions.ready).length})),
+ endpoints:all.filter(x=>x.kind==='EndpointSlice').map(x=>({service:x.metadata.labels['kubernetes.io/service-name'],ready:(x.endpoints||[]).filter(e=>e.conditions?.ready).length})),
  controls:controls.map(x=>({kind:x.kind,name:x.metadata.name})),
  nodes:nodes.map(x=>({name:x.metadata.name,capacity:x.status.capacity,allocatable:x.status.allocatable,ready:x.status.conditions.find(c=>c.type==='Ready')?.status,kubelet:x.status.nodeInfo.kubeletVersion}))};
 const destination=fileURLToPath(new URL('../results/cluster.json',import.meta.url));
