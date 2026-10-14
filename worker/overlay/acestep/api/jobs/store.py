@@ -83,7 +83,11 @@ local changes = cjson.decode(ARGV[2]); for k,v in pairs(changes) do rec[k] = v e
 if ARGV[5] ~= '' then rec.result_json = ARGV[5] end
 redis.call('HSET',KEYS[1],ARGV[1],cjson.encode(rec))
 if changes.status or changes.progress then
- redis.call('PUBLISH',ARGV[6],cjson.encode({status=rec.status,progress=rec.progress,error=rec.error}))
+ local evt = cjson.encode({status=rec.status,progress=rec.progress,error=rec.error})
+ redis.call('PUBLISH',ARGV[6],evt)
+ if ARGV[7] and ARGV[7] ~= '' and ARGV[7] ~= ARGV[6] then
+  redis.call('PUBLISH',ARGV[7],evt)
+ end
 end
 return cjson.encode(rec)
 """
@@ -104,12 +108,16 @@ return count
 """
 class _JobStore:
     """Durable facade; mutable records retain local observers but refresh on get."""
-    def __init__(self,max_age_seconds=86400,*,client=None,namespace='rawchunks:worker'):
+    def __init__(self,max_age_seconds=None,*,client=None,namespace=None):
         uri = os.getenv('VALKEY_URL') or os.getenv('VALKEY_REQUESTS_SERVICE_URI')
         if client is None and not uri: raise RuntimeError('VALKEY_URL or VALKEY_REQUESTS_SERVICE_URI is required')
         self.client = client if client is not None else redis.Redis.from_url(uri,decode_responses=True,socket_connect_timeout=5,socket_timeout=5)
-        self.client.ping(); self.namespace = namespace; self._max_age = max_age_seconds
+        self.client.ping()
+        self.namespace = namespace if namespace is not None else os.getenv('ACESTEP_QUEUE_NAMESPACE', 'rawchunks:worker')
+        self._max_age = int(os.getenv('ACESTEP_JOB_RETENTION_SECONDS', '86400')) if max_age_seconds is None else max_age_seconds
         self._lock = Lock(); self._records = {}; self.claims = {}
+        self._multi_executor = False
+        self._terminal_statuses = {}
     def key(self,name): return f'{self.namespace}:{name}'
     def new_record(self,identifier,env='development'):
         now = time.time(); return _JobRecord(identifier,'queued',now,env=env,updated_at=now)
@@ -118,6 +126,9 @@ class _JobStore:
     def decode(self,raw):
         data = json.loads(raw); identifier = data['job_id']
         if data.get('result_json'): data['result'] = json.loads(data['result_json'])
+        status = data.get('status')
+        if status in ('succeeded', 'failed'):
+            self._terminal_statuses[identifier] = (len(raw), status)
         with self._lock:
             rec = self._records.get(identifier)
             if rec is None: rec = self.new_record(identifier); self._records[identifier] = rec
@@ -128,10 +139,19 @@ class _JobStore:
         self.client.hsetnx(self.key('jobs'),identifier,self.encode(self.new_record(identifier,env)))
         return self.get(identifier)
     def get(self,identifier):
-        raw = self.client.hget(self.key('jobs'),identifier); return self.decode(raw) if raw else None
+        raw = self.client.hget(self.key('jobs'),identifier)
+        if not raw and self.namespace.startswith('rawchunks:worker:'):
+            for suffix in ('turbo', 'sft', 'base'):
+                ns_key = f'rawchunks:worker:{suffix}:jobs'
+                if ns_key != self.key('jobs'):
+                    raw = self.client.hget(ns_key, identifier)
+                    if raw: break
+        return self.decode(raw) if raw else None
     def _update(self,identifier,changes,missing_ok=False):
         changes['updated_at'] = time.time(); owner,token = self.claims.get(identifier,('',''))
-        raw = self.client.eval(_UPDATE,2,self.key('jobs'),self.key('executor'),identifier,json.dumps(changes,allow_nan=False),owner,token,json.dumps(changes['result'],allow_nan=False) if changes.get('result') is not None else '',self.key('events:'+identifier))
+        executor_key = self.key(f'executor:{owner}') if (getattr(self, '_multi_executor', False) and owner) else self.key('executor')
+        shared_event_key = f'rawchunks:worker:events:{identifier}' if self.namespace.startswith('rawchunks:worker:') else ''
+        raw = self.client.eval(_UPDATE,2,self.key('jobs'),executor_key,identifier,json.dumps(changes,allow_nan=False),owner,token,json.dumps(changes['result'],allow_nan=False) if changes.get('result') is not None else '',self.key('events:'+identifier),shared_event_key)
         if raw == 'LEASE_LOST':
             from acestep.api.jobs.durable import LeaseLost
             raise LeaseLost('Stale worker cannot update job')
@@ -164,11 +184,20 @@ class _JobStore:
         removed = self.client.eval(_CLEANUP,5,self.key('jobs'),self.key('active'),self.key('requests'),self.key('files'),self.key('digests'),time.time()-age)
         with self._lock:
             for identifier in list(self._records):
-                if not self.client.hexists(self.key('jobs'),identifier): self._records.pop(identifier,None)
+                if not self.client.hexists(self.key('jobs'),identifier):
+                    self._records.pop(identifier,None)
+                    self._terminal_statuses.pop(identifier,None)
         return removed
     def get_stats(self):
         stats = dict(total=0,queued=0,running=0,succeeded=0,failed=0)
-        for raw in self.client.hvals(self.key('jobs')):
-            status = json.loads(raw)['status']; stats['total'] += 1
+        for job_id, raw in self.client.hgetall(self.key('jobs')).items():
+            cached = self._terminal_statuses.get(job_id)
+            if cached is not None and cached[0] == len(raw):
+                status = cached[1]
+            else:
+                status = json.loads(raw)['status']
+                if status in ('succeeded', 'failed'):
+                    self._terminal_statuses[job_id] = (len(raw), status)
+            stats['total'] += 1
             if status in stats: stats[status] += 1
         return stats
