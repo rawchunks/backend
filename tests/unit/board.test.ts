@@ -204,4 +204,30 @@ describe('take mounting controls', () => {
     expect(html).toContain('aria-label="Toggle Take #2 in master" aria-pressed="false"');
     expect(html).toContain('aria-label="Merge Take #2" disabled=""');
   });
+
+  it('renders unmounted extend takes visibly in Extracted without expanding Master, and expands Master when mounted', () => {
+    const extendTake: Take = {
+      id: 'ext-take', song_id: 'song', take_number: 4, model: 'base', task: 'extend',
+      url: 'ext.wav', is_active: false, created_at: '2026-10-09T00:00:03Z',
+      repainting_start: 60, repainting_end: 90,
+      provenance: { target: 'master', region: { start: 60, end: 90 }, outputDuration: 90 },
+    };
+    const unmountedHtml = render('master', [], [...takes, extendTake]);
+    const extracted = unmountedHtml.slice(unmountedHtml.indexOf('<span>EXTRACTED</span>'));
+    expect(extracted).toContain('Category: EXTEND, Take #4');
+    // Unmounted extend row scales by Math.max(totalDuration=60, takeRange.end=90) = 90 => left:66.666%, width:33.333% (not left:100%)
+    expect(extracted).toContain('left:66.66666666666666%;width:33.33333333333333%');
+
+    // When mounted on Master, totalDuration expands to 90s and the extend overlay is placed at [60, 90] in Master
+    const mountedTrack = {
+      id: 'ext-take', activeTakeId: 'ext-take', name: 'Take #4', type: 'sample', muted: false,
+      clips: [{ id: 'ext-clip', name: 'Take #4', url: 'ext.wav', startTime: 60, offset: 60, duration: 30 }],
+    } as DAWTrack;
+    const mountedHtml = render('ext-take', [mountedTrack], [...takes, extendTake]);
+    const master = mountedHtml.slice(mountedHtml.indexOf('class="board-row master'), mountedHtml.indexOf('class="board-section-separator'));
+    expect(master).toContain('aria-label="Select Take #4 section" aria-pressed="true"');
+    expect(master).toContain('left:66.66666666666666%;width:33.33333333333333%');
+    expect(master).toContain('aria-label="Merge Take #4"');
+    expect(master).toContain('aria-label="Discard Take #4"');
+  });
 });

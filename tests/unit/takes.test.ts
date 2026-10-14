@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isBase, mounted, preview, segments, source, clips, sourceInterval, pending, retained } from '../../../app/src/lib/daw/takes.js';
+import { isBase, mounted, preview, segments, source, clips, sourceInterval, pending, retained, masterArrangement, isMasterTargetTake, isFullSongRestyleTake } from '../../../app/src/lib/daw/takes.js';
 
 const take = { id: 'take', stem_id: 'vocals', url: 'vocals.wav', is_active: true };
 const tracks = [{ id: 'master', stemId: 'stem-master', clips: [{ url: 'master.wav' }] }, { id: 'vocals', clips: [{ url: 'vocals.wav' }] }];
@@ -9,6 +9,9 @@ describe('editor versions', () => {
     const candidate = {...take,id:'candidate',is_active:false,provenance:{region:{start:5,end:10}}};
     expect(pending(candidate)).toBe(true);
     expect(pending({...candidate,is_active:true})).toBe(false);
+    expect(pending({...candidate,is_active:true,provenance:undefined,repainting_start:5,repainting_end:10})).toBe(false);
+    expect(pending({...candidate,model:'demucs-htdemucs'})).toBe(false);
+    expect(pending({...candidate,task:'text2music',is_active:false})).toBe(false);
     expect(pending({...candidate,provenance:{mergedInto:'master'}})).toBe(false);
     const mountedTracks = [...tracks,{id:'candidate',activeTakeId:'candidate',clips:[]},{id:'deleted',activeTakeId:'deleted',clips:[]}];
     expect(retained(mountedTracks,[candidate])).toEqual(mountedTracks.slice(0,-1));
@@ -59,7 +62,15 @@ describe('editor versions', () => {
   it('resolves a candidate to its recorded source rather than its take ID', () => {
     expect(source({ ...take, id: 'candidate' }, tracks)).toBe('vocals');
     expect(source({ ...take, provenance: { target: 'master' } }, tracks)).toBe('master');
+    expect(source({ ...take, stem_id: 'stm-master-1', task: 'repaint' }, [{ id: 'master', clips: [{ url: 'master.wav' }] }])).toBe('master');
     expect(source({ ...take, stem_id: 'missing' }, tracks)).toBeNull();
+  });
+
+  it('treats a rework take with a master stem_id as a master section candidate rather than a full-song restyle', () => {
+    const rework = { ...take, id: 'rework', stem_id: 'stm-master-1', task: 'repaint', is_active: false, repainting_start: 4, repainting_end: 8, provenance: { target: 'master' as const, region: { start: 4, end: 8 } } };
+    expect(isMasterTargetTake(rework)).toBe(true);
+    expect(isFullSongRestyleTake(rework)).toBe(false);
+    expect(pending(rework)).toBe(true);
   });
 
   it('resolves edits of a moved take to the recorded source interval', () => {
@@ -82,6 +93,23 @@ describe('editor versions', () => {
       {startTime:5, offset:0, duration:5}, {startTime:20, offset:15, duration:5},
     ]);
     expect(clips({...candidate, provenance:{...candidate.provenance, audioOffset:5}}, 30)[1].offset).toBe(20);
+  });
+  it('computes master arrangement separation and extension segments for mounted extend clips', () => {
+    expect(masterArrangement(30, [])).toEqual({
+      segments: [{ startTime: 0, offset: 0, duration: 30 }],
+      duration: 30,
+    });
+    expect(masterArrangement(30, [{ startTime: 30, duration: 30 }])).toEqual({
+      segments: [{ startTime: 0, offset: 0, duration: 30 }],
+      duration: 60,
+    });
+    expect(masterArrangement(30, [{ startTime: 10, duration: 15 }])).toEqual({
+      segments: [
+        { startTime: 0, offset: 0, duration: 10 },
+        { startTime: 25, offset: 10, duration: 20 },
+      ],
+      duration: 45,
+    });
   });
 });
 
