@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: api
-          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/backend@sha256:70063852a1236d45ec0505c742c5bd0d2a918ec37bfc6fef5b54b868e5121ef3
+          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/backend@sha256:2ec22391d79643a6bd20fa07c57f46086e778287c730106dfebaef12e36194b0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 3005
@@ -28,9 +28,15 @@ spec:
             - name: HOST
               value: 0.0.0.0
             - name: ACESTEP_API_URL
-              value: http://acestep-service.rawchunks.svc.cluster.local:8001
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: ACESTEP_API_URL
             - name: ACESTEP_TRAINING_URL
-              value: http://acestep-training.rawchunks.svc.cluster.local:8001
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: ACESTEP_TRAINING_URL
             - name: VOICE_PREPARATION_ENABLED
               value: "true"
             - name: SONG_DATABASE_URL
