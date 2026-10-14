@@ -362,7 +362,7 @@ class GenerateMusicMixin:
 
             # Cover/repaint/lego/extract + text2music+morph: lock duration to source audio.
             if processed_src_audio is not None and (
-                task_type in ("cover", "cover-nofsq", "repaint", "lego", "extract")
+                task_type in ("cover", "cover-nofsq", "repaint", "lego", "extract", "complete")
                 or (task_type == "text2music" and flow_edit_morph)
             ):
                 audio_duration = processed_src_audio.shape[-1] / self.sample_rate
@@ -397,8 +397,6 @@ class GenerateMusicMixin:
                 chunk_mask_mode=chunk_mask_mode,
             )
             if torch.cuda.is_available():
-                gc.collect()
-                torch.cuda.empty_cache()
                 skip_preflight = os.environ.get(
                     "ACESTEP_SKIP_VRAM_PREFLIGHT", "",
                 ).lower() in ("1", "true", "yes")
@@ -415,11 +413,24 @@ class GenerateMusicMixin:
                         guidance_scale=guidance_scale,
                     )
                     if vram_error is not None:
-                        return vram_error
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        vram_error = self._vram_preflight_check(
+                            actual_batch_size=actual_batch_size,
+                            audio_duration=audio_duration,
+                            guidance_scale=guidance_scale,
+                        )
+                        if vram_error is not None:
+                            return vram_error
 
-            injection_ratio, resolved_cf_frames, resolved_wav_cf = (
-                _resolve_repaint_config(repaint_mode, repaint_strength)
-            )
+            if task_type == "repaint":
+                injection_ratio, resolved_cf_frames, resolved_wav_cf = (
+                    _resolve_repaint_config(repaint_mode, repaint_strength)
+                )
+            else:
+                injection_ratio, resolved_cf_frames, resolved_wav_cf = (
+                    0.0, 0, 0.0
+                )
 
             service_run = self._run_generate_music_service_with_progress(
                 progress=progress,
@@ -479,7 +490,8 @@ class GenerateMusicMixin:
             repainting_start_batch = service_inputs.get("repainting_start_batch")
             repainting_end_batch = service_inputs.get("repainting_end_batch")
             do_wav_splice = (
-                repaint_mode != "aggressive"
+                task_type == "repaint"
+                and repaint_mode != "aggressive"
                 and repainting_start_batch is not None
                 and repainting_end_batch is not None
             )
@@ -492,6 +504,31 @@ class GenerateMusicMixin:
                     sample_rate=self.sample_rate,
                     crossfade_duration=resolved_wav_cf,
                 )
+            elif (
+                task_type in ("lego", "extract")
+                and repainting_start_batch is not None
+                and repainting_end_batch is not None
+            ):
+                total_samples = pred_wavs.shape[-1]
+                fade_samples = max(1, int(0.015 * self.sample_rate))
+                isolated = torch.zeros_like(pred_wavs)
+                for b_idx in range(pred_wavs.shape[0]):
+                    s_sec = repainting_start_batch[b_idx] if b_idx < len(repainting_start_batch) else 0.0
+                    e_sec = repainting_end_batch[b_idx] if b_idx < len(repainting_end_batch) else None
+                    s_idx = max(0, min(total_samples, int(round(float(s_sec or 0.0) * self.sample_rate))))
+                    e_idx = total_samples if e_sec is None or float(e_sec) < 0 else max(s_idx, min(total_samples, int(round(float(e_sec) * self.sample_rate))))
+                    if e_idx > s_idx:
+                        seg = pred_wavs[b_idx, :, s_idx:e_idx].clone()
+                        seg_len = e_idx - s_idx
+                        f_len = min(fade_samples, seg_len // 4)
+                        if f_len > 1:
+                            t = torch.linspace(0.0, 1.0, f_len, device=seg.device, dtype=seg.dtype)
+                            fade_in = 0.5 * (1.0 - torch.cos(t * 3.141592653589793))
+                            fade_out = 0.5 * (1.0 + torch.cos(t * 3.141592653589793))
+                            seg[:, :f_len] = seg[:, :f_len] * fade_in
+                            seg[:, -f_len:] = seg[:, -f_len:] * fade_out
+                        isolated[b_idx, :, s_idx:e_idx] = seg
+                pred_wavs = isolated
             result = self._build_generate_music_success_payload(
                 outputs=outputs,
                 pred_wavs=pred_wavs,
@@ -514,8 +551,9 @@ class GenerateMusicMixin:
             for _k in _gpu_keys:
                 outputs.pop(_k, None)
             del outputs, pred_wavs, pred_latents_cpu
-            gc.collect()
-            self._empty_cache()
+            if getattr(self, "offload_to_cpu", False):
+                gc.collect()
+                self._empty_cache()
             return result
         except Exception as exc:
             error_msg = f"Error: {exc!s}\n{traceback.format_exc()}"

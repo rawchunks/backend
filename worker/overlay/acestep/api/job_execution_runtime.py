@@ -6,7 +6,7 @@ import asyncio
 import time
 import traceback
 from typing import Any, Awaitable, Callable
-from acestep.api.gpu import run_gpu, apply_job_lora
+from acestep.api.gpu import run_gpu, apply_job_lora, ensure_threadsafe_handlers
 
 
 async def run_one_job_runtime(
@@ -78,6 +78,21 @@ async def run_one_job_runtime(
             job_id=job_id,
             log_fn=log_fn,
         )
+        ensure_threadsafe_handlers(app_state, selected_handler)
+        try:
+            job_store.update_progress(job_id, 0.15, stage="preparing_inputs")
+            update_progress_job_cache_fn(
+                app_state=app_state,
+                store=store,
+                job_id=job_id,
+                progress=0.15,
+                stage="preparing_inputs",
+                map_status=map_status,
+                result_key_prefix=result_key_prefix,
+                result_expire_seconds=result_expire_seconds,
+            )
+        except Exception:
+            pass
         cleanup_lora = apply_job_lora(selected_handler, req)
         try:
             return build_blocking_result_fn(selected_handler, selected_model_name)
@@ -87,7 +102,11 @@ async def run_one_job_runtime(
     t0 = time.time()
     try:
         loop = asyncio.get_running_loop()
-        result = await run_gpu(app_state, _blocking_generate)
+        shared_gpu = not bool(getattr(req, "lora_path", None))
+        result = await run_gpu(app_state, _blocking_generate, shared=shared_gpu)
+        from acestep.api.training import cache_audio_file
+        for raw_path in (result.get("raw_audio_paths") or []) if isinstance(result, dict) else []:
+            cache_audio_file(job_store, raw_path)
         job_store.mark_succeeded(job_id, result)
         update_terminal_job_cache_fn(
             app_state=app_state,
@@ -116,8 +135,10 @@ async def run_one_job_runtime(
         )
     finally:
         try:
-            if hasattr(selected_handler, "_empty_cache"):
+            if getattr(selected_handler, "offload_to_cpu", False) and hasattr(selected_handler, "_empty_cache"):
                 await run_gpu(app_state, selected_handler._empty_cache)
+            elif not getattr(selected_handler, "offload_to_cpu", False):
+                pass
             else:
                 import torch
 
