@@ -12,7 +12,7 @@ spec:
   csi:
     driver: pd.csi.storage.gke.io
     fsType: ext4
-    volumeHandle: projects/gen-lang-client-0035632562/zones/us-central1-f/disks/rawchunks-checkpoints
+    volumeHandle: projects/gen-lang-client-0035632562/zones/us-central1-b/disks/rawchunks-checkpoints-turbo-b
   nodeAffinity:
     required:
       nodeSelectorTerms:
@@ -20,7 +20,7 @@ spec:
             - key: topology.gke.io/zone
               operator: In
               values:
-                - us-central1-f
+                - us-central1-b
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -35,7 +35,82 @@ spec:
       storage: 200Gi
   storageClassName: premium-rwo
   volumeName: checkpoints
-
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: checkpoints-sft
+spec:
+  accessModes:
+    - ReadWriteOnce
+  capacity:
+    storage: 200Gi
+  storageClassName: premium-rwo
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: pd.csi.storage.gke.io
+    fsType: ext4
+    volumeHandle: projects/gen-lang-client-0035632562/zones/us-central1-a/disks/rawchunks-checkpoints-sft
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: topology.gke.io/zone
+              operator: In
+              values:
+                - us-central1-a
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: checkpoints-sft
+  namespace: rawchunks
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 200Gi
+  storageClassName: premium-rwo
+  volumeName: checkpoints-sft
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: checkpoints-base
+spec:
+  accessModes:
+    - ReadWriteOnce
+  capacity:
+    storage: 200Gi
+  storageClassName: premium-rwo
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: pd.csi.storage.gke.io
+    fsType: ext4
+    volumeHandle: projects/gen-lang-client-0035632562/zones/us-central1-a/disks/rawchunks-checkpoints-base
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: topology.gke.io/zone
+              operator: In
+              values:
+                - us-central1-a
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: checkpoints-base
+  namespace: rawchunks
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 200Gi
+  storageClassName: premium-rwo
+  volumeName: checkpoints-base
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
