@@ -14,15 +14,26 @@ from urllib.request import urlopen, Request
 
 _LOCK = RLock()
 _FINGERPRINTS = {}
+_VERIFIED_FILES = {}
 _ARTIFACT_HOST = "pub-1b122472089542a8826ac7f695328c46.r2.dev"
 
 
 def _hash(path):
+    target = Path(path)
+    stat = target.stat()
+    if stat.st_size >= 65536:
+        cache_key = (str(target), stat.st_size, stat.st_mtime_ns)
+        cached = _VERIFIED_FILES.get(cache_key)
+        if cached is not None:
+            return cached
     digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
+    with target.open("rb") as stream:
         for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
-    return digest.hexdigest()
+    hex_digest = digest.hexdigest()
+    if stat.st_size >= 65536:
+        _VERIFIED_FILES[(str(target), stat.st_size, stat.st_mtime_ns)] = hex_digest
+    return hex_digest
 
 
 def checkpoint_fingerprint(model_dir) -> str:
@@ -73,12 +84,38 @@ def materialize_adapter(state, url, digest, model):
     root.mkdir(parents=True, exist_ok=True)
     destination = root / digest
     with _LOCK:
+        if destination.is_dir():
+            manifest_path = destination / "manifest.json"
+            if not manifest_path.is_file() or _hash(manifest_path) != digest:
+                raise ValueError("Adapter manifest checksum mismatch")
+            manifest = json.loads(manifest_path.read_text())
+            if manifest.get("schema_version") != 1 or manifest.get("model") != model or manifest.get("checkpoint_fingerprint") != fingerprints[model]:
+                raise ValueError("Adapter checkpoint is incompatible with the requested resident model")
+            metrics = manifest.get("metrics", {})
+            import math
+            if not isinstance(metrics.get("optimizer_steps"), int) or metrics["optimizer_steps"] < 1 or any(not isinstance(metrics.get(key), (int, float)) or not math.isfinite(metrics[key]) for key in ("final_loss", "effective_update_norm")) or metrics["effective_update_norm"] <= 0:
+                raise ValueError("Adapter has no validated effective training update")
+            files = manifest.get("files")
+            if not isinstance(files, list) or not files:
+                raise ValueError("Adapter manifest contains no files")
+            names = set()
+            for item in files:
+                name, checksum = item.get("filename"), item.get("digest")
+                if not isinstance(name, str) or Path(name).name != name or name in {".", "..", "manifest.json"} or "\\" in name or name in names or not isinstance(checksum, str) or len(checksum) != 64:
+                    raise ValueError("Invalid adapter artifact entry")
+                names.add(name)
+                path = destination / name
+                if not path.is_file() or _hash(path) != checksum:
+                    raise ValueError(f"Adapter file checksum mismatch: {name}")
+            if "adapter_config.json" not in names or not any(name.endswith(".safetensors") for name in names):
+                raise ValueError("Adapter configuration and inference weights are required")
+            config_path = destination / "adapter_config.json"
+            if not isinstance(json.loads(config_path.read_text()), dict):
+                raise ValueError("Invalid adapter configuration")
+            return str(destination)
         temporary = Path(tempfile.mkdtemp(prefix="adapter-", dir=root))
         try:
-            if destination.is_dir():
-                shutil.copyfile(destination / "manifest.json", temporary / "manifest.json")
-            else:
-                _download(url, temporary / "manifest.json", 1024 * 1024)
+            _download(url, temporary / "manifest.json", 1024 * 1024)
             if _hash(temporary / "manifest.json") != digest:
                 raise ValueError("Adapter manifest checksum mismatch")
             manifest = json.loads((temporary / "manifest.json").read_text())
@@ -97,20 +134,16 @@ def materialize_adapter(state, url, digest, model):
                 if not isinstance(name, str) or Path(name).name != name or name in {".", "..", "manifest.json"} or "\\" in name or name in names or not isinstance(checksum, str) or len(checksum) != 64:
                     raise ValueError("Invalid adapter artifact entry")
                 names.add(name)
-                if destination.is_dir():
-                    path = destination / name
-                else:
-                    path = temporary / name
-                    _download(urljoin(url, name), path, 300_000_000)
+                path = temporary / name
+                _download(urljoin(url, name), path, 300_000_000)
                 if _hash(path) != checksum:
                     raise ValueError(f"Adapter file checksum mismatch: {name}")
             if "adapter_config.json" not in names or not any(name.endswith(".safetensors") for name in names):
                 raise ValueError("Adapter configuration and inference weights are required")
-            config_path = (destination if destination.is_dir() else temporary) / "adapter_config.json"
+            config_path = temporary / "adapter_config.json"
             if not isinstance(json.loads(config_path.read_text()), dict):
                 raise ValueError("Invalid adapter configuration")
-            if not destination.is_dir():
-                os.replace(temporary, destination)
+            os.replace(temporary, destination)
             return str(destination)
         finally:
             if temporary.exists():
