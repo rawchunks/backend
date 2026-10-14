@@ -93,6 +93,14 @@ def do_model_initialization(
             status_msg, ok = slot_handler.initialize_service(config_path=slot_config, **init_kwargs)
             if not ok:
                 raise RuntimeError(status_msg)
+            slot_handler._lora_hot_cache_enabled = env_bool("ACESTEP_LORA_HOT_CACHE", True)
+            if suffix and handler is not None:
+                if getattr(handler, "vae", None) is not None and getattr(slot_handler, "vae", None) is not None:
+                    slot_handler.vae = handler.vae
+                if getattr(handler, "text_encoder", None) is not None and getattr(slot_handler, "text_encoder", None) is not None:
+                    slot_handler.text_encoder = handler.text_encoder
+                if getattr(handler, "text_tokenizer", None) is not None and getattr(slot_handler, "text_tokenizer", None) is not None:
+                    slot_handler.text_tokenizer = handler.text_tokenizer
         except Exception as exc:
             setattr(app.state, error_attr, str(exc))
             raise
@@ -114,6 +122,14 @@ def do_model_initialization(
         ensure_model_downloaded=ensure_model_downloaded,
         env_bool=env_bool,
     )
+
+    if env_bool("ACESTEP_INIT_DEMUCS", False):
+        try:
+            from acestep.api.http.separate import get_separator
+            get_separator()
+            print("[API Server] Demucs htdemucs separator warm-loaded")
+        except Exception as exc:
+            print(f"[API Server] Warning: Demucs warm-load skipped: {exc}")
 
     print("[API Server] All models initialized successfully!")
 
