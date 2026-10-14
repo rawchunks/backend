@@ -25,7 +25,7 @@ describe('Kubernetes manifest reference and resource baseline', () => {
   it('GPU deployments reserve one GPU, tolerate GPU taint and avoid RWO rolling update', () => {
     for (const deployment of deployments.filter(d => d.metadata.name.startsWith('acestep'))) {
       const spec = deployment.spec.template.spec;
-      expect(spec.nodeSelector['cloud.google.com/gke-accelerator']).toBe(deployment.metadata.name === 'acestep-training' ? 'nvidia-l4' : 'nvidia-tesla-a100');
+      expect(spec.nodeSelector['cloud.google.com/gke-accelerator']).toBe('nvidia-l4');
       expect(spec.tolerations).toContainEqual(expect.objectContaining({ key: 'nvidia.com/gpu', effect: 'NoSchedule' }));
       expect(spec.containers[0].resources.requests['nvidia.com/gpu']).toBe(1);
       expect(spec.containers[0].resources.limits['nvidia.com/gpu']).toBe(1);

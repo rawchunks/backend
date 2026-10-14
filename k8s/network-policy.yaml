@@ -6,7 +6,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: acestep-xl-15-turbo
+      tier: generation
   policyTypes:
     - Ingress
   ingress:
@@ -37,7 +37,7 @@ spec:
               app: api
         - podSelector:
             matchLabels:
-              app: acestep-xl-15-turbo
+              tier: generation
       ports:
         - protocol: TCP
           port: 8001
