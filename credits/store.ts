@@ -54,6 +54,92 @@ export class CreditStore {
     if (previous.owner !== owner || String(previous.amount) !== String(amount) || previous.kind !== kind) throw fail('Operation replay mismatch');
     return false;
   }
+  private async readSession(c: CreditConnection, owner: string, id: string) {
+    const row = (await c.query('SELECT * FROM credit_sessions WHERE environment=$1 AND id=$2 AND owner=$3 FOR UPDATE', [this.environment, id, owner])).rows[0];
+    if (!row) throw fail('Unknown session', 404);
+    return row;
+  }
+  private active(row: any) {
+    if (row.closed || new Date(row.expires_at).getTime() <= Date.now()) throw fail('Session is closed or expired');
+  }
+  private async allocate(c: CreditConnection, owner: string, sid: string, amount: bigint) {
+    const lots = (await c.query('SELECT * FROM credit_lots WHERE environment=$1 AND owner=$2 AND available>0 AND NOT disputed ORDER BY created_at,id FOR UPDATE', [this.environment, owner])).rows;
+    let remaining = amount;
+    for (const lot of lots) {
+      const take = BigInt(lot.available) < remaining ? BigInt(lot.available) : remaining;
+      if (!take) break;
+      await c.query('UPDATE credit_lots SET available=available-$3,allocated=allocated+$3 WHERE environment=$1 AND id=$2', [this.environment, lot.id, String(take)]);
+      await c.query('INSERT INTO credit_session_lots(environment,session_id,lot_id,remaining) VALUES($1,$2,$3,$4) ON CONFLICT(environment,session_id,lot_id) DO UPDATE SET remaining=credit_session_lots.remaining+excluded.remaining', [this.environment, sid, lot.id, String(take)]);
+      remaining -= take;
+    }
+    if (remaining) throw fail('Insufficient available Credits', 402);
+  }
+  private async close(c: CreditConnection, owner: string, row: any) {
+    if (row.closed) return row;
+    const amount = BigInt(row.remaining);
+    if (await this.posting(c, owner, `end:${row.id}`, amount, 'session-end')) {
+      const lots = (await c.query('SELECT * FROM credit_session_lots WHERE environment=$1 AND session_id=$2 AND remaining>0 FOR UPDATE', [this.environment, row.id])).rows;
+      for (const lot of lots) await c.query('UPDATE credit_lots SET allocated=allocated-$3,available=available+$3 WHERE environment=$1 AND id=$2', [this.environment, lot.lot_id, String(lot.remaining)]);
+      await c.query('UPDATE credit_session_lots SET remaining=0 WHERE environment=$1 AND session_id=$2', [this.environment, row.id]);
+      await c.query('UPDATE credit_accounts SET available=available+$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(amount)]);
+      await c.query('UPDATE credit_sessions SET remaining=0,closed=true WHERE environment=$1 AND id=$2', [this.environment, row.id]);
+    }
+    return { ...row, remaining: '0', closed: true };
+  }
+  async balance(owner: string) {
+    return this.tx(async c => {
+      const account = (await c.query('SELECT * FROM credit_accounts WHERE environment=$1 AND owner=$2 FOR UPDATE', [this.environment, owner])).rows[0];
+      if (!account) return { availableAtomics: '0', allocatedAtomics: '0', reservedAtomics: '0', spentAtomics: '0', suspendedAtomics: '0' };
+      const expired = (await c.query('SELECT * FROM credit_sessions WHERE environment=$1 AND owner=$2 AND NOT closed AND expires_at<=now() FOR UPDATE', [this.environment, owner])).rows;
+      for (const row of expired) await this.close(c, owner, row);
+      const fresh = (await c.query('SELECT * FROM credit_accounts WHERE environment=$1 AND owner=$2', [this.environment, owner])).rows[0];
+      const totals = (await c.query('SELECT coalesce(sum(remaining),0)::text allocated,coalesce(sum(reserved),0)::text reserved FROM credit_sessions WHERE environment=$1 AND owner=$2', [this.environment, owner])).rows[0];
+      return { availableAtomics: String(fresh.available), allocatedAtomics: totals.allocated, reservedAtomics: totals.reserved, spentAtomics: String(fresh.spent), suspendedAtomics: String(fresh.suspended) };
+    });
+  }
+  async start(owner: string, amount: bigint, duration: number, key: string) {
+    positive(amount); identifier(key);
+    if (!Number.isInteger(duration) || duration < 60 || duration > 604800) throw fail('Invalid session duration', 400);
+    return this.tx(c => this.startInTransaction(c, owner, amount, duration, key));
+  }
+  private async startInTransaction(c: CreditConnection, owner: string, amount: bigint, duration: number, key: string) {
+    const id = createHash('sha256').update(`${this.environment}:${owner}:session:${key}`).digest('hex');
+      const account = await this.account(c, owner);
+      const previous = (await c.query('SELECT * FROM credit_sessions WHERE environment=$1 AND id=$2', [this.environment, id])).rows[0];
+      if (previous) {
+        const posting = (await c.query('SELECT amount FROM credit_postings WHERE environment=$1 AND id=$2', [this.environment, `start:${id}`])).rows[0];
+        if (String(posting.amount) !== String(amount) || previous.duration_seconds !== duration) throw fail('Session request replay mismatch');
+        return previous;
+      }
+      if (BigInt(account.available) < amount) throw fail('Insufficient available Credits', 402);
+      const row = (await c.query('INSERT INTO credit_sessions(environment,id,owner,budget,remaining,duration_seconds,expires_at) VALUES($1,$2,$3,$4,$4,$5,now()+$5::integer*interval \'1 second\') RETURNING *', [this.environment, id, owner, String(amount), duration])).rows[0];
+      await this.allocate(c, owner, id, amount);
+      if (await this.posting(c, owner, `start:${id}`, amount, 'session-start')) await c.query('UPDATE credit_accounts SET available=available-$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(amount)]);
+      return row;
+  }
+  private async topupInTransaction(c: CreditConnection, owner: string, id: string, amount: bigint, key: string) {
+      const account = await this.account(c, owner);
+      const row = await this.readSession(c, owner, id);
+      const post = `topup:${id}:${key}`;
+      const existing = (await c.query('SELECT * FROM credit_postings WHERE environment=$1 AND id=$2', [this.environment, post])).rows[0];
+      if (existing) { if (String(existing.amount) !== String(amount)) throw fail('Top up replay mismatch'); return row; }
+      this.active(row);
+      if (BigInt(account.available) < amount) throw fail('Insufficient available Credits', 402);
+      await this.allocate(c, owner, id, amount);
+      if (await this.posting(c, owner, post, amount, 'session-topup')) {
+        await c.query('UPDATE credit_accounts SET available=available-$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(amount)]);
+        return (await c.query('UPDATE credit_sessions SET remaining=remaining+$3,budget=budget+$3 WHERE environment=$1 AND id=$2 RETURNING *', [this.environment, id, String(amount)])).rows[0];
+      }
+      return row;
+  }
+  async topup(owner: string, id: string, amount: bigint, key: string) {
+    positive(amount); identifier(key);
+    return this.tx(c => this.topupInTransaction(c, owner, id, amount, key));
+  }
+  async end(owner: string, id: string) {
+    return this.tx(async c => { await this.account(c, owner); return this.close(c, owner, await this.readSession(c, owner, id)); });
+  }
+  async session(owner: string, id: string) { return this.tx(c => this.readSession(c, owner, id)); }
   
 }
 
