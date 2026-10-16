@@ -176,6 +176,53 @@ export class CreditStore {
     const hold = (await c.query('SELECT * FROM credit_holds WHERE environment=$1 AND id=$2 FOR UPDATE', [this.environment, id])).rows[0];
     return { session, hold };
   }
+  async commit(owner: string, id: string, amount: bigint) {
+    if (amount < 0n) throw fail('Invalid charge', 400);
+    await this.tx(async c => {
+      const { hold, session } = await this.hold(c, owner, id);
+      const previous = BigInt(hold.charged);
+      if (amount <= previous) return;
+      if (hold.closed || amount > BigInt(hold.maximum)) throw fail('Charge exceeds reservation');
+      const delta = amount - previous;
+      if (!(await this.posting(c, owner, `charge:${id}:${amount}`, delta, 'service-charge'))) return;
+      const lots = (await c.query('SELECT * FROM credit_hold_lots WHERE environment=$1 AND hold_id=$2 AND remaining>0 ORDER BY lot_id FOR UPDATE', [this.environment, id])).rows;
+      let remaining = delta;
+      for (const lot of lots) {
+        const take = BigInt(lot.remaining) < remaining ? BigInt(lot.remaining) : remaining;
+        if (!take) break;
+        await c.query('UPDATE credit_lots SET reserved=reserved-$3,spent=spent+$3 WHERE environment=$1 AND id=$2', [this.environment, lot.lot_id, String(take)]);
+        await c.query('UPDATE credit_session_lots SET reserved=reserved-$4 WHERE environment=$1 AND session_id=$2 AND lot_id=$3', [this.environment, session.id, lot.lot_id, String(take)]);
+        await c.query('UPDATE credit_hold_lots SET remaining=remaining-$4 WHERE environment=$1 AND hold_id=$2 AND lot_id=$3', [this.environment, id, lot.lot_id, String(take)]);
+        remaining -= take;
+      }
+      if (remaining) throw fail('Charge attribution missing');
+      await c.query('UPDATE credit_accounts SET spent=spent+$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(delta)]);
+      await c.query('UPDATE credit_sessions SET reserved=reserved-$3,spent=spent+$3 WHERE environment=$1 AND id=$2', [this.environment, session.id, String(delta)]);
+      await c.query('UPDATE credit_holds SET charged=$3 WHERE environment=$1 AND id=$2', [this.environment, id, String(amount)]);
+      if (hold.creator) {
+        const share = (amount - amount * 20n / 100n) - (previous - previous * 20n / 100n);
+        await c.query('INSERT INTO credit_creators(environment,owner,payable) VALUES($1,$2,$3) ON CONFLICT(environment,owner) DO UPDATE SET payable=credit_creators.payable+excluded.payable', [this.environment, hold.creator, String(share)]);
+      }
+    });
+  }
+  async release(owner: string, id: string) {
+    await this.tx(async c => {
+      const { session, hold } = await this.hold(c, owner, id);
+      if (hold.closed) return;
+      const amount = BigInt(hold.maximum) - BigInt(hold.charged);
+      if (!(await this.posting(c, owner, `release:${id}`, amount, 'service-release'))) return;
+      const toAvailable = session.closed || new Date(session.expires_at).getTime() <= Date.now();
+      const lots = (await c.query('SELECT * FROM credit_hold_lots WHERE environment=$1 AND hold_id=$2 AND remaining>0 FOR UPDATE', [this.environment, id])).rows;
+      for (const lot of lots) {
+        await c.query(`UPDATE credit_lots SET reserved=reserved-$3,${toAvailable ? 'available' : 'allocated'}=${toAvailable ? 'available' : 'allocated'}+$3 WHERE environment=$1 AND id=$2`, [this.environment, lot.lot_id, String(lot.remaining)]);
+        await c.query(`UPDATE credit_session_lots SET reserved=reserved-$4${toAvailable ? '' : ',remaining=remaining+$4'} WHERE environment=$1 AND session_id=$2 AND lot_id=$3`, [this.environment, session.id, lot.lot_id, String(lot.remaining)]);
+      }
+      await c.query('UPDATE credit_hold_lots SET remaining=0 WHERE environment=$1 AND hold_id=$2', [this.environment, id]);
+      await c.query(`UPDATE credit_sessions SET reserved=reserved-$3${toAvailable ? '' : ',remaining=remaining+$3'} WHERE environment=$1 AND id=$2`, [this.environment, session.id, String(amount)]);
+      if (toAvailable) await c.query('UPDATE credit_accounts SET available=available+$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(amount)]);
+      await c.query('UPDATE credit_holds SET closed=true WHERE environment=$1 AND id=$2', [this.environment, id]);
+    });
+  }
   
 }
 
