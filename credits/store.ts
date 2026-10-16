@@ -223,7 +223,30 @@ export class CreditStore {
       await c.query('UPDATE credit_holds SET closed=true WHERE environment=$1 AND id=$2', [this.environment, id]);
     });
   }
-  
+  async creditCapture(owner: string, id: string, captureId: string, amount: bigint) {
+    positive(amount);
+    await this.tx(async c => {
+      await this.account(c, owner);
+      const op = (await c.query('SELECT * FROM credit_operations WHERE environment=$1 AND id=$2 AND owner=$3 FOR UPDATE', [this.environment, id, owner])).rows[0];
+      if (!op) throw fail('Unknown payment operation', 404);
+      if (String(op.amount) !== String(amount) || op.kind !== 'purchase') throw fail('Capture amount mismatch');
+      if (op.status === 'credited') { if (op.capture_id !== captureId) throw fail('Capture replay mismatch'); return; }
+      if (await this.posting(c, owner, `capture:${captureId}`, amount, 'purchase')) {
+        await c.query('INSERT INTO credit_lots(environment,id,owner,capture_id,amount,available) VALUES($1,$2,$3,$4,$5,$5)', [this.environment, id, owner, captureId, String(amount)]);
+        await c.query('UPDATE credit_accounts SET available=available+$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(amount)]);
+      } else throw fail('Capture is already attributed to another operation');
+      await c.query("UPDATE credit_operations SET status='credited',capture_id=$3,updated_at=now() WHERE environment=$1 AND id=$2", [this.environment, id, captureId]);
+      const intent: CreditCheckoutIntent | undefined = op.context.checkout;
+      let session;
+      if (intent?.kind === 'start') session = await this.startInTransaction(c, owner, amount, intent.durationSeconds, `purchase:${id}`);
+      if (intent?.kind === 'topup') {
+        const target = await this.readSession(c, owner, intent.sessionId);
+        // A session may end while the card checkout is open. Paid Credits remain available.
+        if (!target.closed && new Date(target.expires_at).getTime() > Date.now()) session = await this.topupInTransaction(c, owner, target.id, amount, `purchase:${id}`);
+      }
+      if (session) await c.query('UPDATE credit_operations SET context=context||$3::jsonb WHERE environment=$1 AND id=$2', [this.environment, id, JSON.stringify({ sessionId: session.id })]);
+    });
+  }
 }
 
 let store: CreditStore | undefined;
