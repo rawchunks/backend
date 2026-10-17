@@ -105,6 +105,8 @@ export async function updateJobStatus(jobId: string, update: Partial<Pick<TaskJo
   return parseJob(raw, id);
 }
 export async function setTaskContext(taskId: string, context: unknown, options: { terminal?: boolean } = {}): Promise<void> {
+  const { bindCreditTask } = await import('../credits/billing.js');
+  await bindCreditTask(taskId, context);
   assertId(taskId);
   const raw = JSON.stringify(context);
   if (raw === undefined) throw new Error('Task context is required');
@@ -160,6 +162,8 @@ export async function withJobLock<T>(resource: string, operation: (assertLease: 
       if (lost || await valkey.get(key) !== token) throw new Error('Finalization lease lost');
     }, {
       save: async (taskId: string, context: unknown, options: { terminal?: boolean } = {}) => {
+        const { bindCreditTask } = await import('../credits/billing.js');
+        await bindCreditTask(taskId, context);
         assertId(taskId);
         const raw = JSON.stringify(context);
         if (raw === undefined) throw new Error('Task context is required');
