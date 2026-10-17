@@ -67,6 +67,52 @@ export class PayPal {
     if (JSON.stringify(existing.context.checkout ?? { kind: 'balance' }) !== JSON.stringify(checkout)) throw fail('Idempotency key reused for a different checkout intent', 409);
     return this.createOrder(id);
   }
+  async createLicense(
+    owner: string,
+    input: { songId: string; chainSongId: string; network: string; walletAddress: string; amountAtomics: string },
+    key: string,
+  ) {
+    const blockchain =
+      input.network === 'eip155:84532'
+        ? 'base'
+        : input.network === 'eip155:42431'
+          ? 'tempo'
+          : input.network === 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1'
+            ? 'solana'
+            : null;
+    if (!blockchain) throw fail(`Unsupported testnet network for Coinflow license checkout: ${input.network}`, 400);
+    const atomics = BigInt(input.amountAtomics);
+    if (atomics <= 0n) throw fail('Invalid license price', 400);
+    const cents = Math.max(1, Math.round(Number(atomics) / 10000));
+    const usd = (cents / 100).toFixed(2);
+    const id = createHash('sha256').update(`${this.store.environment}:${owner}:license:${key}`).digest('hex').slice(0, 36);
+    const context = {
+      songId: input.songId,
+      chainSongId: input.chainSongId,
+      network: input.network,
+      blockchain,
+      walletAddress: input.walletAddress,
+      cents,
+      usd,
+    };
+    await this.store.tx(async c => {
+      await c.query('INSERT INTO credit_accounts(environment,owner) VALUES($1,$2) ON CONFLICT DO NOTHING', [this.store.environment, owner]);
+      await c.query(
+        "INSERT INTO credit_operations(environment,id,owner,kind,amount,context) VALUES($1,$2,$3,'license',$4,$5) ON CONFLICT DO NOTHING",
+        [this.store.environment, id, owner, input.amountAtomics, JSON.stringify(context)],
+      );
+    });
+    const existing = await this.operation(id, owner);
+    if (
+      existing.kind !== 'license' ||
+      String(existing.amount) !== input.amountAtomics ||
+      existing.context?.songId !== input.songId ||
+      existing.context?.network !== input.network
+    ) {
+      throw fail('Idempotency key reused for a different license checkout', 409);
+    }
+    return this.createOrder(id);
+  }
   private merchant(op: any) {
     return { id: op.context.merchantId || process.env.PAYPAL_MERCHANT_ID, email: op.context.merchantEmail || (process.env.PAYPAL_MERCHANT_EMAIL || process.env.PAYPAL_EMAIL)?.toLowerCase() };
   }
@@ -92,6 +138,84 @@ export class PayPal {
     await this.store.tx(c => c.query('UPDATE credit_operations SET order_id=$3,updated_at=now() WHERE environment=$1 AND id=$2', [this.store.environment, id, order.id]));
     await this.validateOrder({ ...op, order_id: order.id }, await this.request(`/v2/checkout/orders/${encodeURIComponent(order.id)}`));
     return { operationId: id, orderId: order.id, status: order.status };
+  }
+  private async coinflowCheckout(op: any, captureId: string, payerEmail?: string) {
+    const apiKey = process.env.COINFLOW_SANDBOX_API_KEY;
+    if (!apiKey) throw fail('Coinflow Sandbox configuration unavailable', 503);
+    const coinflowBase = 'https://api-sandbox.coinflow.cash';
+    const blockchain = op.context?.blockchain || (
+      op.context?.network === 'eip155:84532'
+        ? 'base'
+        : op.context?.network === 'eip155:42431'
+          ? 'tempo'
+          : 'solana'
+    );
+    const walletAddress = op.context?.walletAddress;
+    if (typeof walletAddress !== 'string' || !walletAddress) throw fail('Missing wallet address for Coinflow checkout', 400);
+
+    const sessionRes = await this.transport(`${coinflowBase}/api/auth/session-key`, {
+      method: 'GET',
+      headers: {
+        Authorization: apiKey,
+        'x-coinflow-auth-user-id': op.id,
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!sessionRes.ok) throw fail(`Coinflow session-key request failed (${sessionRes.status})`);
+    const { key: sessionKey } = (await sessionRes.json()) as { key?: string };
+    if (typeof sessionKey !== 'string' || !sessionKey) throw fail('Invalid Coinflow session-key response');
+
+    const email = (payerEmail || process.env.PAYPAL_CREATOR_EMAIL || 'sb-1llge53425539@personal.example.com').toLowerCase();
+    const checkoutRes = await this.transport(`${coinflowBase}/api/checkout/paypal/rawchunks`, {
+      method: 'POST',
+      headers: {
+        Authorization: apiKey,
+        'x-coinflow-auth-session-key': sessionKey,
+        'x-coinflow-auth-user-id': op.id,
+        'x-coinflow-auth-wallet': walletAddress,
+        'x-coinflow-auth-blockchain': blockchain,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        subtotal: { cents: Number(op.context.cents), currency: 'USD' },
+        email,
+        paypal: { email },
+        webhookInfo: {
+          operationId: op.id,
+          songId: op.context.songId,
+          chainSongId: op.context.chainSongId,
+          network: op.context.network,
+          paypalOrderId: op.order_id,
+          paypalCaptureId: captureId,
+        },
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!checkoutRes.ok) {
+      const errBody = await checkoutRes.json().catch(() => ({})) as any;
+      throw fail(`Coinflow PayPal checkout failed (${checkoutRes.status})${errBody?.details ? `: ${JSON.stringify(errBody.details)}` : ''}`);
+    }
+    const { paymentId } = (await checkoutRes.json()) as { paymentId?: string };
+    if (typeof paymentId !== 'string' || !paymentId) throw fail('Coinflow returned no paymentId');
+
+    await this.store.tx(c =>
+      c.query(
+        "UPDATE credit_operations SET status='completed',capture_id=$3,context=context||$4::jsonb,updated_at=now() WHERE environment=$1 AND id=$2",
+        [
+          this.store.environment,
+          op.id,
+          captureId,
+          JSON.stringify({ coinflowPaymentId: paymentId, coinflowBlockchain: blockchain }),
+        ],
+      ),
+    );
+    return {
+      operationId: op.id,
+      status: 'completed',
+      orderId: op.order_id,
+      captureId,
+      coinflowPaymentId: paymentId,
+    };
   }
   async capture(
     owner: string,
@@ -151,6 +275,9 @@ export class PayPal {
     if (order.status !== 'COMPLETED') return { operationId: id, status: order.status };
     const capture = unit.payments?.captures?.[0], usd = this.expectedUsd(op);
     if (unit.payments?.captures?.length !== 1 || capture?.status !== 'COMPLETED' || capture.amount?.currency_code !== 'USD' || capture.amount.value !== usd || typeof capture.id !== 'string') throw fail('PayPal capture verification failed');
+    if (op.kind === 'license') {
+      return this.coinflowCheckout(op, capture.id, order.payer?.email_address);
+    }
     await this.store.creditCapture(op.owner, id, capture.id, BigInt(op.amount));
     return { operationId: id, status: 'credited' };
   }
