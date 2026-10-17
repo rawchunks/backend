@@ -93,5 +93,66 @@ export class PayPal {
     await this.validateOrder({ ...op, order_id: order.id }, await this.request(`/v2/checkout/orders/${encodeURIComponent(order.id)}`));
     return { operationId: id, orderId: order.id, status: order.status };
   }
+  async capture(
+    owner: string,
+    id: string,
+    orderId: string,
+    card?: { number: string; expiry: string; securityCode: string; name?: string },
+  ) {
+    const op = await this.operation(id, owner);
+    if (op.order_id !== orderId) throw fail('Order does not belong to this operation', 409);
+    if (op.status === 'credited' || op.status === 'completed') {
+      return {
+        operationId: id,
+        status: op.status,
+        ...(op.context?.coinflowPaymentId ? { coinflowPaymentId: op.context.coinflowPaymentId } : {}),
+      };
+    }
+    const order = await this.request(`/v2/checkout/orders/${encodeURIComponent(orderId)}`);
+    await this.validateOrder(op, order);
+    if (order.status !== 'COMPLETED') {
+      const captureBody = card
+        ? {
+            payment_source: {
+              card: {
+                number: card.number,
+                expiry: card.expiry,
+                security_code: card.securityCode,
+                name: card.name || 'License Buyer',
+              },
+            },
+          }
+        : {};
+      try {
+        await this.request(`/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`, 'POST', captureBody, `capture-${id}`);
+      } catch (error) {
+        if ((await this.request(`/v2/checkout/orders/${encodeURIComponent(orderId)}`)).status !== 'COMPLETED') throw error;
+      }
+    }
+    return this.reconcile(id);
+  }
+  async reconcile(id: string): Promise<{ operationId: string; status: string; coinflowPaymentId?: string; orderId?: string; captureId?: string }> {
+    const op = await this.operation(id);
+    if (op.status === 'credited' || op.status === 'completed') {
+      return {
+        operationId: id,
+        status: op.status,
+        ...(op.context?.coinflowPaymentId ? { coinflowPaymentId: op.context.coinflowPaymentId } : {}),
+      };
+    }
+    if (!op.order_id) return this.createOrder(id);
+    let order = await this.request(`/v2/checkout/orders/${encodeURIComponent(op.order_id)}`);
+    let unit = await this.validateOrder(op, order);
+    if (order.status === 'APPROVED') {
+      await this.request(`/v2/checkout/orders/${encodeURIComponent(op.order_id)}/capture`, 'POST', {}, `capture-${id}`);
+      order = await this.request(`/v2/checkout/orders/${encodeURIComponent(op.order_id)}`);
+      unit = await this.validateOrder(await this.operation(id), order);
+    }
+    if (order.status !== 'COMPLETED') return { operationId: id, status: order.status };
+    const capture = unit.payments?.captures?.[0], usd = this.expectedUsd(op);
+    if (unit.payments?.captures?.length !== 1 || capture?.status !== 'COMPLETED' || capture.amount?.currency_code !== 'USD' || capture.amount.value !== usd || typeof capture.id !== 'string') throw fail('PayPal capture verification failed');
+    await this.store.creditCapture(op.owner, id, capture.id, BigInt(op.amount));
+    return { operationId: id, status: 'credited' };
+  }
   
 }
