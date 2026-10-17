@@ -281,5 +281,12 @@ export class PayPal {
     await this.store.creditCapture(op.owner, id, capture.id, BigInt(op.amount));
     return { operationId: id, status: 'credited' };
   }
-  
+  async webhook(headers: Record<string, unknown>, event: any) {
+    if (!process.env.PAYPAL_WEBHOOK_ID) throw fail('PayPal webhook verification unavailable', 503);
+    const verified = await this.request('/v1/notifications/verify-webhook-signature', 'POST', {
+      auth_algo: headers['paypal-auth-algo'], cert_url: headers['paypal-cert-url'], transmission_id: headers['paypal-transmission-id'], transmission_sig: headers['paypal-transmission-sig'], transmission_time: headers['paypal-transmission-time'], webhook_id: process.env.PAYPAL_WEBHOOK_ID, webhook_event: event,
+    });
+    if (verified.verification_status !== 'SUCCESS' || typeof event?.id !== 'string') throw fail('Unverified PayPal webhook', 401);
+    await this.store.tx(c => c.query('INSERT INTO credit_events(environment,id,payload) VALUES($1,$2,$3) ON CONFLICT DO NOTHING', [this.store.environment, event.id, JSON.stringify(event)]));
+  }
 }
