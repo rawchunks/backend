@@ -260,6 +260,10 @@ export const databaseRouter: FastifyPluginAsync = async app => {
 
   const streamCheckpointHandler = async (request: FastifyRequest, reply: FastifyReply) => {
     try {
+      if (request.headers['x-credit-session-token']) {
+        const { checkpointCredits } = await import('../credits/billing.js');
+        return reply.send(await checkpointCredits(request));
+      }
       const { id } = request.params as { id: string };
       const song = await getSongById(id);
       if (!song) return reply.status(404).send({ error: 'Song not found' });

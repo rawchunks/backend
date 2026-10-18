@@ -55,7 +55,18 @@ export async function admitCredits(req: FastifyRequest, reply: FastifyReply, res
   }
   reply.header('x-credit-hold-id', hold.id);
 }
-
+export async function checkpointCredits(req: FastifyRequest) {
+  const identity = await authenticate(req), store = creditStore();
+  const input = req.body as { paymentIntentId?: string; listenedSeconds?: number; terminal?: boolean };
+  if (!input?.paymentIntentId || !Number.isFinite(input.listenedSeconds) || input.listenedSeconds! < 0) throw Object.assign(new Error('Invalid playback checkpoint'), { statusCode: 400 });
+  const row = await store.tx(async c => (await c.query('SELECT h.* FROM credit_holds h JOIN credit_sessions s ON s.environment=h.environment AND s.id=h.session_id WHERE h.environment=$1 AND h.id=$2 AND s.owner=$3', [store.environment, input.paymentIntentId, identity.owner])).rows[0]);
+  if (!row || row.context?.kind !== 'stream' || row.context.songId !== (req.params as any).id || !identity.addresses.includes(row.context.userAddress)) throw Object.assign(new Error('Unknown playback operation'), { statusCode: 404 });
+  const millis = Math.min(row.context.durationMs, Math.floor(input.listenedSeconds! * 1000), Math.max(0, Date.now() - row.context.startedAt));
+  const cumulative = BigInt(millis) * BigInt(row.context.rate) / 60000n;
+  await store.commit(identity.owner, row.id, cumulative);
+  if (input.terminal) await store.release(identity.owner, row.id);
+  return { success: true, result: { billedWei: String(cumulative), status: 'credited' } };
+}
 export function installCreditBilling(app: FastifyInstance) {
   app.addHook('onRoute', route => {
     const original = route.handler;
