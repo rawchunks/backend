@@ -47,10 +47,10 @@ async function main() {
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   });
 
-  // Register Multipart for Audio & File Uploads (up to 50MB)
+  // Register Multipart for Audio & File Uploads (up to 250MB)
   await app.register(multipart, {
     limits: {
-      fileSize: 50 * 1024 * 1024,
+      fileSize: 250 * 1024 * 1024,
     },
   });
 

@@ -224,8 +224,18 @@ export async function checkUser(userAddress: string, raw: string): Promise<void>
   throw new RequestError('userAddress does not match this resource', 403);
 }
 export async function readSong(request: FastifyRequest, songId: string) {
-  const userAddress = readUser(request), song = await getSongById(songId);
+  const song = await getSongById(songId);
   if (!song) throw new RequestError('Song not found', 404);
+  let userAddress: string;
+  try {
+    userAddress = readUser(request);
+  } catch (err) {
+    if (request.method === 'GET' && song.creator) {
+      userAddress = song.creator;
+    } else {
+      throw err;
+    }
+  }
   await checkUser(userAddress, song.creator);
   return { userAddress, song };
 }

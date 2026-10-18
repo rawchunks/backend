@@ -4,7 +4,7 @@ import * as dotenv from 'dotenv';
 import { resolve } from 'node:path';
 
 dotenv.config({ path: resolve(process.cwd(), '.env') });
-const uri = process.env.VALKEY_REQUESTS_SERVICE_URI || process.env.VALKEY_URI ||
+const uri = process.env.VALKEY_URI || process.env.VALKEY_REQUESTS_SERVICE_URI ||
   (process.env.VALKEY_REQUESTS_HOST
     ? `rediss://default:${encodeURIComponent(process.env.VALKEY_REQUESTS_PASSWORD || '')}@${process.env.VALKEY_REQUESTS_HOST}:24348`
     : 'redis://127.0.0.1:6379');
@@ -14,6 +14,117 @@ export const valkey = new Redis(uri, {
   tls: uri.startsWith('rediss://') ? { rejectUnauthorized: true } : undefined,
 });
 valkey.on('error', err => console.warn('[Valkey]', err.message));
+
+const isTestValkey = process.env.VALKEY_URI === 'redis://127.0.0.1:1';
+const wipsUri = !isTestValkey
+  ? (process.env.VALKEY_WIPS_SERVICE_URI ||
+      (process.env.VALKEY_WIPS_HOST
+        ? `rediss://default:${encodeURIComponent(process.env.VALKEY_WIPS_PASSWORD || '')}@${process.env.VALKEY_WIPS_HOST}:24348`
+        : uri))
+  : uri;
+const wipsReplicaUri = !isTestValkey ? (process.env.VALKEY_WIPS_REPLICA_URI || wipsUri) : uri;
+export const valkeyWips = wipsUri !== uri
+  ? new Redis(wipsUri, {
+      maxRetriesPerRequest: 3, connectTimeout: 10000, commandTimeout: 10000,
+      retryStrategy: times => Math.min(times * 100, 3000),
+      tls: wipsUri.startsWith('rediss://') ? { rejectUnauthorized: true } : undefined,
+    })
+  : valkey;
+if (valkeyWips !== valkey) {
+  valkeyWips.on('error', err => console.warn('[Valkey]', err.message));
+}
+export const valkeyWipsReader = wipsReplicaUri !== wipsUri
+  ? new Redis(wipsReplicaUri, {
+      maxRetriesPerRequest: 3, connectTimeout: 10000, commandTimeout: 10000,
+      retryStrategy: times => Math.min(times * 100, 3000),
+      tls: wipsReplicaUri.startsWith('rediss://') ? { rejectUnauthorized: true } : undefined,
+    })
+  : valkeyWips;
+if (valkeyWipsReader !== valkeyWips) {
+  valkeyWipsReader.on('error', err => console.warn('[Valkey]', err.message));
+}
+
+export const WIP_TTL_SECONDS = 168 * 3600; // 7 days (168 hours)
+
+export interface SongWipState {
+  songId: string;
+  updatedAt: number;
+  synthLanes?: Array<{
+    id: string;
+    type: 'pianoroll' | 'sequencer' | 'strudel';
+    name: string;
+    color: string;
+    mounted: boolean;
+    activeVersionId: string;
+    versions: Array<{
+      id: string;
+      number: number;
+      createdAt: number;
+      label?: string;
+      pianoRollNotes?: unknown[];
+      sequencerVoices?: unknown[];
+      strudelCode?: string;
+      synthConfig?: Record<string, unknown>;
+    }>;
+    mixer: { volume: number; pan: number; muted: boolean; solo: boolean };
+    fx: Record<string, unknown>;
+  }>;
+  trackEdits?: Record<string, {
+    mixer?: { volume: number; pan: number; muted: boolean; solo: boolean };
+    fx?: Record<string, unknown>;
+    sculpt?: unknown;
+    clipSculpts?: Record<string, unknown>;
+    sectionGain?: [number, number, number] | number;
+    sectionTone?: [number, number, number];
+    activeVersionTakeId?: string | null;
+    dirty?: { mixer?: boolean; fx?: boolean; sculpt?: boolean };
+  }>;
+  dirtyFlags?: { lanes?: boolean; mixer?: boolean; fx?: boolean; sculpt?: boolean };
+  originals?: Array<{ start: number; end: number }>;
+  bpm?: number;
+  synthTracks?: unknown[];
+  sectionGain?: number;
+  sectionLow?: number;
+  sectionMid?: number;
+  sectionHigh?: number;
+}
+
+export async function getWipState(songId: string): Promise<SongWipState | null> {
+  assertId(songId);
+  const key = `rawchunks:wip:${songId}`;
+  const raw = await valkeyWipsReader.get(key).catch(() => valkeyWips.get(key));
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as SongWipState;
+    if (!parsed || typeof parsed !== 'object' || parsed.songId !== songId) return null;
+    valkeyWips.expire(key, WIP_TTL_SECONDS).catch(() => {});
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export async function setWipState(songId: string, state: Omit<SongWipState, 'songId' | 'updatedAt'>): Promise<SongWipState> {
+  assertId(songId);
+  const payload: SongWipState = {
+    ...state,
+    songId,
+    updatedAt: Date.now(),
+  };
+  await valkeyWips.set(`rawchunks:wip:${songId}`, JSON.stringify(payload), 'EX', WIP_TTL_SECONDS);
+  return payload;
+}
+
+export async function deleteWipState(songId: string): Promise<boolean> {
+  assertId(songId);
+  const removed = await valkeyWips.del(`rawchunks:wip:${songId}`);
+  return removed > 0;
+}
+
+export async function closeWips(): Promise<void> {
+  if (valkeyWipsReader !== valkeyWips) await valkeyWipsReader.quit().catch(() => {});
+  await valkeyWips.quit().catch(() => {});
+}
 export interface TaskJob {
   id: string;
   type: 'generate' | 'edit' | 'clone' | 'separate';
@@ -224,4 +335,5 @@ export async function closeSubscriptions(): Promise<void> {
   for (const observers of subscriptions.values()) for (const observer of observers) observer.error(new Error('Server is shutting down'));
   subscriptions.clear();
   await subscriber?.quit(); subscriber = undefined;
+  await closeWips();
 }
