@@ -13,6 +13,10 @@ import { voiceService } from './voice/service.js';
 import { runMigrations } from './databases/migrate.js';
 import { optionsRouter } from './options.js';
 import { valkey, closeSubscriptions } from './broker/valkey.js';
+import { creditsRouter } from './credits/router.js';
+import { creditStore } from './credits/store.js';
+import { PayPal } from './credits/paypal.js';
+import { installCreditBilling, recoverCreditServices } from './credits/billing.js';
 
 dotenv.config({ path: resolve(process.cwd(), '.env') });
 
@@ -28,6 +32,7 @@ const app = Fastify({
 let databaseReady = false;
 
 async function main() {
+  if (process.env.CREDITS_ENABLED === 'true') installCreditBilling(app);
   // Ensure database tables exist
   try {
     await runMigrations();
@@ -95,6 +100,30 @@ async function main() {
 
   // Register Namespaced Service Routes
   await app.register(optionsRouter, { prefix: '/api' });
+  if (process.env.CREDITS_ENABLED === 'true') {
+    if ((process.env.CREDITS_SESSION_SECRET || '').length < 32 || !process.env.THIRDWEB_CLIENT_ID || !process.env.CREDITS_IDENTITY_RPC_URL || !process.env.CREDITS_IDENTITY_FACTORY_ADDRESS) throw new Error('Credit ownership verification is not configured');
+    const credits = creditStore();
+    await credits.migrate();
+    await app.register(creditsRouter, { prefix: '/api' });
+    const paypal = new PayPal(credits);
+    let recovering = false;
+    const recover = async () => {
+      if (recovering) return;
+      recovering = true;
+      try {
+        const pending = await credits.tx(c => c.query("SELECT id FROM credit_operations WHERE environment=$1 AND kind='purchase' AND status='pending' AND created_at>now()-interval '3 days' ORDER BY created_at LIMIT 20", [credits.environment]));
+        for (const row of pending.rows) {
+          try { await paypal.reconcile(row.id); }
+          catch { app.log.warn({ operationId: row.id }, 'Payment reconciliation will retry'); }
+        }
+        await recoverCreditServices();
+      } catch { app.log.error('Credit recovery unavailable'); }
+      finally { recovering = false; }
+    };
+    const timer = setInterval(() => void recover(), 30000);
+    timer.unref();
+    app.addHook('onClose', async () => { clearInterval(timer); await credits.pool.end?.(); });
+  }
   await app.register(databaseRouter, { prefix: '/api' });
   await app.register(generationRouter, { prefix: '/api/generation' });
   await app.register(editingRouter, { prefix: '/api/editing' });

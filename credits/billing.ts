@@ -88,4 +88,33 @@ export function installCreditBilling(app: FastifyInstance) {
     return payload;
   });
 }
-
+export async function recoverCreditServices() {
+  const store = creditStore();
+  const rows = await store.tx(c => c.query('SELECT h.*,s.owner FROM credit_holds h JOIN credit_sessions s ON s.environment=h.environment AND s.id=h.session_id WHERE h.environment=$1 AND NOT h.closed ORDER BY h.created_at LIMIT 30', [store.environment]));
+  for (const hold of rows.rows) {
+    if (!hold.context) {
+      if (Date.now() - new Date(hold.created_at).getTime() > 15 * 60000) await store.release(hold.owner, hold.id);
+      continue;
+    }
+    if (hold.context.kind === 'stream') {
+      if (Date.now() - hold.context.startedAt > hold.context.durationMs + 10 * 60000) await store.release(hold.owner, hold.id);
+      continue;
+    }
+    const { getTaskContext } = await import('../broker/valkey.js');
+    let task = await getTaskContext<any>(hold.context.taskId);
+    if (!task?.result && task) {
+      if (task.kind === 'generate') {
+        const { generationService } = await import('../generation/service.js');
+        await generationService.checkStatusAndFinalize(hold.context.taskId, task.songId);
+      } else if (task.kind === 'edit') {
+        const { editingService } = await import('../editing/service.js');
+        await editingService.finalizeEditResult({ ...task.params, taskId: hold.context.taskId });
+      }
+      task = await getTaskContext<any>(task.workerTaskId || hold.context.taskId);
+    }
+    if (task?.result?.status === 'ready') {
+      await store.commit(hold.owner, hold.id, BigInt(hold.maximum));
+      await store.release(hold.owner, hold.id);
+    } else if (task?.result?.status === 'error') await store.release(hold.owner, hold.id);
+  }
+}
