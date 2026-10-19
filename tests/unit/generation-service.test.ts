@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
 }));
 vi.mock('../../generation/client.js', async () => ({ ...(await vi.importActual<any>('../../generation/client.js')), client: { releaseTask: mocks.releaseTask, queryResult: mocks.queryResult } }));
 vi.mock('../../databases/songs.js', () => ({ createSong: mocks.createSong, finalizeSong: mocks.finalizeSong, getSongById: mocks.getSongById, countUntitledSongsByCreator: mocks.countUntitledSongsByCreator }));
+vi.mock('../../databases/albums.js', () => ({ addSongToAlbum: vi.fn() }));
 vi.mock('../../voice/service.js', () => ({ resolveVoice: mocks.resolveVoice }));
 vi.mock('../../storage/r2.js', () => ({ persistAudioToR2: mocks.persistAudioToR2 }));
 import { Service, generationService, service } from '../../generation/service.js';
@@ -34,7 +35,7 @@ afterEach(() => vi.restoreAllMocks());
 describe('generation Service: model, lyrics and initial song', () => {
   it('exports stable service aliases', () => expect(generationService).toBe(service));
   it.each([
-    [undefined, 'acestep-v15-xl-turbo', 8, 1], ['turbo', 'acestep-v15-xl-turbo', 8, 1], ['sft', 'acestep-v15-xl-sft', 50, 5.5],
+    [undefined, 'acestep-v15-xl-turbo', 8, 1], ['turbo', 'acestep-v15-xl-turbo', 8, 1], ['sft', 'acestep-v15-xl-sft', 50, 7],
   ])('routes %s generation with its model, step count and guidance', async (modelVariant, model, inference_steps, guidance_scale) => {
     contexts.delete('task-1');
     const result = await api.initiateGeneration({ ...base, modelVariant: modelVariant as any, bpm: 120, keyScale: 'D minor', audioDuration: 80, vocalLanguage: 'it', tags: ['DANCE'] });

@@ -4,12 +4,17 @@ import { resolve } from 'path';
 dotenv.config({ path: resolve(process.cwd(), '.env') });
 
 const ACESTEP_API_URL = process.env.ACESTEP_API_URL || '';
+const ACESTEP_TURBO_API_URL = process.env.ACESTEP_TURBO_API_URL || '';
+const ACESTEP_SFT_API_URL = process.env.ACESTEP_SFT_API_URL || '';
+const ACESTEP_BASE_API_URL = process.env.ACESTEP_BASE_API_URL || '';
 const ACESTEP_API_KEY = process.env.ACESTEP_API_KEY || '';
 
 export interface Release {
   model?: 'acestep-v15-turbo' | 'acestep-v15-xl-turbo' | 'acestep-v15-xl-sft' | 'acestep-v15-xl-base' | string;
   task?: 'text2music' | 'repaint' | 'lego' | 'complete' | 'cover' | 'extract';
   task_type?: 'text2music' | 'repaint' | 'lego' | 'complete' | 'cover' | 'extract';
+  instruction?: string;
+  thinking?: boolean;
   prompt?: string;
   lyrics?: string;
   instrumental?: boolean;
@@ -149,20 +154,35 @@ function timeout(value: unknown, fallback: number): number {
 
 export class Client {
   private baseUrl: string;
+  private turboUrl: string;
+  private sftUrl: string;
+  private baseModelUrl: string;
   private apiKey: string;
   private timeoutMs: number;
   private separationTimeoutMs: number;
 
-  constructor(baseUrl = ACESTEP_API_URL, apiKey = ACESTEP_API_KEY, options: { timeoutMs?: number; separationTimeoutMs?: number } = {}) {
+  constructor(baseUrl = ACESTEP_API_URL, apiKey = ACESTEP_API_KEY, options: { timeoutMs?: number; separationTimeoutMs?: number; turboUrl?: string; sftUrl?: string; baseModelUrl?: string } = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
+    const customBaseProvided = baseUrl !== ACESTEP_API_URL;
+    this.turboUrl = (options.turboUrl ?? (customBaseProvided ? '' : ACESTEP_TURBO_API_URL)).replace(/\/$/, '') || this.baseUrl;
+    this.sftUrl = (options.sftUrl ?? (customBaseProvided ? '' : ACESTEP_SFT_API_URL)).replace(/\/$/, '') || this.baseUrl;
+    this.baseModelUrl = (options.baseModelUrl ?? (customBaseProvided ? '' : ACESTEP_BASE_API_URL)).replace(/\/$/, '') || this.baseUrl;
     this.apiKey = apiKey;
     this.timeoutMs = timeout(options.timeoutMs ?? process.env.ACESTEP_TIMEOUT_MS, 30_000);
     this.separationTimeoutMs = timeout(options.separationTimeoutMs ?? process.env.ACESTEP_SEPARATION_TIMEOUT_MS, 600_000);
   }
 
-  private async request(path: string, body?: unknown, timeoutMs = this.timeoutMs, idempotencyKey?: string): Promise<any> {
+  public endpointForModel(model?: string): string {
+    if (!model) return this.baseUrl;
+    if (model.endsWith('-turbo')) return this.turboUrl;
+    if (model.endsWith('-sft')) return this.sftUrl;
+    if (model.endsWith('-base')) return this.baseModelUrl;
+    return this.baseUrl;
+  }
+
+  private async request(path: string, body?: unknown, timeoutMs = this.timeoutMs, idempotencyKey?: string, targetBaseUrl = this.baseUrl): Promise<any> {
     try {
-      const res = await fetch(`${this.baseUrl}${path}`, {
+      const res = await fetch(`${targetBaseUrl}${path}`, {
         ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }),
         headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json', ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}) },
         signal: AbortSignal.timeout(timeoutMs),
@@ -238,7 +258,7 @@ export class Client {
     const body = { ...payload, task: taskType, task_type: taskType };
     if (body.src_audio_path) body.src_audio_path = cleanAudioPath(body.src_audio_path);
     if (body.reference_audio_path) body.reference_audio_path = cleanAudioPath(body.reference_audio_path);
-    const json = await this.request('/release_task', body, this.timeoutMs, options.idempotencyKey);
+    const json = await this.request('/release_task', body, this.timeoutMs, options.idempotencyKey, this.endpointForModel(body.model));
     const data = this.unwrap(json);
     const id = data.task_id ?? data.id;
     if (typeof id !== 'string' || !id.trim()) throw transportError('AceStep release response is missing a task identifier');

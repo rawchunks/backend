@@ -134,7 +134,7 @@ export const generationRouter: FastifyPluginAsync = async (fastify) => {
 
       if (!response.ok) {
         const errorText = await response.text();
-        request.log.error({ status: response.status, errorText }, 'Gemini Nano Banana cover generation failed');
+        request.log.error({ status: response.status, errorText }, 'Cover generation failed');
         return reply.status(502).send({ error: 'Failed to generate cover image' });
       }
 
