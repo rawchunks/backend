@@ -282,6 +282,7 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
     try {
       const { snapshot, ...p } = commitSchema.parse(request.body);
       const res = await service.createCommitSnapshot({ ...p, timelineSnapshot: p.timelineSnapshot ?? snapshot });
+      await deleteWipState(p.songId).catch(() => {});
       return reply.status(201).send(res);
     } catch (err: any) {
       request.log.error(err);
@@ -290,6 +291,57 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
   };
   fastify.post('/commits', handleCommit);
   fastify.post('/commit', handleCommit);
+
+  const wipPayloadSchema = z.object({
+    synthLanes: z.array(z.any()).optional(),
+    synthTracks: z.array(z.any()).optional(),
+    trackEdits: z.record(z.string(), z.any()).optional(),
+    dirtyFlags: z.object({
+      lanes: z.boolean().optional(),
+      mixer: z.boolean().optional(),
+      fx: z.boolean().optional(),
+      sculpt: z.boolean().optional(),
+    }).optional(),
+    originals: z.array(z.object({ start: z.number().finite(), end: z.number().finite() })).optional(),
+    bpm: z.number().finite().min(30).max(300).optional(),
+    sectionGain: z.number().finite().optional(),
+    sectionLow: z.number().finite().optional(),
+    sectionMid: z.number().finite().optional(),
+    sectionHigh: z.number().finite().optional(),
+  });
+
+  fastify.get('/wip/:songId', async (request, reply) => {
+    try {
+      const { songId } = z.object({ songId: z.string().min(1) }).parse(request.params);
+      const wip = await getWipState(songId);
+      return reply.send({ wip, ttlSeconds: WIP_TTL_SECONDS });
+    } catch (err: any) {
+      return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({ error: err.message || 'Failed to load WIP state' });
+    }
+  });
+
+  fastify.put('/wip/:songId', async (request, reply) => {
+    try {
+      const { songId } = z.object({ songId: z.string().min(1) }).parse(request.params);
+      const rawBody = (request.body ?? {}) as Record<string, any>;
+      const candidate = rawBody.wip && typeof rawBody.wip === 'object' ? rawBody.wip : rawBody;
+      const payload = wipPayloadSchema.parse(candidate);
+      const wip = await setWipState(songId, payload);
+      return reply.send({ success: true, wip, ttlSeconds: WIP_TTL_SECONDS });
+    } catch (err: any) {
+      return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({ error: err.message || 'Failed to save WIP state' });
+    }
+  });
+
+  fastify.delete('/wip/:songId', async (request, reply) => {
+    try {
+      const { songId } = z.object({ songId: z.string().min(1) }).parse(request.params);
+      const cleared = await deleteWipState(songId);
+      return reply.send({ success: true, cleared });
+    } catch (err: any) {
+      return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({ error: err.message || 'Failed to clear WIP state' });
+    }
+  });
 
   fastify.get('/peaks', async (request, reply) => {
     try {
@@ -321,6 +373,24 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
       });
     }
   });
+
+  const handleReset = async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const params = (request.params ?? {}) as Record<string, string>;
+      const body = (request.body ?? {}) as Record<string, unknown>;
+      const { songId } = z.object({ songId: z.string().min(1) }).parse({
+        songId: params.songId ?? body.songId,
+      });
+      await deleteWipState(songId).catch(() => {});
+      const history = await service.getTimelineHistory(songId);
+      return reply.send({ success: true, songId, ...history });
+    } catch (err: any) {
+      return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({ error: err.message || 'Failed to reset song edits' });
+    }
+  };
+
+  fastify.post('/reset', handleReset);
+  fastify.post('/reset/:songId', handleReset);
 
   fastify.post('/extend', async (request, reply) => {
     try {

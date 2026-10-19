@@ -155,6 +155,7 @@ async function main() {
   app.post('/extend', forward('/api/editing/extend'));
   app.post('/remix', forward('/api/editing/remix'));
   app.post('/separate', forward('/api/editing/separate'));
+  app.post('/reset', forward('/api/editing/reset'));
   app.post('/voice', forward('/voices'));
   app.put('/user', forward('/api/user'));
   app.patch('/user/profile', forward('/api/user/profile'));
