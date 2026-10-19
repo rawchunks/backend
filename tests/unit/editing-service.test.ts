@@ -47,8 +47,8 @@ describe('editing Service: dispatch and model routing', () => {
     expect(result).toEqual({ taskId: 'task-1', status: 'pending', songId: 'song-1', stemId: 'stem-1', task: 'cover' });
   });
   it.each([
-    [{}, 'acestep-v15-xl-base', 50, 5], [{ modelQuality: 'base' }, 'acestep-v15-xl-base', 50, 5],
-    [{ modelQuality: 'sft' }, 'acestep-v15-xl-sft', 50, 5], [{ modelVariant: 'sft' }, 'acestep-v15-xl-sft', 50, 5],
+    [{}, 'acestep-v15-xl-base', 50, 7], [{ modelQuality: 'base' }, 'acestep-v15-xl-base', 50, 7],
+    [{ modelQuality: 'sft' }, 'acestep-v15-xl-sft', 50, 7], [{ modelVariant: 'sft' }, 'acestep-v15-xl-sft', 50, 7],
     [{ modelQuality: 'turbo' }, 'acestep-v15-xl-turbo', 8, 1], [{ modelVariant: 'turbo' }, 'acestep-v15-xl-turbo', 8, 1],
   ])('routes model selection %j to %s', async (selection, model, inference_steps, guidance_scale) => {
     contexts.delete('task-1');
@@ -94,7 +94,7 @@ describe('editing Service: dispatch and model routing', () => {
     m.listTakesBySong.mockResolvedValue([{ id: 'merged', url: parent.url, stem_id: null, is_active: true, provenance: { sourceTakeId: 'original', parameters: {} } }]);
     m.listCommitsBySong.mockResolvedValue([{ timeline_snapshot: { takes: [{ id: 'original', lyrics: '[Verse]\n[whispered]\nHello', provenance: { parameters: { submitted: { bpm: 100, keyScale: 'C major', vocalLanguage: 'en' } } } }] } }]);
     await api.dispatchEditTask({ ...base, task: 'extend', audioDuration: 75, seed: 7301 });
-    expect(m.releaseTask.mock.calls[0][0]).toMatchObject({ lyrics: '[Verse]\n[whispered]\nHello', bpm: 100, key_scale: 'C major', vocal_language: 'en', seed: 7301, use_random_seed: false, use_format: false, repaint_mode: 'balanced', repaint_strength: 1, shift: 1 });
+    expect(m.releaseTask.mock.calls[0][0]).toMatchObject({ lyrics: '[Verse]\n[whispered]\nHello', bpm: 100, key_scale: 'C major', vocal_language: 'en', seed: 7301, use_random_seed: false, use_format: false, repaint_mode: 'balanced', repaint_strength: 0.5, shift: 3 });
     expect(contexts.get('task-1').provenance.parameters).toMatchObject({ submitted: { seed: 7301 }, resolved: { bpm: 100 } });
   });
   it('keeps explicit extension choices including empty lyrics instead of inherited values', async () => {

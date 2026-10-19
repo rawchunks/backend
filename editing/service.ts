@@ -288,7 +288,7 @@ export class Service {
       : '';
     const resolvedLyrics = params.task === 'lego'
       ? (isVocalLayer ? (params.lyrics?.trim() || inheritedCleanLyrics || '') : '[Instrumental]')
-      : (params.lyrics?.trim() ? params.lyrics.trim() : (inherited.lyrics ?? ''));
+      : (params.lyrics !== undefined ? params.lyrics.trim() : (inherited.lyrics ?? ''));
     const resolvedVocalLanguage = (params.vocalLanguage || inherited.vocalLanguage || 'en').toLowerCase();
     const userPrompt = params.prompt?.trim() || '';
     const effectivePrompt = params.task === 'lego'
@@ -319,15 +319,11 @@ export class Service {
     if ((params.task === 'lego' || params.task === 'complete') && quality !== 'base') throw failure(`${params.task} requires the XL Base model`);
     const model = `acestep-v15-xl-${quality}`;
     const workerTask = params.task === 'extend' ? 'repaint' : params.task;
-    const isVocalEditWithoutLyrics = (
-      (params.task === 'lego' && isVocalLayer && !params.lyrics?.trim()) ||
-      ((params.task === 'repaint' || params.task === 'extend' || params.task === 'cover') && !params.lyrics?.trim() && targetStem?.name.toLowerCase() === 'vocals')
-    );
     const payload: Release = {
       model, task: workerTask, task_type: workerTask, src_audio_path: srcAudio,
       prompt: params.prompt ?? '', lyrics: params.lyrics ?? '',
-      sample_mode: isVocalEditWithoutLyrics ? true : undefined,
-      sample_query: isVocalEditWithoutLyrics ? (params.prompt || combinedGlobalCaption || 'pop vocals') : undefined,
+      thinking: false,
+      sample_mode: false,
       inference_steps: quality === 'turbo' ? 8 : 50,
       guidance_scale: quality === 'turbo' ? 1.0 : 7.0,
       shift: refinementShift(model),
@@ -337,9 +333,6 @@ export class Service {
       bpm: params.bpm, key_scale: params.keyScale, time_signature: params.timeSignature, vocal_language: params.vocalLanguage,
     };
     let sourceDuration = currentTake?.provenance?.outputDuration ?? song.duration ?? null;
-    if (isVocalEditWithoutLyrics && sourceDuration && !payload.audio_duration) {
-      payload.audio_duration = sourceDuration;
-    }
     if (params.task === 'extend' || params.task === 'repaint') {
       const source = await decodeWave((await readAudio(srcAudio)).buffer);
       sourceDuration = readWave(source).duration;
