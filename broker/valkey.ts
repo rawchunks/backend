@@ -337,3 +337,36 @@ export async function closeSubscriptions(): Promise<void> {
   await subscriber?.quit(); subscriber = undefined;
   await closeWips();
 }
+
+function peakCacheKey(url: string): string {
+  return `rawchunks:peaks:v1:${url}`;
+}
+
+export async function getCachedPeaks(
+  url: string
+): Promise<{ mins: number[]; maxs: number[]; duration: number } | null> {
+  if (!url) return null;
+  try {
+    const raw = await valkeyWips.get(peakCacheKey(url));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && Array.isArray(parsed.mins) && Array.isArray(parsed.maxs)) {
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function setCachedPeaks(
+  url: string,
+  peaks: { mins: number[]; maxs: number[]; duration: number }
+): Promise<void> {
+  if (!url || !peaks.mins.length) return;
+  try {
+    await valkeyWips.set(peakCacheKey(url), JSON.stringify(peaks), 'EX', WIP_TTL_SECONDS);
+  } catch {
+    // Non-fatal cache write failure
+  }
+}

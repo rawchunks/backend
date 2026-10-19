@@ -228,3 +228,41 @@ export async function mixWaves(buffers: Buffer[]): Promise<Buffer> {
   return encodeWave(base, samples);
 }
 
+export function extractWavBipolarPeaks(
+  data: Buffer,
+  numBins = 512
+): { mins: number[]; maxs: number[]; duration: number } {
+  const wav = readWave(data);
+  const count = Math.max(1, Math.min(2048, Math.floor(numBins)));
+  const mins = new Array<number>(count).fill(0);
+  const maxs = new Array<number>(count).fill(0);
+  const frames = wav.frames;
+  const channels = wav.channels;
+
+  if (frames > 0 && channels > 0) {
+    for (let bin = 0; bin < count; bin++) {
+      const start = Math.floor((bin * frames) / count);
+      const end = Math.max(start + 1, Math.min(frames, Math.floor(((bin + 1) * frames) / count)));
+      const span = end - start;
+      const step = Math.max(1, Math.floor(span / 64));
+      let minVal = 0;
+      let maxVal = 0;
+      for (let frame = start; frame < end; frame += step) {
+        for (let ch = 0; ch < channels; ch++) {
+          const sample = readSampleValue(wav, wav.samples, frame, ch);
+          if (sample < minVal) minVal = sample;
+          if (sample > maxVal) maxVal = sample;
+        }
+      }
+      mins[bin] = Number(minVal.toFixed(4));
+      maxs[bin] = Number(maxVal.toFixed(4));
+    }
+  }
+
+  return {
+    mins,
+    maxs,
+    duration: Number(wav.duration.toFixed(4)),
+  };
+}
+

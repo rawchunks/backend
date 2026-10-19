@@ -4,8 +4,9 @@ import { service } from './service.js';
 import { readSong, readTake, readUser, checkUser } from '../databases/users.js';
 import { songSql } from '../databases/client.js';
 import { uploadToR2 } from '../storage/r2.js';
-import { readWave } from './audio.js';
+import { readWave, extractWavBipolarPeaks } from './audio.js';
 import { randomUUID } from 'node:crypto';
+import { getWipState, setWipState, deleteWipState, getCachedPeaks, setCachedPeaks, WIP_TTL_SECONDS } from '../broker/valkey.js';
 
 const baseSchema = {
   songId: z.string().min(1),
@@ -153,6 +154,14 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
 
   fastify.addHook('preHandler', async (request, reply) => {
     try {
+      const isWipOrPeaksRoute =
+        request.routeOptions?.url?.startsWith('/wip/') ||
+        request.url.includes('/editing/wip/') ||
+        request.routeOptions?.url === '/peaks' ||
+        request.url.includes('/editing/peaks');
+      if (isWipOrPeaksRoute) {
+        return;
+      }
       const params = request.params as Record<string, string>;
       const body = request.body as Record<string, unknown> | null;
       const query = request.query as Record<string, unknown>;
@@ -281,6 +290,37 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
   };
   fastify.post('/commits', handleCommit);
   fastify.post('/commit', handleCommit);
+
+  fastify.get('/peaks', async (request, reply) => {
+    try {
+      const { url, bins } = z
+        .object({
+          url: z.string().url(),
+          bins: z.coerce.number().int().min(16).max(2048).optional(),
+        })
+        .parse(request.query);
+      const targetBins = bins ?? 512;
+      const cacheKey = `${url}|${targetBins}`;
+      const cached = await getCachedPeaks(cacheKey);
+      if (cached) {
+        reply.header('Cache-Control', 'public, max-age=604800, immutable');
+        return reply.send(cached);
+      }
+      const resp = await fetch(url);
+      if (!resp.ok) {
+        return reply.status(resp.status).send({ error: `Failed to fetch audio (${resp.status})` });
+      }
+      const buf = Buffer.from(await resp.arrayBuffer());
+      const peaks = extractWavBipolarPeaks(buf, targetBins);
+      void setCachedPeaks(cacheKey, peaks);
+      reply.header('Cache-Control', 'public, max-age=604800, immutable');
+      return reply.send(peaks);
+    } catch (err: any) {
+      return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({
+        error: err.message || 'Failed to compute waveform peaks',
+      });
+    }
+  });
 
   fastify.post('/extend', async (request, reply) => {
     try {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { composeEdit, spliceWave, readWave, sliceWave, padWave } from '../../editing/audio.js';
+import { composeEdit, spliceWave, readWave, sliceWave, padWave, extractWavBipolarPeaks } from '../../editing/audio.js';
 
 function wave(samples: number[], rate = 8, channels = 1): Buffer {
   const data = Buffer.alloc(44 + samples.length * 2);
@@ -65,5 +65,14 @@ describe('deterministic sample composition for reviewable edits', () => {
   });
   it('rejects truncated RIFF input', () => {
     expect(() => readWave(wave([1, 2, 3]).subarray(0, 47))).toThrow();
+  });
+  it('extracts normalized bipolar peaks and duration directly from WAV bytes', () => {
+    const source = wave([16384, -8192, 0, 32767], 4, 1);
+    const peaks = extractWavBipolarPeaks(source, 2);
+    expect(peaks.duration).toBe(1);
+    expect(peaks.maxs[0]).toBeCloseTo(0.5, 3);
+    expect(peaks.mins[0]).toBeCloseTo(-0.25, 3);
+    expect(peaks.maxs[1]).toBeCloseTo(32767 / 32768, 3);
+    expect(peaks.mins[1]).toBe(0);
   });
 });
