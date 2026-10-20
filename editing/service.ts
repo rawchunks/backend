@@ -739,12 +739,24 @@ export class Service {
   }
 
   async getTimelineHistory(songId: string) {
+    const key = `history:${songId}`;
+    const [fastStems, fastTakes, fastCommits, fastContext] = await Promise.all([
+      listStemsBySong(songId),
+      listTakesBySong(songId),
+      listCommitsBySong(songId),
+      getTaskContext<any>(key),
+    ]);
+    if (fastContext?.done || (fastStems.length && !fastContext)) {
+      return { stems: fastStems, takes: fastTakes, commits: fastCommits };
+    }
+
     return withJobLock(`song:${songId}`, async (assertLease) => {
-      const stems = await listStemsBySong(songId);
-      const takes = await listTakesBySong(songId);
-      const commits = await listCommitsBySong(songId);
-      const key = `history:${songId}`;
-      const context = await getTaskContext<any>(key);
+      const [stems, takes, commits, context] = await Promise.all([
+        listStemsBySong(songId),
+        listTakesBySong(songId),
+        listCommitsBySong(songId),
+        getTaskContext<any>(key),
+      ]);
       if (context?.done || (stems.length && !context)) return { stems, takes, commits };
       const song = await getSongById(songId);
       if (!song?.url) return { stems, takes, commits };
