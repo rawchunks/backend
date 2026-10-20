@@ -374,7 +374,17 @@ export class Service {
       if (params.trackClasses) payload.track_classes = params.trackClasses;
       if (params.audioDuration !== undefined) payload.audio_duration = params.audioDuration;
       if (params.repaintingStart !== undefined && params.repaintingEnd !== undefined && params.repaintingEnd > params.repaintingStart) {
-        Object.assign(payload, { chunk_mask_mode: 'explicit', repainting_start: params.repaintingStart, repainting_end: params.repaintingEnd });
+        Object.assign(payload, {
+          chunk_mask_mode: 'explicit',
+          repainting_start: params.repaintingStart,
+          repainting_end: params.repaintingEnd,
+          instruction: `Generate a segment of the ${normalizedTrack.toUpperCase()} track based on the audio context:`,
+        });
+      } else {
+        Object.assign(payload, {
+          chunk_mask_mode: 'auto',
+          instruction: `Generate the ${normalizedTrack.toUpperCase()} track based on the audio context:`,
+        });
       }
     }
     if (params.task === 'extract' && params.trackName) {
@@ -383,6 +393,9 @@ export class Service {
     }
     if (params.globalCaption) payload.global_caption = params.globalCaption;
     if (params.task === 'complete') {
+      if (params.audioDuration !== undefined && sourceDuration && params.audioDuration < sourceDuration) {
+        throw failure('Completion duration cannot shorten the source duration');
+      }
       if (params.trackClasses) payload.track_classes = params.trackClasses;
       if (params.audioDuration !== undefined) payload.audio_duration = params.audioDuration;
     }
