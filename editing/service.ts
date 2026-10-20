@@ -578,9 +578,9 @@ export class Service {
         is_muted: false,
         is_solo: existingLayerStem?.is_solo ?? false,
       } : undefined;
-      const masterStem = stems.find(stem => stem.name.toLowerCase() === 'master');
+      const masterStem = stems.find(stem => stem.name.toLowerCase() === 'master' || stem.id.startsWith('stem-master') || stem.id.startsWith('stm-master'));
       const targetStemId = layer?.id ?? (isFullSongCover ? (masterStem?.id ?? take.stem_id ?? null) : take.stem_id);
-      const master = !layer && (isFullSongCover || take.provenance?.target === 'master' || !targetStemId || stems.some(stem => stem.id === targetStemId && stem.name.toLowerCase() === 'master'));
+      const master = !layer && (isFullSongCover || take.provenance?.target === 'master' || !targetStemId || targetStemId.startsWith('stem-master') || targetStemId.startsWith('stm-master') || stems.some(stem => stem.id === targetStemId && stem.name.toLowerCase() === 'master'));
       if (layer) {
         take = {
           ...take,
@@ -676,7 +676,12 @@ export class Service {
       else consume.push(candidate!.id);
     }
     const [source, rendered] = await Promise.all([readAudio(song.url), readAudio(merge.srcAudioUrl)]);
-    const audio = await composeEdit(source.buffer, rendered.buffer, merge.region, start, true);
+    const renderedWave = readWave(await decodeWave(rendered.buffer));
+    const offset = start > 0.05 && renderedWave.duration < end - 0.05 ? 0 : start;
+    const spliceRegion = renderedWave.duration > end - offset + 0.05 && candidates.some(c => c?.task === 'extend')
+      ? { start, end: start + renderedWave.duration - offset }
+      : merge.region;
+    const audio = await composeEdit(source.buffer, rendered.buffer, spliceRegion, offset, true);
     const url = await guarded(assertLease, () => uploadToR2('versions', `edits/${id}.wav`, audio, 'audio/wav'));
     const master = stems.find(stem => stem.name.toLowerCase() === 'master' || stem.id.startsWith('stem-master') || stem.id.startsWith('stm-master'));
     const provenance: TakeProvenance = { taskId: id, sourceUrl: song.url, sourceTakeId: takes.find(take => take.is_active && take.provenance?.target === 'master')?.id ?? null, sourceDuration: readWave(await decodeWave(source.buffer)).duration, target: 'master', targetStemId: master?.id ?? null, region: merge.region, outputDuration: readWave(audio).duration, audioOffset: start, candidates: merge.takeIds, original: merge.original, parameters: { commitId: merge.commitId, placements } };

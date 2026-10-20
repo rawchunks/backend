@@ -233,6 +233,36 @@ describe('editing Service: finalize, activation, mixer and history', () => {
     expect(await api.updateTrackMixer('stem-1', { volume: 0, pan: -1, is_muted: true })).toEqual({ id: 'stem-1', volume: 0 });
     expect(m.updateStemMixer).toHaveBeenCalledWith('stem-1', { volume: 0, pan: -1, is_muted: true });
   });
+  it('consumes a merged master rework candidate across floating-point region bounds and non-master separation commits', async () => {
+    const start = 3.1, end = 8.3, duration = end - start;
+    m.listStemsBySong.mockResolvedValue([{ id: 'stm-master-song-1', name: 'Master Track', url: 'original.wav' }]);
+    m.listTakesBySong.mockResolvedValue([
+      { id: 'rework-1', song_id: 'song-1', stem_id: 'stm-master-song-1', task: 'repaint', model: 'acestep-v15-xl-base', is_active: false, url: 'rework.wav', provenance: { target: 'master', region: { start, end }, audioOffset: start, outputDuration: 60 } },
+    ]);
+    m.listCommitsBySong.mockResolvedValue([
+      { id: 'commit-sep-1', timeline_snapshot: { stemsCount: 4 } },
+      { id: 'commit-master-1', timeline_snapshot: { action: 'init', activeTakeId: 'take-1' } },
+    ]);
+    const res = await api.switchActiveTake('song-1', null, 'rework-1', '0xABCDEF0123', 'merge', {
+      takeIds: ['rework-1'],
+      placements: [{ takeId: 'rework-1', shift: 0 }],
+      region: { start, end: start + duration },
+      original: false,
+      commitId: 'commit-master-1',
+      srcAudioUrl: 'rendered.wav',
+    });
+    expect(res).toMatchObject({ success: true, versionState: 'merged' });
+    expect(m.activateTake).toHaveBeenCalledWith(
+      'song-1',
+      'stm-master-song-1',
+      expect.stringMatching(/^take-merge-/),
+      expect.objectContaining({
+        consume: ['rework-1'],
+        remaining: [],
+        master: true,
+      }),
+    );
+  });
   it('returns existing history without initializing a master track', async () => {
     m.listStemsBySong.mockResolvedValue([{ id: 's' }]); m.listTakesBySong.mockResolvedValue([{ id: 't' }]); m.listCommitsBySong.mockResolvedValue([{ id: 'c' }]);
     expect(await api.getTimelineHistory('song-1')).toEqual({ stems: [{ id: 's' }], takes: [{ id: 't' }], commits: [{ id: 'c' }] });
