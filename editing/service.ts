@@ -197,7 +197,9 @@ export class Service {
     if (!taskSchema.safeParse(params.task).success) throw failure(`Invalid editing task '${params.task}'`);
     editSchema.parse(params);
     if (params.modelQuality && params.modelVariant && params.modelQuality !== params.modelVariant) throw failure('Conflicting modelQuality and modelVariant');
-    if (params.task === 'extract') return this.separateStems({ songId: params.songId, stemType: (params as any).stemType || 'all', srcAudioUrl: params.srcAudioUrl, userAddress: params.userAddress });
+    if (params.task === 'extract' && !params.trackName?.trim()) {
+      return this.separateStems({ songId: params.songId, stemType: (params as any).stemType || 'all', srcAudioUrl: params.srcAudioUrl, userAddress: params.userAddress });
+    }
     if (params.task === 'repaint' && (params.repaintingStart === undefined || params.repaintingEnd === undefined || params.repaintingEnd <= params.repaintingStart)) throw failure('Repainting start and end bounds must define a positive interval');
     if (params.task === 'extend' && params.audioDuration === undefined) throw failure('Target audio duration is required for extension');
     if (params.task === 'lego' && !params.trackName?.trim()) throw failure('Select the instrument track to generate');
@@ -208,7 +210,7 @@ export class Service {
     const master = stems.find(stem => stem.name.toLowerCase() === 'master');
     const targetStem = params.stemId ? stems.find(stem => stem.id === params.stemId) : master;
     if (params.stemId && !targetStem) throw failure('Stem does not belong to the song', 409);
-    const targetStemId = params.task === 'lego' ? null : targetStem?.id ?? null;
+    const targetStemId = (params.task === 'lego' || params.task === 'extract') ? null : targetStem?.id ?? null;
     const takes = await listTakesBySong(params.songId);
     const commits = await listCommitsBySong(params.songId);
     const currentTake = takes.find(take => take.is_active && take.stem_id === (targetStem?.id ?? null));
@@ -279,7 +281,7 @@ export class Service {
     const normalizedTrack = VALID_TRACK_NAMES.has(rawTrack)
       ? rawTrack
       : (TRACK_ALIASES[rawTrack] || (rawTrack.includes('backing') ? 'backing_vocals' : rawTrack.includes('vocal') ? 'vocals' : 'guitar'));
-    if (params.task === 'lego') {
+    if (params.task === 'lego' || params.task === 'extract') {
       params = { ...params, trackName: normalizedTrack };
     }
     const isVocalLayer = normalizedTrack === 'vocals' || normalizedTrack === 'backing_vocals';
@@ -316,7 +318,7 @@ export class Service {
       };
     }
     const quality = params.modelQuality ?? params.modelVariant ?? 'base';
-    if ((params.task === 'lego' || params.task === 'complete') && quality !== 'base') throw failure(`${params.task} requires the XL Base model`);
+    if ((params.task === 'lego' || params.task === 'complete' || params.task === 'extract') && quality !== 'base') throw failure(`${params.task} requires the XL Base model`);
     const model = `acestep-v15-xl-${quality}`;
     const workerTask = params.task === 'extend' ? 'repaint' : params.task;
     const payload: Release = {
@@ -374,6 +376,10 @@ export class Service {
       if (params.repaintingStart !== undefined && params.repaintingEnd !== undefined && params.repaintingEnd > params.repaintingStart) {
         Object.assign(payload, { chunk_mask_mode: 'explicit', repainting_start: params.repaintingStart, repainting_end: params.repaintingEnd });
       }
+    }
+    if (params.task === 'extract' && params.trackName) {
+      payload.track_name = params.trackName;
+      payload.instruction = `Extract the ${normalizedTrack.toUpperCase()} track from the audio:`;
     }
     if (params.globalCaption) payload.global_caption = params.globalCaption;
     if (params.task === 'complete') {
@@ -434,6 +440,11 @@ export class Service {
         }
         if (ctx.params.task === 'extract' && task.stems && Object.keys(task.stems).length) {
           ctx.stems = task.stems;
+          await save();
+          return this.finalizeSeparation(params.taskId, ctx, id, assertLease);
+        }
+        if (ctx.params.task === 'extract' && ctx.params.trackName && Array.isArray(task.audio_urls) && typeof task.audio_urls[0] === 'string' && task.audio_urls[0]) {
+          ctx.stems = { [ctx.params.trackName]: task.audio_urls[0] };
           await save();
           return this.finalizeSeparation(params.taskId, ctx, id, assertLease);
         }
