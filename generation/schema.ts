@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 export const generateSchema = z.object({
-  creatorAddress: z.string().min(10), prompt: z.string().refine((value) => value.trim().length >= 3),
+  creatorAddress: z.string().min(10), prompt: z.string().optional().default(''),
   licenses: z.number().int().nonnegative().optional(), stream_price: z.number().finite().nonnegative().optional(), license_price: z.number().finite().nonnegative().optional(),
   title: z.string().optional(), image: z.string().optional(), albumId: z.string().optional(), lyrics: z.string().optional(), instrumental: z.boolean().optional(),
   modelVariant: z.enum(['turbo', 'sft']).default('turbo'), vocalLanguage: z.string().optional(),
@@ -10,6 +10,13 @@ export const generateSchema = z.object({
   voiceReferenceUrl: z.string().url().optional(), voiceCoverStrength: z.number().finite().min(0).max(1).optional(), tags: z.array(z.string()).optional(),
   voiceMode: z.enum(['reference', 'trained']).optional(),
 }).superRefine((value, context) => {
+  const hasPrompt = (value.prompt ?? '').trim().length >= 3;
+  const hasLyrics = (value.lyrics ?? '').trim().length >= 3;
+  if (value.instrumental && !hasPrompt) {
+    context.addIssue({ code: 'custom', path: ['prompt'], message: 'Prompt is required for instrumental songs (min 3 chars)' });
+  } else if (!value.instrumental && !hasPrompt && !hasLyrics) {
+    context.addIssue({ code: 'custom', path: ['prompt'], message: 'Either prompt or lyrics is required for non-instrumental songs' });
+  }
   if (value.voiceId && value.voiceReferenceUrl) context.addIssue({ code: 'custom', path: ['voiceReferenceUrl'], message: 'Choose a saved voice or direct reference audio' });
   if (value.voiceId && !value.voiceMode) context.addIssue({ code: 'custom', path: ['voiceMode'], message: 'Choose reference audio or a prepared saved voice' });
   if (value.voiceMode === 'trained' && !value.voiceId) context.addIssue({ code: 'custom', path: ['voiceId'], message: 'A trained voice requires its saved voice ID' });

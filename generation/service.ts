@@ -12,7 +12,7 @@ export interface Generate {
   title?: string;
   image?: string;
   albumId?: string;
-  prompt: string;
+  prompt?: string;
   lyrics?: string;
   instrumental?: boolean;
   vocalLanguage?: string;
@@ -72,11 +72,12 @@ export class Service {
     const sft = params.modelVariant === 'sft';
     const model = sft ? 'acestep-v15-xl-sft' : 'acestep-v15-xl-turbo';
     const steps = sft ? 50 : 8;
+    const promptText = params.prompt?.trim() || '';
     const lyrics = params.instrumental ? '[Instrumental]' : params.lyrics?.trim() ? params.lyrics : '';
     const sampleMode = !params.instrumental && !lyrics;
     const payload: Release = {
-      model, task: 'text2music', task_type: 'text2music', prompt: params.prompt, lyrics,
-      instrumental: !!params.instrumental, sample_mode: sampleMode, sample_query: sampleMode ? params.prompt : undefined,
+      model, task: 'text2music', task_type: 'text2music', prompt: promptText, lyrics,
+      instrumental: !!params.instrumental, sample_mode: sampleMode, sample_query: sampleMode ? promptText : undefined,
       vocal_language: params.vocalLanguage, bpm: params.bpm, key_scale: params.keyScale, seed: params.seed,
       use_format: false, use_cot_caption: false, use_cot_language: false, use_random_seed: params.seed === undefined,
       batch_size: 1, inference_steps: steps, guidance_scale: sft ? 7.0 : 1.0, shift: refinementShift(model), audio_format: 'wav',
@@ -102,7 +103,7 @@ export class Service {
     }
     const songId = `sng-${randomUUID()}`;
     const creator = params.creatorAddress.startsWith('0x') ? params.creatorAddress.toLowerCase() : params.creatorAddress;
-    const ctx: Context = { kind: 'generate', songId, prompt: params.prompt, lyrics, model, creator, submitted: params, voice: voiceProvenance };
+    const ctx: Context = { kind: 'generate', songId, prompt: promptText, lyrics, model, creator, submitted: params, voice: voiceProvenance };
     let songTitle = params.title?.trim();
     if (!songTitle) {
       const untitledCount = await countUntitledSongsByCreator(creator);
