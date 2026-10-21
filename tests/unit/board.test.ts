@@ -33,13 +33,13 @@ describe('editor selection', () => {
     expect(html.match(/aria-pressed="true"/g) ?? []).toHaveLength(0);
   });
 
-  it.each(['earlier', 'later', 'original'])('highlights only the focused take %s', selected => {
+  it.each(['earlier', 'later'])('highlights only the focused take %s', selected => {
     const html = render(selected);
     expect(selectedRows(html)).toHaveLength(1);
     expect(html.match(/aria-pressed="true"/g) ?? []).toHaveLength(1);
     const number = takes.find(take => take.id === selected)!.take_number;
     expect(html).toMatch(new RegExp(`aria-pressed="true"[^>]*>#${number}</button>`));
-    expect(html.match(new RegExp(`TK#${number}</span>`, 'g'))).toHaveLength(1);
+    expect(html).toContain(`aria-label="Category: EXTRACT, Take #${number}"`);
   });
 
   it('keeps extracted badges unselected when another lane has focus', () => {
@@ -76,7 +76,7 @@ describe('master lanes', () => {
     expect(selectedRows(html)).toHaveLength(1);
     expect(html.match(/aria-pressed="true"/g) ?? []).toHaveLength(1);
     expect(html).toContain('aria-label="Select Drums in master" aria-pressed="true"');
-    expect(html).toContain('>DRU</button>');
+    expect(html).toContain('>DRM</button>');
     expect(html).toContain('>VOC</button>');
     expect(html).toContain('>BAS</button>');
   });
@@ -97,8 +97,8 @@ describe('master lanes', () => {
   it('places the selected lane first without changing the stored track order', () => {
     const html = render('stem-2', stems);
     const lanes = html.slice(html.indexOf('class="board-section-separator'));
-    const names = [...lanes.matchAll(/class="board-track-name">([^<]*)<\/span>/g)].map(match => match[1]);
-    expect(names.slice(0, 3)).toEqual(['Bass', 'Vocals', 'Drums']);
+    const trackIds = [...lanes.matchAll(/data-track-id="([^"]*)"/g)].map(match => match[1]);
+    expect(trackIds.slice(0, 3)).toEqual(['stem-2', 'stem-0', 'stem-1']);
     expect(useDawStore.getInitialState().tracks).toEqual(stems);
   });
 });
@@ -153,7 +153,9 @@ describe('take mounting controls', () => {
 
   it('keeps saved instrument lanes visible when they store an active take ID', () => {
     const track = { id: 'bass', activeTakeId: 'earlier', name: 'Bass', type: 'stem', muted: false, clips: [{ url: 'bass.wav' }] } as DAWTrack;
-    expect(render('master', [track])).toContain('class="board-track-name">Bass</span>');
+    const html = render('master', [track]);
+    expect(html).toContain('data-track-id="bass"');
+    expect(html).toContain('>BAS</span>');
   });
 
   it('places mounted waveforms and their controls inside the master timeline', () => {

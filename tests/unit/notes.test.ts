@@ -38,7 +38,18 @@ describe('instrument lanes', () => {
     expect(pattern.duration).toBe(4);
   });
 
-  it.each(['pianoroll', 'sequencer'] as const)('renders cleared %s data without invented notes', type => {
+  it.each(['pianoroll', 'sequencer', 'strudel'] as const)('renders cleared %s data without invented notes', type => {
     expect(sequence({ type }, 120)).toMatchObject({ rows: 1, notes: [] });
   });
+
+  it('sequences Strudel note().s() chaining, stack(), chords, and DSP modifiers onto the timeline', () => {
+    const pattern = sequence({
+      type: 'strudel',
+      strudelCode: `stack(s("bd*2 sd"), note("c2 [c3,eb3,g3]").s("sawtooth").gain(0.6).lpf(1200))`,
+    }, 120);
+    expect(pattern.duration).toBe(2);
+    expect(pattern.notes.map(n => n.label)).toEqual(['BD', 'BD', 'SD', 'C2', 'C3', 'EB3', 'G3']);
+    expect(pattern.notes.find(n => n.label === 'C2')?.velocity).toBeCloseTo(0.6);
+  });
 });
+

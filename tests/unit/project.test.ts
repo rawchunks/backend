@@ -196,4 +196,58 @@ describe('candidate placement', () => {
     await useDawStore.getState().moveTake('part', 0);
     expect(useDawStore.getState().tracks.find(track => track.id === 'part')?.clips.map(clip => clip.startTime)).toEqual([5,12]);
   });
+  it('silences ORG when mounting a master rework take with a master stem_id and updates master audio on merge even when stems are empty', async () => {
+    const { sdk } = await import('../../../app/src/lib/sdk.js');
+    vi.spyOn(dawEngine, 'syncOriginals').mockImplementation(() => {});
+    vi.spyOn(dawEngine, 'render').mockResolvedValue(new Blob(['wav'], { type: 'audio/wav' }));
+    const rework = {
+      id: 'rework-1',
+      song_id: 'song',
+      stem_id: 'stm-master-song',
+      take_number: 2,
+      task: 'repaint',
+      url: 'rework.wav',
+      is_active: false,
+      repainting_start: 4,
+      repainting_end: 8,
+      provenance: { target: 'master', region: { start: 4, end: 8 }, audioOffset: 4, outputDuration: 30 },
+    } as Take;
+    useDawStore.getState().initProject('song', 'Session', 30, 'master.wav');
+    useDawStore.getState().setTakes([rework]);
+    await useDawStore.getState().toggleTake('rework-1');
+    expect(useDawStore.getState().originals).toEqual([{ start: 4, end: 8 }]);
+    expect(dawEngine.syncOriginals).toHaveBeenCalled();
+
+    const mergedTake = {
+      id: 'take-merge-1',
+      song_id: 'song',
+      stem_id: 'stm-master-song',
+      take_number: 3,
+      task: 'merge',
+      url: 'merged-master.wav',
+      is_active: true,
+      provenance: { target: 'master', region: { start: 4, end: 8 }, outputDuration: 30 },
+    } as Take;
+    vi.spyOn(sdk, 'fetch').mockImplementation((async (url: string) => {
+      if (url.startsWith('/api/editing/source')) {
+        return { ok: true, json: async () => ({ url: 'uploaded-render.wav' }) } as any;
+      }
+      if (url === '/api/editing/activate') {
+        return { ok: true, json: async () => ({ success: true, activeTakeId: mergedTake.id, take: mergedTake, versionState: 'merged' }) } as any;
+      }
+      if (url.startsWith('/api/editing/history/')) {
+        return { ok: true, json: async () => ({ stems: [], takes: [mergedTake], commits: [{ id: 'commit-merge-1', timeline_snapshot: { action: 'merge', activeTakeId: mergedTake.id, provenance: mergedTake.provenance } }] }) } as any;
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    }) as any);
+
+    await useDawStore.getState().activateTake('rework-1', 'merge');
+    expect(dawEngine.render).toHaveBeenCalledWith(['master', 'rework-1'], 8, true, 4);
+    const after = useDawStore.getState();
+    expect(after.tracks.map(t => t.id)).toEqual(['master']);
+    expect(after.tracks[0].clips[0].url).toBe('merged-master.wav');
+    expect(after.originalMasterUrl).toBe('merged-master.wav');
+    expect(after.originals).toEqual([]);
+    expect(after.takes).toEqual([mergedTake]);
+  });
 });

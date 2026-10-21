@@ -49,4 +49,35 @@ describe('chain registry', () => {
     expect(() => setChainRegistry([], 'eip155:123')).toThrow('default network');
     expect(() => getNetworkRpcUrl('solana:unconfigured')).toThrow('RPC URL not configured');
   });
+
+  it('aggregates CAIP-2 networkIds into isTestnet and isMainnet and respects NETWORK_MODE', async () => {
+    const chains = await import('../../../app/src/lib/chains');
+    expect(chains.TESTNET_NETWORKS).toEqual([
+      'eip155:84532',
+      'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
+      'eip155:42431',
+    ]);
+    expect(chains.MAINNET_NETWORKS).toEqual([
+      'eip155:8453',
+      'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',
+    ]);
+    expect(chains.isTestnet('eip155:84532')).toBe(true);
+    expect(chains.isTestnet('solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1')).toBe(true);
+    expect(chains.isTestnet('eip155:42431')).toBe(true);
+    expect(chains.isTestnet('eip155:8453')).toBe(false);
+    expect(chains.isMainnet('eip155:8453')).toBe(true);
+    expect(chains.isMainnet('solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp')).toBe(true);
+    expect(chains.isMainnet('eip155:84532')).toBe(false);
+
+    vi.stubEnv('NETWORK_MODE', 'mainnet');
+    expect(chains.getNetworkMode()).toBe('mainnet');
+    expect(chains.isMainnet()).toBe(true);
+    expect(chains.isTestnet()).toBe(false);
+
+    vi.stubEnv('NETWORK_MODE', 'testnet');
+    expect(chains.getNetworkMode()).toBe('testnet');
+    expect(chains.isTestnet()).toBe(true);
+    expect(chains.isMainnet()).toBe(false);
+  });
 });
+
