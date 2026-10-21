@@ -593,4 +593,86 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
       return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({ error: err.message });
     }
   });
+
+  fastify.post('/strudel', async (request, reply) => {
+    try {
+      const p = z.object({
+        songId: z.string().optional(),
+        prompt: z.string().refine((v) => v.trim().length > 0, { message: 'Prompt is required' }),
+        currentCode: z.string().optional(),
+        bpm: z.number().finite().min(30).max(300).optional(),
+        keyScale: z.string().optional(),
+        timeSignature: z.string().optional(),
+        stems: z.array(z.string()).optional(),
+        songContext: z.string().max(4000).optional(),
+        musicalContext: z.string().max(4000).optional(),
+        musical_context: z.string().max(4000).optional(),
+      }).parse(request.body);
+
+      const apiKey = process.env.GOOGLE_GENERATIVE_AI_API_KEY;
+      if (!apiKey) {
+        return reply.status(500).send({ error: 'GOOGLE_GENERATIVE_AI_API_KEY is not configured' });
+      }
+
+      const resolvedContext = (p.songContext || p.musicalContext || p.musical_context || '').trim();
+      const systemInstruction = [
+        'You are a world-class algorithmic live-coding musician and Strudel pattern architect inside the Rawchunks DAW.',
+        'Return ONLY valid, executable Strudel pattern code — no markdown fences, no commentary, no prose.',
+        'Supported Strudel syntax in Rawchunks:',
+        '- Drum & percussion mini-notation: s("bd [hh hh] sd [hh cp]") with tokens bd, sd, hh, oh, cp, rim, tom, ht, mt, lt, perc, ride, crash, ~ (rest), [sub-cycles], *n repeats.',
+        '- Melodic & harmonic mini-notation: note("c2 [eb2 g2] bb2 c3").s("sawtooth") or chords note("[c3,eb3,g3] [f3,ab3,c4]").s("triangle"). Supported synth oscillator waveforms: sine, triangle, sawtooth, square.',
+        '- Polyphonic multi-layer patterns: stack(s("bd*2 [~ sd] hh*4, ~ cp"), note("c2 [c2 g2] eb2 [f2 bb1]").s("sawtooth").lpf(900)) or newline-separated expressions.',
+        '- Chainable modifiers: .fast(n), .slow(n), .rev(), .gain(0..1.5), .lpf(hz), .hpf(hz), .pan(-1..1), .room(0..1), .delay(0..1).',
+        `Project context: BPM=${p.bpm ?? 120}, Key=${p.keyScale || 'C minor'}, TimeSignature=${p.timeSignature || '4/4'}${p.stems?.length ? `, Active Stems=${p.stems.join(', ')}` : ''}.`,
+        resolvedContext
+          ? `Lossless Acoustic & Symbolic Song Context:\n${resolvedContext}\nCRITICAL MUSICAL ALIGNMENT RULES:\n1. Lock all melodic/chord notes strictly to the Key/Scale, Bass Roots, and bar-by-bar Chords progression provided in [SONG_CTX v1].\n2. Complement the 16-step Groove onset masks (L=low/kick, M=mid/snare, H=high/hat) and any active KEYS/DRUMS lanes: place syncopations or counter-rhythms in open slots or lock bass/kick tightly to L.\n3. Respect the DYN contour and OpenBand frequency guidance using .lpf() / .hpf() and octave choice so your pattern sits cleanly in the mix without masking existing stems.`
+          : '',
+        p.currentCode?.trim() ? `Current active pattern to evolve or transform:\n${p.currentCode.trim()}` : '',
+      ].filter(Boolean).join('\n');
+
+      const modelName = 'gemini-3.8-flash';
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: systemInstruction }] },
+            contents: [{ role: 'user', parts: [{ text: p.prompt.trim() }] }],
+            generationConfig: {
+              temperature: 0.35,
+              maxOutputTokens: 512,
+            },
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        request.log.error({ status: response.status, errorText }, 'Strudel LLM generation failed');
+        return reply.status(502).send({ error: 'Failed to generate Strudel pattern' });
+      }
+
+      const data: any = await response.json();
+      const rawText: string = data?.candidates?.[0]?.content?.parts
+        ?.map((part: any) => (typeof part?.text === 'string' ? part.text : ''))
+        .join('')
+        .trim() || '';
+
+      const cleaned = rawText
+        .replace(/^```(?:javascript|js|strudel|ts)?\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
+
+      if (!cleaned) {
+        return reply.status(502).send({ error: 'Empty pattern returned from Strudel model' });
+      }
+
+      return reply.send({ code: cleaned });
+    } catch (err: any) {
+      return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({
+        error: err.message || 'Failed to generate Strudel pattern',
+      });
+    }
+  });
 };
