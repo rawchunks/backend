@@ -365,7 +365,55 @@ export async function streamSongLyrics(params: {
  * with thinking disabled for near-zero latency.
  * Invoked ONLY when the user attaches an image in the Vibe flow.
  */
+export async function translateImageToSongPrompt(params: {
+  image: string;
+  userPrompt?: string;
+  signal?: AbortSignal;
+}): Promise<string> {
+  const apiKey = getNebiusApiKey();
+  const extraContext = params.userPrompt?.trim();
+  const userText = extraContext
+    ? `${VISION_SYSTEM_PROMPT}\nAdditional user context: ${extraContext}`
+    : VISION_SYSTEM_PROMPT;
 
+  const response = await fetch(NEBIUS_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: VISION_PROMPT_MODEL,
+      messages: [
+        { role: 'system', content: VISION_SYSTEM_PROMPT },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: userText },
+            { type: 'image_url', image_url: { url: params.image } },
+          ],
+        },
+      ],
+      temperature: 0.4,
+      max_tokens: 180,
+      stream: false,
+      chat_template_kwargs: { enable_thinking: false },
+    }),
+    signal: params.signal,
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw Object.assign(
+      new Error(`Nemotron VL image-to-prompt failed (${response.status}): ${errText}`),
+      { statusCode: 502 }
+    );
+  }
+
+  const data: any = await response.json();
+  const raw = String(data?.choices?.[0]?.message?.content || '').trim();
+  return raw.replace(/^["']+|["']+$/g, '').trim();
+}
 
 /**
  * Orchestrates the full Songwriter Agent (/vibe) workflow in real-time:
