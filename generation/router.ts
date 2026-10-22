@@ -19,6 +19,63 @@ function storeCover(bytes: Buffer, mimeType: string) {
   return uploadToR2('songs', `covers/${randomUUID()}`, bytes, mimeType);
 }
 
+export async function generateCoverArt({
+  prompt,
+  title,
+  style,
+}: {
+  prompt?: string;
+  title?: string;
+  style?: string;
+}): Promise<string> {
+  const apiKey = process.env.GOOGLE_GENERATIVE_AI_API_KEY;
+  if (!apiKey) {
+    throw Object.assign(new Error('GOOGLE_GENERATIVE_AI_API_KEY is not configured'), { statusCode: 500 });
+  }
+
+  // Minimal $Brand - one-line summary of landing/src/lib/theme.ts
+  const brand = 'underground acid cyberpunk aesthetic with neon green (#00ff41), hot punk magenta (#ff00a0), and cyber cyan (#00ccff) on deep black';
+  const promptParts = [(prompt || '').trim()];
+  if (title?.trim()) promptParts.push(title.trim());
+  if (style?.trim()) promptParts.push(style.trim());
+  const basedOn = promptParts.filter(Boolean).join(', ');
+  const textPrompt = `Minimal cover for a song, based on ${basedOn}. No text. Style: ${brand}`;
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-nano-banana-2.1:generateContent?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: textPrompt }] }],
+        generationConfig: {
+          responseModalities: ['IMAGE'],
+        },
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    const err: any = new Error('Failed to generate cover image');
+    err.statusCode = 502;
+    err.upstreamStatus = response.status;
+    err.upstreamBody = errorText;
+    throw err;
+  }
+
+  const data: any = await response.json();
+  const candidatePart = data?.candidates?.[0]?.content?.parts?.find((part: any) => part.inlineData?.data);
+  const inlineData = candidatePart?.inlineData;
+
+  if (!inlineData?.data) {
+    throw Object.assign(new Error('No image data returned from cover model'), { statusCode: 502 });
+  }
+
+  const mimeType = inlineData.mimeType || 'image/jpeg';
+  return storeCover(Buffer.from(inlineData.data, 'base64'), mimeType);
+}
+
 import { requireSessionPayment } from '../broker/payment.js';
 
 const generationPricing = (request: any) => {
@@ -105,49 +162,7 @@ export const generationRouter: FastifyPluginAsync = async (fastify) => {
         return reply.send({ imageUrl });
       }
       const { prompt, title, style } = coverSchema.parse(request.body);
-      const apiKey = process.env.GOOGLE_GENERATIVE_AI_API_KEY;
-      if (!apiKey) {
-        return reply.status(500).send({ error: 'GOOGLE_GENERATIVE_AI_API_KEY is not configured' });
-      }
-
-      // Minimal $Brand - one-line summary of landing/src/lib/theme.ts
-      const brand = 'underground acid cyberpunk aesthetic with neon green (#00ff41), hot punk magenta (#ff00a0), and cyber cyan (#00ccff) on deep black';
-      const promptParts = [prompt.trim()];
-      if (title?.trim()) promptParts.push(title.trim());
-      if (style?.trim()) promptParts.push(style.trim());
-      const basedOn = promptParts.join(', ');
-      const textPrompt = `Minimal cover for a song, based on ${basedOn}. No text. Style: ${brand}`;
-
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-nano-banana-2.1:generateContent?key=${apiKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: textPrompt }] }],
-            generationConfig: {
-              responseModalities: ['IMAGE'],
-            },
-          }),
-        }
-      );
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        request.log.error({ status: response.status, errorText }, 'Cover generation failed');
-        return reply.status(502).send({ error: 'Failed to generate cover image' });
-      }
-
-      const data: any = await response.json();
-      const candidatePart = data?.candidates?.[0]?.content?.parts?.find((part: any) => part.inlineData?.data);
-      const inlineData = candidatePart?.inlineData;
-
-      if (!inlineData?.data) {
-        return reply.status(502).send({ error: 'No image data returned from cover model' });
-      }
-
-      const mimeType = inlineData.mimeType || 'image/jpeg';
-      const imageUrl = await storeCover(Buffer.from(inlineData.data, 'base64'), mimeType);
+      const imageUrl = await generateCoverArt({ prompt, title, style });
       return reply.send({ imageUrl });
     } catch (err: any) {
       request.log.error(err);
