@@ -271,7 +271,94 @@ async function streamNebiusToolTurn(
  * Streams lyrics token-by-token from nvidia/Nemotron-3-Ultra-550b-a55b using the exact songwriter system prompt
  * and the independent Lyrics Canvas tag library.
  */
+export async function streamSongLyrics(params: {
+  userPrompt: string;
+  sonicPrompt?: string;
+  title?: string;
+  vocalLanguage?: string;
+  audioDuration?: number;
+  onDelta: (delta: string) => void;
+  signal?: AbortSignal;
+}): Promise<string> {
+  const apiKey = getNebiusApiKey();
+  const lyricsLibContext = getLyricsLibraryContext();
 
+  const userDirective = [
+    `User Vibe Prompt: ${params.userPrompt.trim()}`,
+    params.title ? `Song Title: ${params.title}` : '',
+    params.sonicPrompt ? `Musical Style & Arrangement: ${params.sonicPrompt}` : '',
+    params.vocalLanguage && params.vocalLanguage !== 'en'
+      ? `Write the vocal lyrics in language code "${params.vocalLanguage}" (keep all [Bracketed] structural/vocal tags in English).`
+      : '',
+    params.audioDuration ? `Target Song Duration: ~${params.audioDuration}s` : '',
+    '',
+    lyricsLibContext,
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const response = await fetch(NEBIUS_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: SONGWRITER_MODEL,
+      messages: [
+        { role: 'system', content: LYRICS_SYSTEM_PROMPT },
+        { role: 'user', content: userDirective },
+      ],
+      temperature: 0.75,
+      max_tokens: 1200,
+      stream: true,
+      chat_template_kwargs: { enable_thinking: false },
+    }),
+    signal: params.signal,
+  });
+
+  if (!response.ok || !response.body) {
+    const errText = await response.text().catch(() => '');
+    throw Object.assign(new Error(`Nemotron lyrics stream failed (${response.status}): ${errText}`), {
+      statusCode: 502,
+    });
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullLyrics = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === '[DONE]') continue;
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+
+      const contentDelta = parsed?.choices?.[0]?.delta?.content;
+      if (typeof contentDelta === 'string' && contentDelta.length > 0) {
+        fullLyrics += contentDelta;
+        params.onDelta(contentDelta);
+      }
+    }
+  }
+
+  return fullLyrics;
+}
 
 /**
  * Translates an attached image into a natural, concise human song prompt using nvidia/Nemotron-3.5-Super-VL
