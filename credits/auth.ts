@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { FastifyRequest } from 'fastify';
 import { readUser } from '../databases/users.js';
 import { z } from 'zod';
@@ -7,6 +8,49 @@ export interface CreditIdentity {
   owner: string;
   userAddress: string;
   addresses: string[];
+  promoIdentityHash?: string | null;
+}
+
+const DISPOSABLE_EMAIL_DOMAINS = new Set([
+  'mailinator.com', 'guerrillamail.com', 'tempmail.com', '10minutemail.com',
+  'yopmail.com', 'trashmail.com', 'sharklasers.com', 'getnada.com',
+  'temp-mail.org', 'maildrop.cc', 'dispostable.com', 'fakeinbox.com',
+]);
+const VERIFIED_AUTH_PROVIDERS = new Set([
+  'google', 'github', 'discord', 'x', 'twitter', 'farcaster', 'email', 'passkey', 'apple',
+]);
+
+export function canonicalizePromoEmail(raw: string): string | null {
+  const parts = raw.trim().toLowerCase().split('@');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+  const domain = parts[1] === 'googlemail.com' ? 'gmail.com' : parts[1];
+  if (DISPOSABLE_EMAIL_DOMAINS.has(domain)) return null;
+  let local = parts[0].split('+')[0];
+  if (domain === 'gmail.com') local = local.replace(/\./g, '');
+  return local ? `${local}@${domain}` : null;
+}
+
+export function extractPromoIdentity(accountId: string, linkedAccounts: unknown[]): string | null {
+  for (const entry of linkedAccounts) {
+    if (!entry || typeof entry !== 'object') continue;
+    const rec = entry as Record<string, any>;
+    const type = typeof rec.type === 'string' ? rec.type.toLowerCase() : '';
+    if (!VERIFIED_AUTH_PROVIDERS.has(type)) continue;
+    const details = rec.details && typeof rec.details === 'object' ? (rec.details as Record<string, any>) : rec;
+    const rawEmail = typeof details.email === 'string' ? details.email : typeof rec.email === 'string' ? rec.email : '';
+    if (rawEmail) {
+      const email = canonicalizePromoEmail(rawEmail);
+      if (!email) continue;
+      return createHash('sha256').update(`email:${email}`).digest('hex');
+    }
+    if (type === 'email') continue;
+    const subject = [details.id, details.userId, details.fid, details.username, details.credentialId, rec.id, accountId]
+      .find(v => (typeof v === 'string' || typeof v === 'number') && String(v).trim().length > 0);
+    if (subject) {
+      return createHash('sha256').update(`${type}:${String(subject).trim().toLowerCase()}`).digest('hex');
+    }
+  }
+  return null;
 }
 
 export interface WalletAuthOptions {
@@ -66,7 +110,8 @@ export function createWalletAuthenticator(options: WalletAuthOptions) {
     }
     const pair = addresses.find(([evm, svm]) => evm.toLowerCase() === userAddress || svm === userAddress);
     if (!pair) throw failure('userAddress does not belong to authenticated wallet', 403);
-    return { owner: pair[0].toLowerCase(), userAddress, addresses: [pair[0].toLowerCase(), pair[1]] };
+    const promoIdentityHash = extractPromoIdentity(result.data.id, result.data.linkedAccounts);
+    return { owner: pair[0].toLowerCase(), userAddress, addresses: [pair[0].toLowerCase(), pair[1]], promoIdentityHash };
   };
 }
 
