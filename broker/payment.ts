@@ -18,6 +18,10 @@ export interface SessionPaymentConfig {
   creatorAddress?: string;
 }
 
+export const PRICING = {
+  vibe: { amountWei: '30000', priceUsd: 0.03, action: 'vibe' },
+} as const satisfies Record<string, SessionPaymentConfig>;
+
 export type SessionPaymentResolver = (
   req: FastifyRequest
 ) => Promise<SessionPaymentConfig | null> | SessionPaymentConfig | null;

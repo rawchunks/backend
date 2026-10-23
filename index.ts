@@ -8,6 +8,7 @@ import { resolve } from 'path';
 import { databaseRouter } from './databases/router.js';
 import { generationRouter } from './generation/router.js';
 import { editingRouter } from './editing/router.js';
+import { vibeRouter } from './vibe/router.js';
 import voiceRoutes from './voice/index.js';
 import { voiceService } from './voice/service.js';
 import { runMigrations } from './databases/migrate.js';
@@ -127,6 +128,8 @@ async function main() {
   await app.register(databaseRouter, { prefix: '/api' });
   await app.register(generationRouter, { prefix: '/api/generation' });
   await app.register(editingRouter, { prefix: '/api/editing' });
+  await app.register(vibeRouter, { prefix: '/api/vibe' });
+  await app.register(vibeRouter, { prefix: '/vibe' });
   await app.register(voiceRoutes, { prefix: '/api/voices' });
   await app.register(voiceRoutes, { prefix: '/voices' });
 

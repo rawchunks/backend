@@ -59,6 +59,16 @@ spec:
                 secretKeyRef:
                   name: backend-secrets
                   key: GOOGLE_GENERATIVE_AI_API_KEY
+            - name: NEBIUS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: NEBIUS_API_KEY
+            - name: ELEVENLABS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: ELEVENLABS_API_KEY
             - name: RAWCHUNKS_TREASURY_ADDRESS
               valueFrom:
                 secretKeyRef:
