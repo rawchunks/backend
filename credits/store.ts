@@ -202,7 +202,14 @@ export class CreditStore {
       this.active(row);
       if (BigInt(row.remaining) < maximum) throw fail('Session Credits exhausted', 402);
       const hold = (await c.query('INSERT INTO credit_holds(environment,id,session_id,maximum,resource,creator) VALUES($1,$2,$3,$4,$5,$6) RETURNING *', [this.environment, id, sid, String(maximum), resource, creator || null])).rows[0];
-      const lots = (await c.query('SELECT * FROM credit_session_lots WHERE environment=$1 AND session_id=$2 AND remaining>0 ORDER BY lot_id FOR UPDATE', [this.environment, sid])).rows;
+      const lots = (
+        await c.query(
+          creator
+            ? "SELECT * FROM credit_session_lots WHERE environment=$1 AND session_id=$2 AND remaining>0 AND lot_id NOT LIKE 'promo:%' ORDER BY lot_id FOR UPDATE"
+            : "SELECT * FROM credit_session_lots WHERE environment=$1 AND session_id=$2 AND remaining>0 ORDER BY (lot_id LIKE 'promo:%') DESC,lot_id FOR UPDATE",
+          [this.environment, sid],
+        )
+      ).rows;
       let remaining = maximum;
       for (const lot of lots) {
         const take = BigInt(lot.remaining) < remaining ? BigInt(lot.remaining) : remaining;
@@ -212,7 +219,10 @@ export class CreditStore {
         await c.query('INSERT INTO credit_hold_lots(environment,hold_id,lot_id,remaining) VALUES($1,$2,$3,$4)', [this.environment, id, lot.lot_id, String(take)]);
         remaining -= take;
       }
-      if (remaining) throw fail('Session capture attribution missing');
+      if (remaining) {
+        if (creator) throw fail('Campaign Credits can only be used for generation and editing', 402);
+        throw fail('Session capture attribution missing');
+      }
       await c.query('UPDATE credit_sessions SET remaining=remaining-$3,reserved=reserved+$3 WHERE environment=$1 AND id=$2', [this.environment, sid, String(maximum)]);
       return hold;
     });
