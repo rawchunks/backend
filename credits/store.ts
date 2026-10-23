@@ -73,7 +73,7 @@ export class CreditStore {
     if (row.closed || new Date(row.expires_at).getTime() <= Date.now()) throw fail('Session is closed or expired');
   }
   private async allocate(c: CreditConnection, owner: string, sid: string, amount: bigint) {
-    const lots = (await c.query('SELECT * FROM credit_lots WHERE environment=$1 AND owner=$2 AND available>0 AND NOT disputed ORDER BY created_at,id FOR UPDATE', [this.environment, owner])).rows;
+    const lots = (await c.query("SELECT * FROM credit_lots WHERE environment=$1 AND owner=$2 AND available>0 AND NOT disputed ORDER BY (id LIKE 'promo:%') DESC,created_at,id FOR UPDATE", [this.environment, owner])).rows;
     let remaining = amount;
     for (const lot of lots) {
       const take = BigInt(lot.available) < remaining ? BigInt(lot.available) : remaining;
@@ -120,6 +120,30 @@ export class CreditStore {
       const fresh = (await c.query('SELECT * FROM credit_accounts WHERE environment=$1 AND owner=$2', [this.environment, owner])).rows[0];
       const totals = (await c.query('SELECT coalesce(sum(remaining),0)::text allocated,coalesce(sum(reserved),0)::text reserved FROM credit_sessions WHERE environment=$1 AND owner=$2', [this.environment, owner])).rows[0];
       return { availableAtomics: String(fresh.available), allocatedAtomics: totals.allocated, reservedAtomics: totals.reserved, spentAtomics: String(fresh.spent), suspendedAtomics: String(fresh.suspended), promo };
+    });
+  }
+  async claimPromo(owner: string, identityHash: string | null | undefined, duration: number, key: string) {
+    identifier(key);
+    if (!Number.isInteger(duration) || duration < 60 || duration > 604800) throw fail('Invalid session duration', 400);
+    if (!identityHash) throw fail('A verified email or social account is required to claim Campaign Credits', 403);
+    return this.tx(async c => {
+      await c.query('SELECT pg_advisory_xact_lock($1)', [20261000]);
+      await this.account(c, owner);
+      const lotId = `${PROMO_CAMPAIGN_ID}:${owner}`;
+      const captureId = `${PROMO_CAMPAIGN_ID}:${identityHash}`;
+      const existing = (await c.query('SELECT * FROM credit_lots WHERE environment=$1 AND (id=$2 OR capture_id=$3) LIMIT 1', [this.environment, lotId, captureId])).rows[0];
+      if (existing) throw fail('Campaign Credits already claimed', 409);
+      const countRow = (await c.query('SELECT count(*)::int AS count FROM credit_lots WHERE environment=$1 AND id LIKE $2', [this.environment, `${PROMO_CAMPAIGN_ID}:%`])).rows[0];
+      if (Number(countRow?.count ?? 0) >= PROMO_MAX_CLAIMS) throw fail('Campaign Credits exhausted (first 1,000 users reached)', 409);
+      if (await this.posting(c, owner, `capture:${captureId}`, PROMO_AMOUNT_ATOMICS, 'promo')) {
+        await c.query('INSERT INTO credit_lots(environment,id,owner,capture_id,amount,available) VALUES($1,$2,$3,$4,$5,$5)', [this.environment, lotId, owner, captureId, String(PROMO_AMOUNT_ATOMICS)]);
+        await c.query('UPDATE credit_accounts SET available=available+$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(PROMO_AMOUNT_ATOMICS)]);
+      } else {
+        throw fail('Campaign Credits already claimed', 409);
+      }
+      const openSession = (await c.query('SELECT * FROM credit_sessions WHERE environment=$1 AND owner=$2 AND NOT closed AND expires_at>now() ORDER BY created_at DESC LIMIT 1 FOR UPDATE', [this.environment, owner])).rows[0];
+      if (openSession) return this.topupInTransaction(c, owner, openSession.id, PROMO_AMOUNT_ATOMICS, `promo:${key}`);
+      return this.startInTransaction(c, owner, PROMO_AMOUNT_ATOMICS, duration, `promo:${key}`);
     });
   }
   async start(owner: string, amount: bigint, duration: number, key: string) {
