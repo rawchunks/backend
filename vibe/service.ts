@@ -423,7 +423,228 @@ export async function translateImageToSongPrompt(params: {
  * 3. Invokes generateCoverArt directly in parallel (without generating an image prompt)
  * 4. Streams poetic, bracket-tagged lyrics token-by-token into the Lyrics Canvas
  */
+export async function runVibeAgentStream(params: {
+  userPrompt?: string;
+  image?: string;
+  emit: (event: VibeStreamEvent) => void;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const { emit, signal } = params;
+  const rawUserPrompt = (params.userPrompt || '').trim();
+  const attachedImage = (params.image || '').trim();
 
+  let effectivePrompt = rawUserPrompt;
+
+  if (attachedImage) {
+    emit({ type: 'status', step: 'Translating image into song prompt...' });
+    const translatedPrompt = await translateImageToSongPrompt({
+      image: attachedImage,
+      userPrompt: rawUserPrompt || undefined,
+      signal,
+    });
+    if (translatedPrompt) {
+      effectivePrompt = rawUserPrompt ? `${rawUserPrompt} — ${translatedPrompt}` : translatedPrompt;
+      emit({ type: 'field', field: 'prompt', value: effectivePrompt });
+    }
+  }
+
+  const state = {
+    title: '',
+    prompt: effectivePrompt,
+    instrumental: false,
+    vocalLanguage: 'en',
+    tags: [] as string[],
+    bpm: 120,
+    keyScale: 'A minor',
+    audioDuration: 120,
+    coverTriggered: false,
+  };
+
+  let coverPromise: Promise<void> | null = null;
+
+  const startCoverGeneration = () => {
+    if (coverPromise) return;
+    state.coverTriggered = true;
+    emit({ type: 'cover_start' });
+    coverPromise = (async () => {
+      try {
+        const imageUrl = await generateCoverArt({
+          prompt: state.prompt || effectivePrompt,
+          title: state.title || undefined,
+          style: state.tags.length ? state.tags.join(', ') : undefined,
+        });
+        emit({ type: 'cover', imageUrl });
+      } catch (err: any) {
+        // Non-fatal if cover art fails; rest of the song form still completes
+        console.warn('[Vibe Agent] Cover generation warning:', err?.message || err);
+      }
+    })();
+  };
+
+  const handleActionTool = (call: StreamToolCall): string => {
+    let args: Record<string, any> = {};
+    try {
+      args = call.arguments ? JSON.parse(call.arguments) : {};
+    } catch {
+      args = {};
+    }
+
+    switch (call.name) {
+      case 'read_styles_library':
+        return getStylesLibraryContext();
+      case 'read_parameters_library':
+        return getParametersLibraryContext();
+      case 'read_lyrics_library':
+        return getLyricsLibraryContext();
+      case 'set_title': {
+        const cleanTitle = typeof args.title === 'string' ? args.title.trim().slice(0, 100) : '';
+        if (cleanTitle) {
+          state.title = cleanTitle;
+          emit({ type: 'field', field: 'title', value: cleanTitle });
+        }
+        return 'ok';
+      }
+      case 'set_prompt': {
+        const cleanPrompt = typeof args.prompt === 'string' ? args.prompt.trim().slice(0, 500) : '';
+        if (cleanPrompt) {
+          state.prompt = cleanPrompt;
+          emit({ type: 'field', field: 'prompt', value: cleanPrompt });
+        }
+        return 'ok';
+      }
+      case 'set_vocal_config': {
+        const isInst = Boolean(args.instrumental);
+        const lang = normalizeLanguage(args.vocalLanguage);
+        state.instrumental = isInst;
+        state.vocalLanguage = lang;
+        emit({ type: 'field', field: 'instrumental', value: isInst });
+        if (!isInst) {
+          emit({ type: 'field', field: 'vocalLanguage', value: lang });
+        }
+        return 'ok';
+      }
+      case 'set_style_tags': {
+        const normalized = normalizeStyleTags(args.tags);
+        if (normalized.length > 0) {
+          state.tags = normalized;
+          emit({ type: 'field', field: 'tags', value: normalized });
+        }
+        return 'ok';
+      }
+      case 'set_global_parameters': {
+        const bpm = normalizeBpm(args.bpm);
+        const keyScale = normalizeKeyScale(args.keyScale);
+        const audioDuration = normalizeDuration(args.audioDuration);
+        if (bpm) {
+          state.bpm = bpm;
+          emit({ type: 'field', field: 'bpm', value: bpm });
+        }
+        if (keyScale) {
+          state.keyScale = keyScale;
+          emit({ type: 'field', field: 'keyScale', value: keyScale });
+        }
+        if (audioDuration) {
+          state.audioDuration = audioDuration;
+          emit({ type: 'field', field: 'audioDuration', value: audioDuration });
+        }
+        return 'ok';
+      }
+      case 'trigger_cover': {
+        startCoverGeneration();
+        return 'cover_triggered';
+      }
+      default:
+        return 'unknown_tool';
+    }
+  };
+
+  emit({ type: 'status', step: 'Reading Studio libraries...' });
+
+  const messages: any[] = [
+    {
+      role: 'system',
+      content: [
+        'You are the Studio Songwriter & Producer Agent for Rawchunks.',
+        'Your job is to configure the Studio form fields based on the user vibe prompt.',
+        'Workflow:',
+        '1. First, call `read_styles_library` and `read_parameters_library` to inspect valid Studio style tags and parameter constraints (do NOT guess tag names before reading the library).',
+        '2. Next, call `set_title`, `set_prompt`, `set_vocal_config`, `set_style_tags`, `set_global_parameters`, and `trigger_cover` to populate every field of the form.',
+      ].join('\n'),
+    },
+    {
+      role: 'user',
+      content: effectivePrompt,
+    },
+  ];
+
+  // Up to 2 tool turns: Turn 1 reads the independent libraries on-demand; Turn 2 streams the setter tool calls
+  for (let turn = 0; turn < 2; turn++) {
+    const toolOutputs: { call: StreamToolCall; output: string }[] = [];
+    const calls = await streamNebiusToolTurn(
+      messages,
+      'required',
+      async (call) => {
+        const output = handleActionTool(call);
+        toolOutputs.push({ call, output });
+      },
+      signal
+    );
+
+    if (!calls.length) break;
+
+    const hasSetters = calls.some((c) => c.name.startsWith('set_') || c.name === 'trigger_cover');
+    const hasReaders = calls.some((c) => c.name.startsWith('read_'));
+
+    messages.push({
+      role: 'assistant',
+      content: null,
+      tool_calls: calls.map((c) => ({
+        id: c.id,
+        type: 'function',
+        function: { name: c.name, arguments: c.arguments || '{}' },
+      })),
+    });
+
+    for (const { call, output } of toolOutputs) {
+      messages.push({
+        role: 'tool',
+        tool_call_id: call.id,
+        name: call.name,
+        content: output,
+      });
+    }
+
+    // If all setter tools already ran in a single turn, no second turn needed
+    if (hasSetters && !hasReaders) break;
+  }
+
+  // Ensure cover art is triggered even if the model omitted trigger_cover
+  if (!state.coverTriggered) {
+    startCoverGeneration();
+  }
+
+  // Stream lyrics token-by-token if the song is not instrumental
+  if (!state.instrumental) {
+    emit({ type: 'status', step: 'Writing lyrics...' });
+    emit({ type: 'lyrics_start' });
+    await streamSongLyrics({
+      userPrompt: effectivePrompt,
+      sonicPrompt: state.prompt,
+      title: state.title,
+      vocalLanguage: state.vocalLanguage,
+      audioDuration: state.audioDuration,
+      onDelta: (delta) => emit({ type: 'lyrics_delta', delta }),
+      signal,
+    });
+  }
+
+  if (coverPromise) {
+    emit({ type: 'status', step: 'Finalizing cover art...' });
+    await coverPromise;
+  }
+
+  emit({ type: 'done' });
+}
 
 export {
   LYRICS_CANVAS_TAGS,
