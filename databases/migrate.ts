@@ -29,9 +29,9 @@ export async function runMigrations() {
       avatar TEXT
     );
   `;
-  await userSql`ALTER TABLE public.wallet_pairs ADD COLUMN IF NOT EXISTS nickname TEXT, ADD COLUMN IF NOT EXISTS avatar TEXT;`;
+  await userSql`ALTER TABLE public.wallet_pairs ADD COLUMN IF NOT EXISTS nickname TEXT, ADD COLUMN IF NOT EXISTS avatar TEXT, ADD COLUMN IF NOT EXISTS guides_seen JSONB DEFAULT '[]'::jsonb NOT NULL;`;
   await userSql`ALTER TABLE public.wallet_pairs ALTER COLUMN svm_address DROP NOT NULL;`;
-  await userSql`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS nickname TEXT, ADD COLUMN IF NOT EXISTS avatar TEXT;`;
+  await userSql`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS nickname TEXT, ADD COLUMN IF NOT EXISTS avatar TEXT, ADD COLUMN IF NOT EXISTS guides_seen JSONB DEFAULT '[]'::jsonb NOT NULL;`;
   console.log('✓ User database schema verified (wallet_pairs, users).');
 
   // 2. Song Database Migrations

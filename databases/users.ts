@@ -23,6 +23,7 @@ export interface WalletPair {
   consentedAt?: string | null; consentVersion?: string | null; consentSignature?: string | null;
   consentMessage?: string | null; consentMetadata?: Record<string, unknown> | null;
   nickname?: string | null; avatar?: string | null;
+  guidesSeen?: string[];
 }
 export interface UserConsentRecord {
   evmAddress: string; svmAddress: string; policyVersion: string; signature: string; message: string;
@@ -55,6 +56,9 @@ function pairFromRow(row: any): WalletPair | null {
     consentMetadata: row.consent_metadata ?? null,
     nickname: row.nickname ?? null,
     avatar: row.avatar ?? null,
+    guidesSeen: Array.isArray(row.guides_seen)
+      ? row.guides_seen.filter((item: unknown): item is string => typeof item === 'string')
+      : [],
   };
 }
 function consentFromRow(row: any): UserConsentRecord | null {
@@ -195,6 +199,37 @@ export async function checkUserConsent(address: string): Promise<{ hasConsented:
   if (!address) return { hasConsented: false, record: null };
   const record = await getUserConsent(address);
   return { hasConsented: Boolean(record), evmAddress: record?.evmAddress ?? null, svmAddress: record?.svmAddress ?? null, record };
+}
+
+export async function getUserGuides(rawAddress: string): Promise<string[]> {
+  const parsed = parseAddress(rawAddress);
+  const rows = parsed.kind === 'evm'
+    ? await userSql`SELECT guides_seen FROM public.wallet_pairs WHERE evm_address = ${parsed.value} LIMIT 1`
+    : await userSql`SELECT guides_seen FROM public.wallet_pairs WHERE svm_address = ${parsed.value} LIMIT 1`;
+  const raw = rows[0]?.guides_seen;
+  return Array.isArray(raw) ? raw.filter((item: unknown): item is string => typeof item === 'string') : [];
+}
+
+export async function putUserGuides(input: {
+  address: string;
+  svmAddress?: string | null;
+  guides: string[];
+}): Promise<string[]> {
+  const parsed = parseAddress(input.address);
+  const incoming = Array.from(new Set((input.guides || []).map(item => String(item).trim()).filter(Boolean)));
+  let existing = await getWalletPair(parsed.value);
+  if (!existing && parsed.kind === 'evm') {
+    existing = await updateProfile({ address: parsed.value, svmAddress: input.svmAddress ?? null });
+  }
+  if (!existing) throw new RequestError('Wallet pair not found', 404);
+  const merged = Array.from(new Set([...(existing.guidesSeen ?? []), ...incoming]));
+  const serialized = JSON.stringify(merged);
+  await userSql`
+    UPDATE public.wallet_pairs
+    SET guides_seen = ${serialized}::jsonb
+    WHERE evm_address = ${existing.evmAddress}
+  `;
+  return merged;
 }
 
 export function readUser(request: FastifyRequest): string {
