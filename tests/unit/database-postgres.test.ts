@@ -6,7 +6,7 @@ vi.mock('../../databases/client.js', async () => {
 });
 import { databaseCause, clearPostgres, closePostgres, fixtures as f, initializePostgres, postgres } from '../support/database-postgres.js';
 import { runMigrations } from '../../databases/migrate.js';
-import { getUserConsent, getWalletPair, putUserConsent, putWalletPair, updateProfile } from '../../databases/users.js';
+import { getUserConsent, getWalletPair, putUserConsent, putWalletPair, STARTER_SONG_ID, updateProfile } from '../../databases/users.js';
 import { createSong, deleteSong, getFullSongProject, getSongById, listAllSongs, listSongsByCreator, updateSong } from '../../databases/songs.js';
 import { createStem, listStemsBySong, updateStemMixer } from '../../databases/stems.js';
 import { activateTake, createTake, deleteTake, listTakesBySong, listTakesByStem } from '../../databases/takes.js';
@@ -175,5 +175,63 @@ describe('production DDL and queries on disposable PostgreSQL engines', () => {
     await createSong({ ...f.song, id: 'song-unpaired', creator: 'so11111111111111111111111111111111111111112' });
     expect((await listSongsByCreator(f.evm)).map((song) => song.id).sort()).toEqual(['song-a', 'song-svm']);
     expect((await getWalletPair(` ${f.evm.toUpperCase().replace('0X', '0x')} `))?.evmAddress).toBe(f.evm);
+  });
+  it('seeds a private copy of the starter song into new user accounts only', async () => {
+    const templateOwner = `0x${'9'.repeat(40)}`;
+    await createSong({
+      ...f.song,
+      id: STARTER_SONG_ID,
+      title: 'Playground',
+      creator: templateOwner,
+      public: false,
+    });
+    await createStem({
+      ...f.stem,
+      id: 'stm-master-template',
+      song_id: STARTER_SONG_ID,
+      name: 'master',
+    });
+    await createTake({
+      ...f.take,
+      id: 'take-template-1',
+      song_id: STARTER_SONG_ID,
+      stem_id: 'stm-master-template',
+      is_active: true,
+      provenance: {
+        targetStemId: 'stm-master-template',
+        parameters: { submitted: { creatorAddress: templateOwner } },
+      } as any,
+    });
+
+    await putUserConsent({
+      address: f.evm,
+      signature: 'isolated-fixture',
+      message: 'Initial signup policy',
+    });
+
+    const userSongs = await listSongsByCreator(f.evm);
+    expect(userSongs).toHaveLength(1);
+    const seededSong = userSongs[0];
+    expect(seededSong.id).not.toBe(STARTER_SONG_ID);
+    expect(seededSong.title).toBe('Playground');
+    expect(seededSong.creator).toBe(f.evm);
+    expect(seededSong.public).toBe(false);
+
+    const project = await getFullSongProject(seededSong.id);
+    expect(project.stems).toHaveLength(1);
+    expect(project.takes).toHaveLength(1);
+    expect(project.takes[0].stem_id).toBe(project.stems[0].id);
+    expect(project.takes[0].is_active).toBe(true);
+    expect((project.takes[0].provenance as any)?.targetStemId).toBe(project.stems[0].id);
+    expect((project.takes[0].provenance as any)?.parameters?.submitted?.creatorAddress).toBe(f.evm);
+
+    // Subsequent consent or profile updates on existing account must not duplicate the starter song
+    await updateProfile({ address: f.evm, nickname: 'Producer' });
+    await putUserConsent({
+      address: f.evm,
+      signature: 'isolated-fixture-2',
+      message: 'Updated signup policy',
+    });
+    expect(await listSongsByCreator(f.evm)).toHaveLength(1);
   });
 });

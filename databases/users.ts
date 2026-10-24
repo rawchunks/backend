@@ -1,6 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import { userSql, songSql } from './client.js';
 import type { FastifyRequest } from 'fastify';
 import { getSongById } from './songs.js';
+
+export const STARTER_SONG_ID = 'sng-95ee3b8a-e8a0-4f6d-bef4-69bac7528e35';
 
 export class RequestError extends Error {
   constructor(message: string, public readonly statusCode = 400) { super(message); }
@@ -67,6 +70,161 @@ function consentFromRow(row: any): UserConsentRecord | null {
   return pair ? { evmAddress: pair.evmAddress, svmAddress: pair.svmAddress, policyVersion: row.consent_version, signature: row.consent_signature, message: row.consent_message, metadata: row.consent_metadata ?? undefined, signedAt: new Date(row.consented_at).toISOString() } : null;
 }
 
+function remapJsonIds(value: unknown, idMap: Map<string, string>): unknown {
+  if (!value || idMap.size === 0) return value;
+  let serialized = typeof value === 'string' ? value : JSON.stringify(value);
+  for (const [oldId, newId] of idMap.entries()) {
+    if (oldId && oldId !== newId) {
+      serialized = serialized.split(oldId).join(newId);
+    }
+  }
+  try {
+    return JSON.parse(serialized);
+  } catch {
+    return value;
+  }
+}
+
+export async function seedStarterSongForNewUser(evmAddress: string): Promise<void> {
+  try {
+    if (typeof songSql !== 'function') return;
+    const normalized = evmAddress.trim().toLowerCase();
+    if (!EVM_REGEX.test(normalized)) return;
+
+    const templateRows = await songSql`SELECT * FROM songs WHERE id = ${STARTER_SONG_ID} LIMIT 1`;
+    if (!Array.isArray(templateRows) || !templateRows[0]) return;
+    const template = templateRows[0];
+    if (String(template.creator ?? '').trim().toLowerCase() === normalized) return;
+
+    const newSongId = `sng-${randomUUID()}`;
+    const tagsJson = JSON.stringify(Array.isArray(template.tags) ? template.tags : []);
+    const insertedSongs = await songSql`
+      INSERT INTO songs (
+        id, title, family, basis, creator, source, version, url, duration, tags,
+        licenses, stream_price, license_price, network, image, album_id, public, metadata_cid
+      )
+      SELECT
+        ${newSongId},
+        ${template.title ?? 'Playground'},
+        NULL,
+        NULL,
+        ${normalized},
+        ${template.source ?? null},
+        1,
+        ${template.url},
+        ${template.duration != null ? Number(template.duration) : null},
+        ${tagsJson}::jsonb,
+        ${Number(template.licenses ?? 0)},
+        ${Number(template.stream_price ?? 0.01)},
+        ${Number(template.license_price ?? 5)},
+        ${template.network ?? null},
+        ${template.image ?? null},
+        NULL,
+        false,
+        NULL
+      WHERE NOT EXISTS (
+        SELECT 1 FROM songs WHERE creator = ${normalized}
+      )
+      RETURNING id
+    `;
+    if (!Array.isArray(insertedSongs) || !insertedSongs[0]) return;
+
+    const stems = await songSql`SELECT * FROM stems WHERE song_id = ${STARTER_SONG_ID} ORDER BY created_at ASC`;
+    const takes = await songSql`SELECT * FROM takes WHERE song_id = ${STARTER_SONG_ID} ORDER BY created_at ASC`;
+    const commits = await songSql`SELECT * FROM commits WHERE song_id = ${STARTER_SONG_ID} ORDER BY created_at ASC`;
+
+    const idMap = new Map<string, string>([
+      [STARTER_SONG_ID, newSongId],
+      [String(template.creator ?? ''), normalized],
+    ]);
+
+    const stemRows = Array.isArray(stems) ? stems : [];
+    const takeRows = Array.isArray(takes) ? takes : [];
+    const commitRows = Array.isArray(commits) ? commits : [];
+
+    for (const stem of stemRows) {
+      idMap.set(String(stem.id), `stm-${stem.name ?? 'master'}-${randomUUID()}`);
+    }
+    for (const take of takeRows) {
+      idMap.set(String(take.id), `take-${randomUUID()}`);
+    }
+    for (const commit of commitRows) {
+      idMap.set(String(commit.id), `cmt-${randomUUID()}`);
+    }
+
+    for (const stem of stemRows) {
+      const newStemId = idMap.get(String(stem.id))!;
+      await songSql`
+        INSERT INTO stems (
+          id, song_id, name, url, waveform_peaks_url, volume, pan, is_muted, is_solo
+        ) VALUES (
+          ${newStemId},
+          ${newSongId},
+          ${stem.name},
+          ${stem.url},
+          ${stem.waveform_peaks_url ?? null},
+          ${Number(stem.volume ?? 1.0)},
+          ${Number(stem.pan ?? 0.0)},
+          ${Boolean(stem.is_muted)},
+          ${Boolean(stem.is_solo)}
+        )
+      `;
+    }
+
+    for (const take of takeRows) {
+      const newTakeId = idMap.get(String(take.id))!;
+      const mappedStemId = take.stem_id ? (idMap.get(String(take.stem_id)) ?? null) : null;
+      const mappedProvenance = take.provenance
+        ? JSON.stringify(remapJsonIds(take.provenance, idMap))
+        : null;
+      await songSql`
+        INSERT INTO takes (
+          id, song_id, stem_id, take_number, model, task, prompt, lyrics,
+          repainting_start, repainting_end, url, waveform_url, is_active, seed, provenance
+        ) VALUES (
+          ${newTakeId},
+          ${newSongId},
+          ${mappedStemId},
+          ${Number(take.take_number ?? 1)},
+          ${take.model},
+          ${take.task},
+          ${take.prompt ?? null},
+          ${take.lyrics ?? null},
+          ${take.repainting_start != null ? Number(take.repainting_start) : null},
+          ${take.repainting_end != null ? Number(take.repainting_end) : null},
+          ${take.url},
+          ${take.waveform_url ?? null},
+          ${Boolean(take.is_active)},
+          ${take.seed != null ? Number(take.seed) : null},
+          ${mappedProvenance}::jsonb
+        )
+      `;
+    }
+
+    for (const commit of commitRows) {
+      const newCommitId = idMap.get(String(commit.id))!;
+      const mappedParentCommitId = commit.parent_commit_id
+        ? (idMap.get(String(commit.parent_commit_id)) ?? null)
+        : null;
+      const mappedSnapshot = JSON.stringify(remapJsonIds(commit.timeline_snapshot ?? {}, idMap));
+      await songSql`
+        INSERT INTO commits (
+          id, song_id, user_address, parent_commit_id, message, timeline_snapshot
+        ) VALUES (
+          ${newCommitId},
+          ${newSongId},
+          ${normalized},
+          ${mappedParentCommitId},
+          ${commit.message ?? 'Initial playground state'},
+          ${mappedSnapshot}::jsonb
+        )
+      `;
+    }
+  } catch {
+    // Non-fatal: starter song seeding should never block account creation
+  }
+}
+
 export interface UpdateProfileInput {
   address: string;
   nickname?: string | null;
@@ -105,6 +263,7 @@ export async function updateProfile(input: UpdateProfileInput): Promise<WalletPa
       `;
       const pair = pairFromRow(rows[0]);
       if (!pair) throw new RequestError('Failed to create profile');
+      await seedStarterSongForNewUser(pair.evmAddress);
       return pair;
     } else {
       const rows = await userSql`
@@ -153,6 +312,9 @@ export async function putWalletPair(input: {
   `;
   const pair = pairFromRow(rows[0]);
   if (!pair) throw new Error('Failed to create or update wallet pair');
+  if (!pair.consentedAt) {
+    await seedStarterSongForNewUser(pair.evmAddress);
+  }
   return pair;
 }
 export async function getWalletPair(rawAddress: string): Promise<WalletPair | null> {
@@ -166,6 +328,7 @@ export async function putUserConsent(input: RecordConsentInput): Promise<UserCon
   const parsed = parseAddress(input.address);
   if (!input.signature?.trim() || input.signature === '0x' || !input.message?.trim()) throw new RequestError('A signature and signed message are required');
   let pair = await getWalletPair(parsed.value);
+  const isNewAccount = !pair || !pair.consentedAt;
   if (!pair && parsed.kind === 'evm' && !input.svmAddress) pair = await updateProfile({ address: parsed.value });
   if (!pair?.svmAddress && input.svmAddress) {
     const evm = parseAddress(parsed.kind === 'evm' ? parsed.value : input.metadata?.evmAddress);
@@ -183,6 +346,9 @@ export async function putUserConsent(input: RecordConsentInput): Promise<UserCon
   `;
   const record = consentFromRow(updated[0]);
   if (!record) throw new RequestError('Account pair changed while recording consent', 409);
+  if (isNewAccount) {
+    await seedStarterSongForNewUser(record.evmAddress);
+  }
   return record;
 }
 
