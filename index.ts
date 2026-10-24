@@ -172,6 +172,11 @@ async function main() {
   app.get('/user/consent/:address', async (req: any, reply: any) => {
     return forward(`/api/user/consent/${encodeURIComponent(req.params.address)}`)(req, reply);
   });
+  app.post('/user/guides', forward('/api/user/guides'));
+  app.put('/user/guides', forward('/api/user/guides'));
+  app.get('/user/guides/:address', async (req: any, reply: any) => {
+    return forward(`/api/user/guides/${encodeURIComponent(req.params.address)}`)(req, reply);
+  });
 
   app.addHook('onClose', async () => { await voiceService.stop(); await closeSubscriptions(); await valkey.quit(); });
   const shutdown = () => {

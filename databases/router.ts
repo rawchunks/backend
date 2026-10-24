@@ -1,6 +1,6 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { getWalletPair, putWalletPair, getUserConsent, putUserConsent, parseAddress, updateProfile } from './users.js';
+import { getWalletPair, putWalletPair, getUserConsent, putUserConsent, getUserGuides, putUserGuides, parseAddress, updateProfile } from './users.js';
 import { listSongsByCreator, listAllSongs, getFullSongProject, updateSong, deleteSong, getSongById, createSong, copySong } from './songs.js';
 import { randomUUID } from 'node:crypto';
 import { listStemsBySong } from './stems.js';
@@ -33,6 +33,10 @@ const consentBody = z.object({
   disclaimerType: text.optional(), policyVersion: text.default('1.0.0'), signature: text,
   message: z.string().optional(), metadata: z.record(z.string(), z.unknown()).optional(), chainId: z.number().int().positive().optional(),
 }).refine(data => data.address || data.evmAddress || data.svmAddress, 'At least one address must be provided');
+const guidesBody = z.object({
+  address: address.optional(),
+  guides: z.array(text).max(32),
+});
 const integerQuery = (minimum: number) => z.string().regex(/^\d+$/).transform(Number).refine(value => Number.isSafeInteger(value) && value >= minimum);
 const listQuery = z.object({ creator: z.string().optional(), limit: integerQuery(1).optional(), offset: integerQuery(0).optional() });
 const consentQuery = z.object({ version: text.optional(), type: text.optional() });
@@ -206,6 +210,25 @@ export const databaseRouter: FastifyPluginAsync = async app => {
   };
   app.post('/user/consent', recordConsent);
   app.put('/user/consent', recordConsent);
+  app.get('/user/guides/:address', async (request, reply) => {
+    try {
+      const { address: raw } = request.params as { address: string };
+      address.parse(raw);
+      return reply.send({ guides: await getUserGuides(raw) });
+    } catch (error) { return failure(request, reply, error, 'Failed to lookup user guides'); }
+  });
+  const recordGuides = async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const parsed = guidesBody.parse(request.body || {});
+      const userAddress = readUser(request);
+      const targetAddress = parsed.address || userAddress;
+      await checkUser(userAddress, targetAddress);
+      const guides = await putUserGuides({ address: targetAddress, guides: parsed.guides });
+      return reply.send({ guides });
+    } catch (error) { return failure(request, reply, error, 'Failed to update user guides'); }
+  };
+  app.post('/user/guides', recordGuides);
+  app.put('/user/guides', recordGuides);
   app.get('/songs', async (request, reply) => {
     try {
       const query = listQuery.parse(request.query);
