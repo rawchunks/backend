@@ -7,6 +7,33 @@ import { signSession } from './session.js';
 
 const id = z.string().min(1).max(128);
 const amount = z.string().regex(/^[1-9][0-9]{0,17}$/);
+const PROMO_SUBNET_WINDOW_MS = 24 * 60 * 60 * 1000;
+const PROMO_SUBNET_MAX_CLAIMS = 3;
+const promoSubnetClaims = new Map<string, number[]>();
+
+function clientSubnetKey(req: { headers: Record<string, unknown>; ip?: string }): string {
+  const cf = typeof req.headers['cf-connecting-ip'] === 'string' ? req.headers['cf-connecting-ip'].trim() : '';
+  const xff = typeof req.headers['x-forwarded-for'] === 'string' ? req.headers['x-forwarded-for'].split(',')[0]?.trim() ?? '' : '';
+  const raw = (cf || xff || req.ip || 'unknown').replace(/^::ffff:/i, '');
+  const ipv4 = raw.split('.');
+  if (ipv4.length === 4 && ipv4.every(part => /^\d+$/.test(part))) {
+    return `${ipv4[0]}.${ipv4[1]}.${ipv4[2]}.0/24`;
+  }
+  if (raw.includes(':')) {
+    const parts = raw.toLowerCase().split(':').slice(0, 3);
+    return `${parts.join(':')}::/48`;
+  }
+  return raw;
+}
+
+function checkPromoSubnetLimit(subnet: string): number[] {
+  const now = Date.now();
+  const active = (promoSubnetClaims.get(subnet) ?? []).filter(ts => now - ts < PROMO_SUBNET_WINDOW_MS);
+  if (active.length >= PROMO_SUBNET_MAX_CLAIMS) {
+    throw Object.assign(new Error('Too many campaign claims from this network. Please try again later.'), { statusCode: 429 });
+  }
+  return active;
+}
 const checkout = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('balance') }).strict(),
   z.object({ kind: z.literal('start'), durationSeconds: z.number().int().min(60).max(604800) }).strict(),
@@ -26,7 +53,16 @@ export const creditsRouter: FastifyPluginAsync = async app => {
   const sessionResponse = (row: any, owner: string) => ({ ...sessionView(row), token: signSession({ sub: owner, sid: row.id, env: store.environment, exp: Math.floor(new Date(row.expires_at).getTime() / 1000) }) });
   app.get('/credits/balance', async req => {
     const identity = await authenticate(req);
-    return { userAddress: identity.userAddress, ...await store.balance(identity.owner), packs, paypalClientId: process.env.PAYPAL_CLIENT_ID, environment: store.environment };
+    return { userAddress: identity.userAddress, ...await store.balance(identity.owner, identity.promoIdentityHash), packs, paypalClientId: process.env.PAYPAL_CLIENT_ID, environment: store.environment };
+  });
+  app.post('/credits/promo/claim', async req => {
+    const identity = await authenticate(req);
+    const input = body(z.object({ durationSeconds: z.number().int().min(60).max(604800).optional() }).strict().optional(), req.body);
+    const subnet = clientSubnetKey(req);
+    const activeClaims = checkPromoSubnetLimit(subnet);
+    const row = await store.claimPromo(identity.owner, identity.promoIdentityHash, input?.durationSeconds ?? 21600, key(req.headers));
+    promoSubnetClaims.set(subnet, [...activeClaims, Date.now()]);
+    return sessionResponse(row, identity.owner);
   });
   app.post('/credits/paypal/create-order', async req => {
     const identity = await authenticate(req);
