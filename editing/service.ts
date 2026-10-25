@@ -165,15 +165,27 @@ export class Service {
     });
   }
 
-  async separateStems(params: { songId: string; stemType?: string; srcAudioUrl?: string; userAddress?: string }) {
+  async separateStems(params: { songId: string; stemType?: string; srcAudioUrl?: string; userAddress?: string }): Promise<any> {
+    const DEMUCS_STEMS = new Set(['all', 'vocals', 'drums', 'bass', 'other', 'instrumental']);
+    const requestedStem = (params.stemType || 'all').trim().toLowerCase();
     const song = await getSongById(params.songId);
     if (!song) throw failure(`Song ${params.songId} not found`, 404);
     const srcAudio = params.srcAudioUrl || song.url;
     if (!srcAudio) throw failure(`No audio source available for song ${params.songId}`);
     const userAddress = params.userAddress || song.creator;
     if (!userAddress) throw failure(`User address or song creator is required to record separation for song ${params.songId}`);
+    if (!DEMUCS_STEMS.has(requestedStem)) {
+      return this.dispatchEditTask({
+        songId: params.songId,
+        userAddress,
+        task: 'extract',
+        trackName: requestedStem,
+        srcAudioUrl: srcAudio,
+        modelQuality: 'base',
+      });
+    }
     const operationId = `sep-${randomUUID()}`;
-    const payload = { src_audio_path: srcAudio, stem_type: params.stemType || 'all' };
+    const payload = { src_audio_path: srcAudio, stem_type: requestedStem };
     const ctx: Context = { kind: 'edit', params: { songId: params.songId, userAddress, task: 'extract', srcAudioUrl: srcAudio }, model: 'demucs-htdemucs', dispatch: payload };
     await setTaskContext(operationId, ctx);
     const response = await client.separate(payload, { idempotencyKey: operationId });
@@ -193,7 +205,7 @@ export class Service {
     return { ...await this.finalizeEditResult({ ...ctx.params, taskId }), taskId, songId: params.songId, task: 'extract' };
   }
 
-  async dispatchEditTask(params: Edit) {
+  async dispatchEditTask(params: Edit): Promise<any> {
     if (!taskSchema.safeParse(params.task).success) throw failure(`Invalid editing task '${params.task}'`);
     editSchema.parse(params);
     if (params.modelQuality && params.modelVariant && params.modelQuality !== params.modelVariant) throw failure('Conflicting modelQuality and modelVariant');
