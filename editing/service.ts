@@ -524,10 +524,16 @@ export class Service {
     const extractedTakes = ctx.extractedTakes ??= [];
     const save = async () => { await guarded(assertLease, () => setTaskContext(taskId, ctx)); };
     const entries = Object.entries(ctx.stems!);
+    const uploadedUrls = await Promise.all(
+      entries.map(async ([, rawUrl], index) => {
+        if (extracted[index]?.url) return extracted[index].url as string;
+        return guarded(assertLease, () => persistAudioToR2('versions', `stems/${id}-${index}.wav`, rawUrl));
+      })
+    );
     for (let index = 0; index < entries.length; index++) {
-      const [name, rawUrl] = entries[index];
+      const [name] = entries[index];
       if (!extracted[index]) {
-        const url = await guarded(assertLease, () => persistAudioToR2('versions', `stems/${id}-${index}.wav`, rawUrl));
+        const url = uploadedUrls[index];
         extracted[index] = await guarded(assertLease, () => createStem({ id: `stem-${ctx.params.songId}-${name}`, song_id: ctx.params.songId, name: name.toLowerCase(), url, waveform_peaks_url: null, volume: 1, pan: 0, is_muted: true, is_solo: false })); await save();
       }
       if (!extractedTakes[index]) {
