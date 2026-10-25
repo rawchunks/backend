@@ -45,23 +45,37 @@ def _public_url(src):
         raise RuntimeError('Source audio host could not be resolved') from exc
     if not answers or any(not ipaddress.ip_address(item[4][0]).is_global for item in answers):
         raise HTTPException(403,'Source audio URL must resolve to a public address')
-    return parsed, answers[0][4][0]
+    ordered = sorted(answers, key=lambda item: 0 if item[0] == socket.AF_INET else 1)
+    addresses = list(dict.fromkeys(item[4][0] for item in ordered))
+    return parsed, addresses
+
+def _connect_pinned(addresses, port, timeout=None, source_address=None):
+    candidates = [addresses] if isinstance(addresses, str) else list(addresses)
+    last_exc = None
+    for addr in candidates:
+        try:
+            return socket.create_connection((addr, port), timeout, source_address)
+        except OSError as exc:
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    raise OSError('No resolved address available for connection')
 
 class _PinnedHTTPHandler(urllib.request.HTTPHandler):
     def http_open(self,request):
-        parsed,address=_public_url(request.full_url)
+        parsed,addresses=_public_url(request.full_url)
         def connection(host,**kwargs):
             conn=http.client.HTTPConnection(host,**kwargs)
-            conn._create_connection=lambda target,timeout=None,source_address=None: socket.create_connection((address,parsed.port or 80),timeout,source_address)
+            conn._create_connection=lambda target,timeout=None,source_address=None: _connect_pinned(addresses,parsed.port or 80,timeout,source_address)
             return conn
         return self.do_open(connection,request)
 
 class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
     def https_open(self,request):
-        parsed,address=_public_url(request.full_url)
+        parsed,addresses=_public_url(request.full_url)
         def connection(host,**kwargs):
             conn=http.client.HTTPSConnection(host,**kwargs)
-            conn._create_connection=lambda target,timeout=None,source_address=None: socket.create_connection((address,parsed.port or 443),timeout,source_address)
+            conn._create_connection=lambda target,timeout=None,source_address=None: _connect_pinned(addresses,parsed.port or 443,timeout,source_address)
             return conn
         kwargs={'context':self._context}
         if hasattr(self,'_check_hostname'):kwargs['check_hostname']=self._check_hostname
