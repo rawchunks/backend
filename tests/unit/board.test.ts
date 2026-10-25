@@ -64,7 +64,7 @@ describe('master lanes', () => {
   });
   it('omits the repeated song title and category names from the track headers', () => {
     const html = render('master');
-    const master = html.slice(html.indexOf('class="board-row master'), html.indexOf('class="board-section-separator'));
+    const master = html.slice(html.indexOf('class="board-row master'), html.indexOf('class="board-stage-reference"'));
     expect(master).not.toContain('board-track-name');
     expect(html).not.toContain('class="board-track-name">EXTRACT');
     expect(html).not.toContain('class="board-track-name">TEXT2MUSIC');
@@ -96,8 +96,8 @@ describe('master lanes', () => {
   });
   it('places the selected lane first without changing the stored track order', () => {
     const html = render('stem-2', stems);
-    const lanes = html.slice(html.indexOf('class="board-section-separator'));
-    const trackIds = [...lanes.matchAll(/data-track-id="([^"]*)"/g)].map(match => match[1]);
+    const lanes = html.slice(html.indexOf('class="board-stage-focus"'));
+    const trackIds = [...lanes.matchAll(/data-track-id="([^"]*)"/g)].map(match => match[1]).filter(id => id !== 'master');
     expect(trackIds.slice(0, 3)).toEqual(['stem-2', 'stem-0', 'stem-1']);
     expect(useDawStore.getInitialState().tracks).toEqual(stems);
   });
@@ -138,7 +138,7 @@ describe('take mounting controls', () => {
     const baseline = {...takes[0],id:'merged',task:'merge',is_active:true};
     const master = {id:'master',type:'audio',clips:[{url:committed.url}]} as DAWTrack;
     const html = render('master',[master],[committed,consumed,baseline,takes[2]]);
-    const extracted = html.slice(html.indexOf('<span>EXTRACTED</span>'));
+    const extracted = html.slice(html.indexOf('class="board-stage-reference"'));
     expect(extracted).not.toContain('Category: EXTRACT, Take #2');
     expect(extracted).not.toContain('Category: TEXT2MUSIC');
     expect(extracted).toContain('Category: EXTRACT, Take #3');
@@ -162,7 +162,7 @@ describe('take mounting controls', () => {
     const track = { id: 'earlier', activeTakeId: 'earlier', name: 'Take #2', type: 'sample', muted: false,
       clips: [{id:'segment', url:'earlier.wav', startTime:10, offset:0, duration:5}] } as DAWTrack;
     const html = render('earlier', [track]);
-    const master = html.slice(html.indexOf('class="board-row master'), html.indexOf('class="board-section-separator'));
+    const master = html.slice(html.indexOf('class="board-row master'), html.indexOf('class="board-stage-matrix"'));
     expect(master).toContain('aria-label="Toggle Take #2 in master" aria-pressed="true"');
     expect(master).toContain('aria-label="Select Take #2 section" aria-pressed="true"');
     expect(master).toContain('left:16.666666666666664%;width:8.333333333333332%');
@@ -172,7 +172,7 @@ describe('take mounting controls', () => {
     expect(actions).toContain('aria-label="Toggle Take #2 section" aria-pressed="true"');
     expect(actions).toContain('class="board-overlay-player"');
     expect(actions).toContain('aria-label="Play selected audio for Take #2"');
-    const badges = master.slice(master.indexOf('aria-label="Mounted layer controls"'),master.indexOf('class="board-track-header-bottom"'));
+    const badges = master.slice(master.indexOf('aria-label="Mounted layer controls"'),master.indexOf('class="board-track-header-bottom'));
     expect(badges).not.toContain('>ORG</button>');
     expect(master).toContain('aria-label="Merge Take #2"');
     expect(master).toContain('aria-label="Merge all mounted sections"');
@@ -215,7 +215,7 @@ describe('take mounting controls', () => {
       provenance: { target: 'master', region: { start: 60, end: 90 }, outputDuration: 90 },
     };
     const unmountedHtml = render('master', [], [...takes, extendTake]);
-    const extracted = unmountedHtml.slice(unmountedHtml.indexOf('<span>EXTRACTED</span>'));
+    const extracted = unmountedHtml.slice(unmountedHtml.indexOf('class="board-stage-reference"'));
     expect(extracted).toContain('Category: EXTEND, Take #4');
     // Unmounted extend row scales by Math.max(totalDuration=60, takeRange.end=90) = 90 => left:66.666%, width:33.333% (not left:100%)
     expect(extracted).toContain('left:66.66666666666666%;width:33.33333333333333%');
@@ -226,7 +226,7 @@ describe('take mounting controls', () => {
       clips: [{ id: 'ext-clip', name: 'Take #4', url: 'ext.wav', startTime: 60, offset: 60, duration: 30 }],
     } as DAWTrack;
     const mountedHtml = render('ext-take', [mountedTrack], [...takes, extendTake]);
-    const master = mountedHtml.slice(mountedHtml.indexOf('class="board-row master'), mountedHtml.indexOf('class="board-section-separator'));
+    const master = mountedHtml.slice(mountedHtml.indexOf('class="board-row master'), mountedHtml.indexOf('class="board-stage-matrix"'));
     expect(master).toContain('aria-label="Select Take #4 section" aria-pressed="true"');
     expect(master).toContain('left:66.66666666666666%;width:33.33333333333333%');
     expect(master).toContain('aria-label="Merge Take #4"');
