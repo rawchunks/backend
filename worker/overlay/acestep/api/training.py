@@ -143,23 +143,26 @@ def cache_audio_file(store, file_path: str | Path, ttl_seconds: int = 900) -> No
         path = Path(file_path)
         if client is None or not path.is_file():
             return
+        file_size = path.stat().st_size
         origin = _pod_audio_origin()
-        if origin:
-            try:
-                client.set(f"rawchunks:worker:audio-owner:{path.name}", f"{origin}|{path}", ex=ttl_seconds)
-            except Exception:
-                pass
-        raw = path.read_bytes()
-        import base64
-        encoded = base64.b64encode(raw).decode("ascii")
 
         def _write_valkey() -> None:
+            if origin:
+                try:
+                    client.set(f"rawchunks:worker:audio-owner:{path.name}", f"{origin}|{path}", ex=ttl_seconds)
+                except Exception:
+                    pass
+            if file_size > 2 * 1024 * 1024:
+                return
             try:
+                import base64
+                raw = path.read_bytes()
+                encoded = base64.b64encode(raw).decode("ascii")
                 client.set(f"rawchunks:worker:audio:{path.name}", encoded, ex=ttl_seconds)
             except Exception:
                 pass
 
-        if len(raw) <= 256 * 1024:
+        if file_size <= 256 * 1024:
             _write_valkey()
         else:
             import threading
