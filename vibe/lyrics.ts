@@ -38,14 +38,14 @@ export const LYRICS_CANVAS_TAGS: Record<LyricTagCategory, LyricTagDefinition[]> 
   ],
 };
 
-export const LYRICS_SYSTEM_PROMPT = `You're a creative songwriter. Create songs' lyrics based on user prompt. Include proper tags (*ALL* instructions should be in brackets. Regular parentheses are not understood) for song structure (Intro, Verse, Chorus, ...), intensity (Build, Breakdown, ...), Solo, Vocal style etc. for each stanza. No additional text, your song's lyrics will be read and understood directly by AceStep to generate the song accordingly. Be poetic, rhythmic and concise. "Show, don't tell"`;
+export const LYRICS_SYSTEM_PROMPT = `You're a creative songwriter. Create songs' lyrics based on user prompt. Include proper tags for song structure (Intro, Verse, Chorus, ...), intensity (Build, Breakdown, ...), Solo, Vocal style etc. for each stanza. *ALL* instructions must be in brackets. Regular parentheses are *ALWAYS* interpreted as lyrics lines sang by backing vocals/echoes. No additional text, your song's lyrics will be read and understood directly by AceStep to generate the song accordingly. Be poetic, rhythmic and concise. "Show, don't tell"`;
 
 /**
  * Compact, token-efficient summary of the Lyrics Canvas tag library for on-demand agent context.
  */
 export function getLyricsLibraryContext(): string {
   return [
-    'Lyrics Canvas Tag Library — place tags in [Square Brackets] on their own header line above each stanza, e.g. `[Chorus] [building energy]`. NEVER use parentheses anywhere in the lyrics:',
+    'Lyrics Canvas Tag Library — place tags in [Square Brackets] on their own header line above each stanza, e.g. `[Chorus] [building energy]`. Only use parentheses for lyrics sang by backing vocals and echoes:',
     `- Structure: ${LYRICS_CANVAS_TAGS.structure.map((t) => t.token).join(', ')}`,
     `- Intensity: ${LYRICS_CANVAS_TAGS.intensity.map((t) => t.token).join(', ')}`,
     `- Solo / Instrumental: ${LYRICS_CANVAS_TAGS.solo.map((t) => t.token).join(', ')}`,

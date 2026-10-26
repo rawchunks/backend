@@ -25,6 +25,7 @@ const PORT = parseInt(process.env.PORT || '3005', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 
 const app = Fastify({
+  bodyLimit: 20 * 1024 * 1024,
   logger: {
     level: process.env.LOG_LEVEL || 'info',
   },

@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: api
-          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/backend@sha256:160b6d20039d879cecee3c072d2a3d31024c9d9de9ba15384db05d6d41693f8b
+          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/backend@sha256:d8b56eae08f8caf3c7846a4b386594f86b1377430109829a4f629a05a4e2e66c
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 3005
@@ -69,6 +69,11 @@ spec:
                 secretKeyRef:
                   name: backend-secrets
                   key: ELEVENLABS_API_KEY
+            - name: CARTESIA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: CARTESIA_API_KEY
             - name: RAWCHUNKS_TREASURY_ADDRESS
               valueFrom:
                 secretKeyRef:

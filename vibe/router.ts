@@ -12,6 +12,7 @@ import {
   normalizeLanguage,
 } from './parameters.js';
 import {
+  analyzeAudioVibe,
   runVibeAgentStream,
   streamSongLyrics,
   translateImageToSongPrompt,
@@ -22,20 +23,25 @@ export async function vibeRouter(fastify: FastifyInstance) {
   /**
    * POST /vibe (or /api/vibe)
    * General Songwriter Agent endpoint — gated by x402 ($0.02 USDC / 2 Credits).
-   * Accepts a text prompt, an image (translated via nvidia/Nemotron-3.5-Super-VL), or both.
+   * Accepts a text prompt, an image (translated via nvidia/Nemotron-3.5-Super-VL),
+   * a hum/voice recording (DSP features + Instant STT), or any combination.
    * Streams NDJSON field updates in real-time to populate the /studio form.
    */
   fastify.post<{
     Body: {
       prompt?: string;
       image?: string;
+      audio?: string;
       modelVariant?: 'turbo' | 'sft';
     };
   }>('/', { preHandler: [requireSessionPayment(PRICING.vibe)] }, async (request, reply) => {
     const prompt = request.body?.prompt?.trim() || '';
     const image = request.body?.image?.trim() || '';
-    if (prompt.length < 2 && !image) {
-      return reply.code(400).send({ error: 'Provide a text prompt (min 2 chars) or attach an image' });
+    const audio = request.body?.audio?.trim() || '';
+    if (prompt.length < 2 && !image && !audio) {
+      return reply
+        .code(400)
+        .send({ error: 'Provide a text prompt (min 2 chars), attach an image, or record a voice/hum clip' });
     }
 
     const stream = new PassThrough();
@@ -50,6 +56,7 @@ export async function vibeRouter(fastify: FastifyInstance) {
         await runVibeAgentStream({
           userPrompt: prompt,
           image: image || undefined,
+          audio: audio || undefined,
           emit,
         });
       } catch (err: any) {
@@ -73,6 +80,27 @@ export async function vibeRouter(fastify: FastifyInstance) {
    * Nested free per-action endpoints (/vibe/*)
    * Allow inspecting modular libraries or executing individual songwriter actions.
    */
+  fastify.post<{
+    Body: {
+      audio: string;
+      prompt?: string;
+    };
+  }>('/audio', async (request, reply) => {
+    const audio = request.body?.audio?.trim();
+    if (!audio) {
+      return reply.code(400).send({ error: 'audio is required' });
+    }
+    try {
+      const analysis = await analyzeAudioVibe({
+        audio,
+        userPrompt: request.body?.prompt,
+      });
+      return analysis;
+    } catch (err: any) {
+      request.log.error(err, '[VibeRouter] Audio vibe analysis failed');
+      return reply.code(502).send({ error: err?.message || 'Audio vibe analysis failed' });
+    }
+  });
   fastify.post<{
     Body: {
       image: string;

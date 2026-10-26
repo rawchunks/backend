@@ -1,4 +1,5 @@
 import { generateCoverArt } from '../generation/router.js';
+import { analyzeAudioVibe, type AudioVibeAnalysis } from './audio.js';
 import { LYRICS_CANVAS_TAGS, LYRICS_SYSTEM_PROMPT, getLyricsLibraryContext } from './lyrics.js';
 import { STYLE_TAGS_LIBRARY, getStylesLibraryContext, normalizeStyleTags } from './styles.js';
 import {
@@ -426,24 +427,55 @@ export async function translateImageToSongPrompt(params: {
 export async function runVibeAgentStream(params: {
   userPrompt?: string;
   image?: string;
+  audio?: string;
   emit: (event: VibeStreamEvent) => void;
   signal?: AbortSignal;
 }): Promise<void> {
   const { emit, signal } = params;
   const rawUserPrompt = (params.userPrompt || '').trim();
   const attachedImage = (params.image || '').trim();
+  const attachedAudio = (params.audio || '').trim();
 
   let effectivePrompt = rawUserPrompt;
+  let audioAnalysis: AudioVibeAnalysis | null = null;
 
-  if (attachedImage) {
-    emit({ type: 'status', step: 'Translating image into song prompt...' });
-    const translatedPrompt = await translateImageToSongPrompt({
-      image: attachedImage,
-      userPrompt: rawUserPrompt || undefined,
-      signal,
+  if (attachedImage || attachedAudio) {
+    emit({
+      type: 'status',
+      step:
+        attachedImage && attachedAudio
+          ? 'Analyzing image and voice/hum vibe...'
+          : attachedAudio
+            ? 'Analyzing voice/hum rhythm, mood, and words...'
+            : 'Translating image into song prompt...',
     });
-    if (translatedPrompt) {
-      effectivePrompt = rawUserPrompt ? `${rawUserPrompt} — ${translatedPrompt}` : translatedPrompt;
+
+    const [translatedImagePrompt, analyzedAudio] = await Promise.all([
+      attachedImage
+        ? translateImageToSongPrompt({
+          image: attachedImage,
+          userPrompt: rawUserPrompt || undefined,
+          signal,
+        })
+        : Promise.resolve(''),
+      attachedAudio
+        ? analyzeAudioVibe({
+          audio: attachedAudio,
+          userPrompt: rawUserPrompt || undefined,
+          signal,
+        })
+        : Promise.resolve(null),
+    ]);
+
+    audioAnalysis = analyzedAudio;
+
+    const parts: string[] = [];
+    if (rawUserPrompt && !analyzedAudio) parts.push(rawUserPrompt);
+    if (translatedImagePrompt) parts.push(translatedImagePrompt);
+    if (analyzedAudio?.prompt) parts.push(analyzedAudio.prompt);
+
+    if (parts.length > 0) {
+      effectivePrompt = parts.join(' — ');
       emit({ type: 'field', field: 'prompt', value: effectivePrompt });
     }
   }
@@ -452,13 +484,21 @@ export async function runVibeAgentStream(params: {
     title: '',
     prompt: effectivePrompt,
     instrumental: false,
-    vocalLanguage: 'en',
+    vocalLanguage:
+      audioAnalysis?.stt?.isLexical && audioAnalysis?.stt?.language
+        ? normalizeLanguage(audioAnalysis.stt.language)
+        : 'en',
     tags: [] as string[],
-    bpm: 120,
-    keyScale: 'A minor',
+    bpm: audioAnalysis?.features?.bpm || 120,
+    keyScale: audioAnalysis?.features?.keyScale || 'A minor',
     audioDuration: 120,
     coverTriggered: false,
   };
+
+  if (audioAnalysis?.features) {
+    emit({ type: 'field', field: 'bpm', value: state.bpm });
+    emit({ type: 'field', field: 'keyScale', value: state.keyScale });
+  }
 
   let coverPromise: Promise<void> | null = null;
 
@@ -650,4 +690,5 @@ export {
   LYRICS_CANVAS_TAGS,
   STYLE_TAGS_LIBRARY,
   PARAMETERS_LIBRARY,
+  analyzeAudioVibe,
 };
