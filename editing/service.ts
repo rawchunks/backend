@@ -733,18 +733,23 @@ export class Service {
     options?: { mode?: 'extract' | 'align'; lyrics?: string }
   ) {
     const stems = await listStemsBySong(songId);
-    const vocalsStem = stems.find((s) => s.name.toLowerCase() === 'vocals');
-    if (!vocalsStem?.url) {
-      throw failure('Extract stems first so Scribe can process the isolated vocals lane', 409);
+    const vocalsStem = stems.find((s) => s.name.toLowerCase() === 'vocals' && s.url);
+    const masterStem =
+      stems.find((s) => s.name.toLowerCase() === 'master' && s.url) ||
+      stems.find((s) => Boolean(s.url));
+    const song = !vocalsStem?.url && !masterStem?.url ? await getSongById(songId) : null;
+    const targetAudioUrl = vocalsStem?.url || masterStem?.url || song?.url;
+    if (!targetAudioUrl) {
+      throw failure('No audio available for lyrics processing', 409);
     }
     const mode = options?.mode ?? (options?.lyrics?.trim() ? 'align' : 'extract');
     const res =
       mode === 'align'
-        ? await alignVocalStemLyrics(songId, options?.lyrics, vocalsStem.url, {
+        ? await alignVocalStemLyrics(songId, options?.lyrics, targetAudioUrl, {
             force: true,
             languageCode: vocalLanguage,
           })
-        : await transcribeVocalStemOnce(songId, vocalsStem.url, {
+        : await transcribeVocalStemOnce(songId, targetAudioUrl, {
             force: true,
             languageCode: vocalLanguage,
           });

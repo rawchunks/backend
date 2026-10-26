@@ -6,6 +6,7 @@ import { createSong, finalizeSong, getSongById, countUntitledSongsByCreator } fr
 import { addSongToAlbum } from '../databases/albums.js';
 import { resolveVoice } from '../voice/service.js';
 import { persistAudioToR2 } from '../storage/r2.js';
+import { alignVocalStemLyrics, transcribeVocalStemOnce } from '../editing/scribe.js';
 
 export interface Generate {
   creatorAddress: string;
@@ -192,6 +193,22 @@ export class Service {
         provenance: { taskId, sourceUrl: url, sourceTakeId: null, sourceDuration: ctx.durations?.[index] ?? null, target: 'master' as const, targetStemId: master.id, region: null, outputDuration: ctx.durations?.[index] ?? null, parameters: { submitted: ctx.submitted ?? ctx.dispatch ?? {}, resolved: ctx.metas?.[index] ?? {}, ...(ctx.voice ? { voice: ctx.voice } : {}) } },
       }));
       await guarded(assertLease, () => finalizeSong(songId, outputs, master, versions));
+      const isInstrumental = Boolean(ctx.submitted?.instrumental ?? ctx.dispatch?.instrumental);
+      const primaryLyrics = (ctx.lyrics || ctx.metas?.[0]?.lyrics || '').trim();
+      const vocalLanguage = ctx.submitted?.vocalLanguage || ctx.dispatch?.vocal_language || 'en';
+      if (!isInstrumental && audioUrls[0]) {
+        if (primaryLyrics && primaryLyrics.toLowerCase() !== '[instrumental]') {
+          void alignVocalStemLyrics(songId, primaryLyrics, audioUrls[0], {
+            languageCode: vocalLanguage,
+            force: true,
+          });
+        } else {
+          void transcribeVocalStemOnce(songId, audioUrls[0], {
+            languageCode: vocalLanguage,
+            force: true,
+          });
+        }
+      }
       ctx.result = {
         status: 'ready', progress: 100, primaryUrl: audioUrls[0], audioUrls: ctx.audioUrls, songAId: songId,
         ...(urls.length > 1 ? { songBId: `${songId}-var2` } : {}), duration: ctx.durations?.[0], durations: ctx.durations, metas: ctx.metas,

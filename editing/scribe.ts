@@ -1,6 +1,8 @@
 import { valkey } from '../broker/valkey.js';
+import { getSongById } from '../databases/songs.js';
 import { listStemsBySong } from '../databases/stems.js';
 import { listTakesBySong, updateTakeLyrics } from '../databases/takes.js';
+import type { Stem } from '../databases/schema/stems.js';
 import type {
   Take,
   TakeProvenance,
@@ -66,13 +68,18 @@ function isMeaningfulLyrics(lyrics?: string | null): boolean {
   return true;
 }
 
+function isBracketOnlyLine(lineText: string): boolean {
+  return /^\s*(?:\[[^\]]*\]\s*)+$/.test(lineText);
+}
+
 function isValidAlignment(candidate: any): candidate is LyricsAlignment {
   return (
     Boolean(candidate) &&
     typeof candidate === 'object' &&
     Array.isArray(candidate.lines) &&
     candidate.lines.length > 0 &&
-    Array.isArray(candidate.words)
+    Array.isArray(candidate.words) &&
+    candidate.lines.some((l: any) => typeof l?.start === 'number' && Number.isFinite(l.start))
   );
 }
 
@@ -83,16 +90,20 @@ function extractStoredLyricsAndLang(
   lyrics: string;
   vocalLanguage: string;
   alignment: LyricsAlignment | null;
+  alignmentSource: 'vocals' | 'master' | null;
   alreadyTranscribed: boolean;
   alreadyAligned: boolean;
   fromScribe: boolean;
+  isInstrumental: boolean;
 } {
   let authoritativeLang = preferredLanguage ? normalizeLanguageCode(preferredLanguage) : '';
   let scribeLang = '';
   let alreadyTranscribed = false;
   let alreadyAligned = false;
   let hasSubmittedLyrics = false;
+  let isInstrumental = false;
   let alignment: LyricsAlignment | null = null;
+  let alignmentSource: 'vocals' | 'master' | null = null;
 
   const priorityTakes = [
     ...takes.filter((t) => t.is_active),
@@ -119,6 +130,13 @@ function extractStoredLyricsAndLang(
     if (isMeaningfulLyrics(submitted.lyrics)) {
       hasSubmittedLyrics = true;
     }
+    if (
+      submitted.instrumental === true ||
+      resolved.instrumental === true ||
+      (typeof take.lyrics === 'string' && take.lyrics.trim().toLowerCase() === '[instrumental]')
+    ) {
+      isInstrumental = true;
+    }
     if (params.scribeTranscribed === true) {
       alreadyTranscribed = true;
     }
@@ -128,6 +146,10 @@ function extractStoredLyricsAndLang(
     if (!alignment && isValidAlignment(params.lyricsAlignment)) {
       alignment = params.lyricsAlignment;
       alreadyAligned = true;
+      alignmentSource =
+        params.lyricsAlignmentSource === 'vocals' || params.lyricsAlignmentSource === 'master'
+          ? params.lyricsAlignmentSource
+          : 'vocals';
     }
   }
 
@@ -140,9 +162,11 @@ function extractStoredLyricsAndLang(
         lyrics: take.lyrics!.trim(),
         vocalLanguage: detectedLang,
         alignment,
+        alignmentSource,
         alreadyTranscribed: true,
         alreadyAligned,
         fromScribe,
+        isInstrumental: false,
       };
     }
     const params = (take.provenance?.parameters ?? {}) as Record<string, any>;
@@ -152,9 +176,11 @@ function extractStoredLyricsAndLang(
         lyrics: String(storedLyrics).trim(),
         vocalLanguage: detectedLang,
         alignment,
+        alignmentSource,
         alreadyTranscribed: true,
         alreadyAligned,
         fromScribe,
+        isInstrumental: false,
       };
     }
   }
@@ -163,9 +189,11 @@ function extractStoredLyricsAndLang(
     lyrics: '',
     vocalLanguage: detectedLang,
     alignment,
+    alignmentSource,
     alreadyTranscribed,
     alreadyAligned,
     fromScribe,
+    isInstrumental,
   };
 }
 
@@ -398,8 +426,8 @@ export function buildForcedAlignmentLines(
   if (rawLines.length === 0) return null;
 
   const parsedLines = rawLines.map((lineText) => {
-    const isTag = /^\s*\[[^\]]+\]\s*$/.test(lineText);
-    const sungText = isTag ? '' : lineText.replace(/\[[^\]]+\]/g, ' ').trim();
+    const isTag = isBracketOnlyLine(lineText);
+    const sungText = isTag ? '' : lineText.replace(/\[[^\]]*\]/g, ' ').trim();
     const expectedWords = sungText ? sungText.split(/\s+/).filter(Boolean) : [];
     const expectedCharLen = normalizeMatchChars(sungText).length;
     return {
@@ -463,29 +491,15 @@ export function buildForcedAlignmentLines(
       }
     }
 
-    const phraseChunks = splitWordsIntoAlignedPhrases(lineWords);
-    if (phraseChunks.length === 1) {
-      const chunk = phraseChunks[0];
-      lines.push({
-        index: lines.length,
-        text: item.text,
-        isTag: false,
-        start: chunk.length > 0 ? chunk[0].start : null,
-        end: chunk.length > 0 ? chunk[chunk.length - 1].end : null,
-        words: chunk,
-      });
-    } else {
-      for (const chunk of phraseChunks) {
-        lines.push({
-          index: lines.length,
-          text: chunk.map((cw) => cw.text).join(' '),
-          isTag: false,
-          start: chunk.length > 0 ? chunk[0].start : null,
-          end: chunk.length > 0 ? chunk[chunk.length - 1].end : null,
-          words: chunk,
-        });
-      }
-    }
+    const sanitizedWords = sanitizeAlignedLineWords(lineWords);
+    lines.push({
+      index: lines.length,
+      text: item.text,
+      isTag: false,
+      start: sanitizedWords.length > 0 ? sanitizedWords[0].start : null,
+      end: sanitizedWords.length > 0 ? sanitizedWords[sanitizedWords.length - 1].end : null,
+      words: sanitizedWords,
+    });
   }
 
   // Attach timestamps to structural [Section] tags based on adjacent sung lines
@@ -521,7 +535,8 @@ function buildUpdatedProvenance(
   lyrics: string,
   vocalLanguage: string,
   alignment: LyricsAlignment | null,
-  alignedAttempted = false
+  alignedAttempted = false,
+  alignmentSource: 'vocals' | 'master' = 'vocals'
 ): TakeProvenance {
   const base: TakeProvenance = existing ?? {
     taskId: `scribe-${songId}`,
@@ -544,10 +559,59 @@ function buildUpdatedProvenance(
       scribeLanguage: vocalLanguage,
       vocalLanguage: vocalLanguage || existingParams.vocalLanguage,
       ...(lyrics ? { transcribedLyrics: lyrics } : {}),
-      ...(alignment ? { lyricsAlignment: alignment, lyricsAlignedAttempted: true } : existingParams.lyricsAlignment ? { lyricsAlignment: existingParams.lyricsAlignment } : {}),
+      ...(alignment
+        ? {
+            lyricsAlignment: alignment,
+            lyricsAlignedAttempted: true,
+            lyricsAlignmentSource: alignmentSource,
+          }
+        : existingParams.lyricsAlignment
+          ? {
+              lyricsAlignment: existingParams.lyricsAlignment,
+              lyricsAlignmentSource: existingParams.lyricsAlignmentSource || alignmentSource,
+            }
+          : {}),
       ...(alignedAttempted ? { lyricsAlignedAttempted: true } : {}),
     },
   };
+}
+
+async function resolveBestVocalOrMasterAudioUrl(
+  songId: string,
+  stems: Stem[],
+  takes: Take[],
+  explicitUrl?: string
+): Promise<{ url: string; sourceKind: 'vocals' | 'master'; vocalsStem?: Stem } | null> {
+  const vocalsStem = stems.find((s) => s.name.toLowerCase() === 'vocals' && s.url);
+  if (vocalsStem?.url) {
+    return { url: vocalsStem.url, sourceKind: 'vocals', vocalsStem };
+  }
+  if (explicitUrl) {
+    const isVocalsExplicit = stems.some((s) => s.url === explicitUrl && s.name.toLowerCase() === 'vocals');
+    return {
+      url: explicitUrl,
+      sourceKind: isVocalsExplicit ? 'vocals' : 'master',
+      vocalsStem,
+    };
+  }
+  const masterStem =
+    stems.find((s) => s.name.toLowerCase() === 'master' && s.url) ||
+    stems.find((s) => Boolean(s.url));
+  if (masterStem?.url) {
+    return { url: masterStem.url, sourceKind: 'master' };
+  }
+  const activeTake =
+    takes.find((t) => t.is_active && t.url) ||
+    takes.find((t) => t.task === 'text2music' && t.url) ||
+    takes.find((t) => Boolean(t.url));
+  if (activeTake?.url) {
+    return { url: activeTake.url, sourceKind: 'master' };
+  }
+  const song = await getSongById(songId).catch(() => null);
+  if (song?.url) {
+    return { url: song.url, sourceKind: 'master' };
+  }
+  return null;
 }
 
 export interface TranscribeVocalOptions {
@@ -653,8 +717,8 @@ export function prepareVocalStemWavForElevenLabs(buffer: Buffer): Buffer {
 }
 
 /**
- * Asynchronously transcribes ONLY the isolated vocals stem for a song at most ONCE
- * (unless force=true) using ElevenLabs Scribe v2 (scribe_v2) with word-level timestamps
+ * Asynchronously transcribes the isolated vocals stem (or falls back to the master mix)
+ * for a song using ElevenLabs Scribe v2 (scribe_v2) with word-level timestamps
  * and caches both lyrics and LyricsAlignment on the song's takes in DB.
  */
 export async function transcribeVocalStemOnce(
@@ -668,11 +732,15 @@ export async function transcribeVocalStemOnce(
   const lockKey = `rawchunks:scribe:lock:${songId}`;
   if (!options?.force && inFlightSongs.has(songId)) return null;
 
-  const takes = await listTakesBySong(songId);
+  const [takes, stems] = await Promise.all([listTakesBySong(songId), listStemsBySong(songId)]);
   const existing = extractStoredLyricsAndLang(takes, options?.languageCode);
   const targetLang = normalizeLanguageCode(options?.languageCode || existing.vocalLanguage || 'en');
 
-  if (!options?.force && (existing.alreadyTranscribed || existing.lyrics)) {
+  const resolvedAudio = await resolveBestVocalOrMasterAudioUrl(songId, stems, takes, explicitVocalsStemUrl);
+  const canUpgradeToVocalsStem =
+    resolvedAudio?.sourceKind === 'vocals' && existing.alignmentSource === 'master';
+
+  if (!options?.force && !canUpgradeToVocalsStem && (existing.alreadyTranscribed || existing.lyrics)) {
     if (existing.lyrics && !existing.alignment && !existing.alreadyAligned) {
       if (existing.fromScribe) {
         return transcribeVocalStemOnce(songId, explicitVocalsStemUrl, {
@@ -690,13 +758,21 @@ export async function transcribeVocalStemOnce(
     };
   }
 
-  // Strictly require an isolated vocals stem — NEVER pass the full mixed song to Scribe.
-  const stems = await listStemsBySong(songId);
-  const vocalsStem = stems.find((s) => s.name.toLowerCase() === 'vocals');
-  const vocalsUrl = explicitVocalsStemUrl || vocalsStem?.url;
-  if (!vocalsUrl) {
+  // If the song already has user/songwriter lyrics and we are upgrading from master to vocals stem,
+  // use forced alignment instead of overwriting lyrics with STT.
+  if (canUpgradeToVocalsStem && existing.lyrics && !existing.fromScribe && !options?.force) {
+    return alignVocalStemLyrics(songId, existing.lyrics, resolvedAudio?.url, {
+      ...options,
+      force: true,
+      languageCode: targetLang,
+    });
+  }
+
+  if (!resolvedAudio?.url) {
     return null;
   }
+
+  const { url: vocalsUrl, sourceKind, vocalsStem } = resolvedAudio;
 
   if (!options?.force) {
     const lockAcquired = await valkey.set(lockKey, '1', 'EX', 180, 'NX').catch(() => 'OK');
@@ -767,7 +843,8 @@ export async function transcribeVocalStemOnce(
           formattedLyrics,
           vocalLanguage,
           alignment,
-          true
+          true,
+          sourceKind
         );
         return updateTakeLyrics(take.id, songId, nextLyrics, nextProv);
       })
@@ -784,8 +861,8 @@ export async function transcribeVocalStemOnce(
 }
 
 /**
- * Aligns known/edited lyrics against the isolated vocals stem using ElevenLabs
- * Forced Alignment API (`POST /v1/forced-alignment`), preserving [Section] tags.
+ * Aligns known/edited lyrics against the isolated vocals stem (or master mix fallback)
+ * using ElevenLabs Forced Alignment API (`POST /v1/forced-alignment`), preserving [Section] tags.
  */
 export async function alignVocalStemLyrics(
   songId: string,
@@ -808,7 +885,11 @@ export async function alignVocalStemLyrics(
     return transcribeVocalStemOnce(songId, explicitVocalsStemUrl, options);
   }
 
-  if (!options?.force && existing.alignment && existing.lyrics === rawLyrics) {
+  const resolvedAudio = await resolveBestVocalOrMasterAudioUrl(songId, stems, takes, explicitVocalsStemUrl);
+  const canUpgradeToVocalsStem =
+    resolvedAudio?.sourceKind === 'vocals' && existing.alignmentSource === 'master';
+
+  if (!options?.force && !canUpgradeToVocalsStem && existing.alignment && existing.lyrics === rawLyrics) {
     return {
       lyrics: rawLyrics,
       vocalLanguage: targetLang,
@@ -816,19 +897,18 @@ export async function alignVocalStemLyrics(
     };
   }
 
-  // Strictly require an isolated vocals stem — NEVER pass the full mixed song.
-  const vocalsStem = stems.find((s) => s.name.toLowerCase() === 'vocals');
-  const vocalsUrl = explicitVocalsStemUrl || vocalsStem?.url;
-  if (!vocalsUrl) {
+  if (!resolvedAudio?.url) {
     return null;
   }
+
+  const { url: vocalsUrl, sourceKind, vocalsStem } = resolvedAudio;
 
   // Strip structural [Section] tags before sending text to /v1/forced-alignment
   const sungLines = rawLyrics
     .split(/\r?\n/)
     .map((l) => l.trim())
-    .filter((l) => l.length > 0 && !/^\s*\[[^\]]+\]\s*$/.test(l))
-    .map((l) => l.replace(/\[[^\]]+\]/g, ' ').trim())
+    .filter((l) => l.length > 0 && !isBracketOnlyLine(l))
+    .map((l) => l.replace(/\[[^\]]*\]/g, ' ').trim())
     .filter(Boolean);
 
   const cleanSungText = sungLines.join('\n').trim();
@@ -874,10 +954,7 @@ export async function alignVocalStemLyrics(
     };
 
     const alignment = buildForcedAlignmentLines(rawLyrics, payload.words);
-    const alignedLyricsText =
-      alignment && alignment.lines.length > 0
-        ? alignment.lines.map((l) => l.text).join('\n').trim()
-        : rawLyrics;
+    const alignedLyricsText = rawLyrics;
 
     const currentTakes = await listTakesBySong(songId);
     const targets = currentTakes.filter(
@@ -898,7 +975,8 @@ export async function alignVocalStemLyrics(
           alignedLyricsText,
           targetLang,
           alignment,
-          true
+          true,
+          sourceKind
         );
         return updateTakeLyrics(take.id, songId, nextLyrics, nextProv);
       })
@@ -923,7 +1001,7 @@ export async function getSongLyricsStatus(
   alignment: LyricsAlignment | null;
   status: 'cached' | 'transcribing' | 'aligning' | 'none';
 }> {
-  const takes = await listTakesBySong(songId);
+  const [takes, stems] = await Promise.all([listTakesBySong(songId), listStemsBySong(songId)]);
   const existing = extractStoredLyricsAndLang(takes, preferredLanguage);
   const targetLang = normalizeLanguageCode(preferredLanguage || existing.vocalLanguage || 'en');
 
@@ -950,12 +1028,64 @@ export async function getSongLyricsStatus(
     };
   }
 
-  if (existing.lyrics || existing.alreadyTranscribed) {
+  const hasVocalsStem = stems.some((s) => s.name.toLowerCase() === 'vocals' && Boolean(s.url));
+  const hasAnyAudio =
+    hasVocalsStem ||
+    stems.some((s) => Boolean(s.url)) ||
+    takes.some((t) => Boolean(t.url));
+  const canUpgradeToVocalsStem = hasVocalsStem && existing.alignmentSource === 'master';
+
+  if (existing.lyrics) {
+    if (hasAnyAudio && ((!existing.alignment && !existing.alreadyAligned) || canUpgradeToVocalsStem)) {
+      void alignVocalStemLyrics(songId, existing.lyrics, undefined, {
+        languageCode: targetLang,
+        force: canUpgradeToVocalsStem,
+      });
+      return {
+        lyrics: existing.lyrics,
+        vocalLanguage: existing.vocalLanguage || targetLang,
+        alignment: existing.alignment,
+        status: 'aligning',
+      };
+    }
     return {
       lyrics: existing.lyrics,
       vocalLanguage: existing.vocalLanguage || targetLang,
       alignment: existing.alignment,
       status: 'cached',
+    };
+  }
+
+  if (existing.alreadyTranscribed) {
+    if (canUpgradeToVocalsStem && !existing.isInstrumental) {
+      void transcribeVocalStemOnce(songId, undefined, {
+        languageCode: targetLang,
+        force: true,
+      });
+      return {
+        lyrics: existing.lyrics,
+        vocalLanguage: existing.vocalLanguage || targetLang,
+        alignment: existing.alignment,
+        status: 'transcribing',
+      };
+    }
+    return {
+      lyrics: existing.lyrics,
+      vocalLanguage: existing.vocalLanguage || targetLang,
+      alignment: existing.alignment,
+      status: 'cached',
+    };
+  }
+
+  if (!existing.isInstrumental && hasAnyAudio) {
+    void transcribeVocalStemOnce(songId, undefined, {
+      languageCode: targetLang,
+    });
+    return {
+      lyrics: '',
+      vocalLanguage: targetLang,
+      alignment: null,
+      status: 'transcribing',
     };
   }
 

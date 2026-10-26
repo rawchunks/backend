@@ -154,3 +154,33 @@ test('prepareVocalStemWavForElevenLabs downsamples 48kHz stereo 16-bit WAV to 16
   assert.ok(downsampled.length < buf.length / 5); // 6x smaller
 });
 
+test('buildForcedAlignmentLines treats multi-bracket tag lines as tags and preserves 1-to-1 line breaks', () => {
+  const rawLyrics = `[Verse 1] [Intimate Vocal]
+Walking through the neon rain, shadows call my name`;
+
+  const alignedTokens = [
+    { text: 'Walking', start: 1.0, end: 1.4, loss: 0.01 },
+    { text: 'through', start: 1.45, end: 1.8, loss: 0.01 },
+    { text: 'the', start: 1.85, end: 2.0, loss: 0.01 },
+    { text: 'neon', start: 2.05, end: 2.5, loss: 0.01 },
+    { text: 'rain,', start: 2.55, end: 3.1, loss: 0.01 },
+    { text: 'shadows', start: 4.3, end: 4.8, loss: 0.01 },
+    { text: 'call', start: 4.85, end: 5.2, loss: 0.01 },
+    { text: 'my', start: 5.25, end: 5.5, loss: 0.01 },
+    { text: 'name', start: 5.55, end: 6.1, loss: 0.01 },
+  ];
+
+  const alignment = buildForcedAlignmentLines(rawLyrics, alignedTokens);
+  assert.ok(alignment);
+  assert.equal(alignment.lines.length, 2);
+  assert.equal(alignment.lines[0].text, '[Verse 1] [Intimate Vocal]');
+  assert.equal(alignment.lines[0].isTag, true);
+  assert.equal(alignment.lines[0].start, 1.0);
+  assert.equal(alignment.lines[1].text, 'Walking through the neon rain, shadows call my name');
+  assert.equal(alignment.lines[1].isTag, false);
+  assert.equal(alignment.lines[1].start, 1.0);
+  assert.equal(alignment.lines[1].end, 6.1);
+  assert.equal(alignment.lines[1].words.length, 9);
+});
+
+
