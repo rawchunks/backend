@@ -15,33 +15,50 @@ export const valkey = new Redis(uri, {
 });
 valkey.on('error', err => console.warn('[Valkey]', err.message));
 
-const isTestValkey = process.env.VALKEY_URI === 'redis://127.0.0.1:1';
+const isTestValkey = uri.startsWith('redis://127.0.0.1:');
 const wipsUri = !isTestValkey
   ? (process.env.VALKEY_WIPS_SERVICE_URI ||
-      (process.env.VALKEY_WIPS_HOST
-        ? `rediss://default:${encodeURIComponent(process.env.VALKEY_WIPS_PASSWORD || '')}@${process.env.VALKEY_WIPS_HOST}:24348`
-        : uri))
+    (process.env.VALKEY_WIPS_HOST
+      ? `rediss://default:${encodeURIComponent(process.env.VALKEY_WIPS_PASSWORD || '')}@${process.env.VALKEY_WIPS_HOST}:24348`
+      : uri))
   : uri;
 const wipsReplicaUri = !isTestValkey ? (process.env.VALKEY_WIPS_REPLICA_URI || wipsUri) : uri;
 export const valkeyWips = wipsUri !== uri
   ? new Redis(wipsUri, {
-      maxRetriesPerRequest: 3, connectTimeout: 10000, commandTimeout: 10000,
-      retryStrategy: times => Math.min(times * 100, 3000),
-      tls: wipsUri.startsWith('rediss://') ? { rejectUnauthorized: true } : undefined,
-    })
+    maxRetriesPerRequest: 3, connectTimeout: 10000, commandTimeout: 10000,
+    retryStrategy: times => Math.min(times * 100, 3000),
+    tls: wipsUri.startsWith('rediss://') ? { rejectUnauthorized: true } : undefined,
+  })
   : valkey;
 if (valkeyWips !== valkey) {
   valkeyWips.on('error', err => console.warn('[Valkey]', err.message));
 }
 export const valkeyWipsReader = wipsReplicaUri !== wipsUri
   ? new Redis(wipsReplicaUri, {
-      maxRetriesPerRequest: 3, connectTimeout: 10000, commandTimeout: 10000,
-      retryStrategy: times => Math.min(times * 100, 3000),
-      tls: wipsReplicaUri.startsWith('rediss://') ? { rejectUnauthorized: true } : undefined,
-    })
+    maxRetriesPerRequest: 3, connectTimeout: 10000, commandTimeout: 10000,
+    retryStrategy: times => Math.min(times * 100, 3000),
+    tls: wipsReplicaUri.startsWith('rediss://') ? { rejectUnauthorized: true } : undefined,
+  })
   : valkeyWips;
 if (valkeyWipsReader !== valkeyWips) {
   valkeyWipsReader.on('error', err => console.warn('[Valkey]', err.message));
+}
+
+const cacheUri = !isTestValkey
+  ? (process.env.VALKEY_CACHE_SERVICE_URI ||
+    (process.env.VALKEY_CACHE_HOST
+      ? `rediss://default:${encodeURIComponent(process.env.VALKEY_CACHE_PASSWORD || '')}@${process.env.VALKEY_CACHE_HOST}:24348`
+      : uri))
+  : uri;
+export const valkeyCache = cacheUri !== uri
+  ? new Redis(cacheUri, {
+    maxRetriesPerRequest: 2, connectTimeout: 5000, commandTimeout: 3000,
+    retryStrategy: times => Math.min(times * 100, 3000),
+    tls: cacheUri.startsWith('rediss://') ? { rejectUnauthorized: true } : undefined,
+  })
+  : valkey;
+if (valkeyCache !== valkey) {
+  valkeyCache.on('error', err => console.warn('[Valkey Cache]', err.message));
 }
 
 export const WIP_TTL_SECONDS = 168 * 3600; // 7 days (168 hours)
@@ -97,7 +114,7 @@ export async function getWipState(songId: string): Promise<SongWipState | null> 
   try {
     const parsed = JSON.parse(raw) as SongWipState;
     if (!parsed || typeof parsed !== 'object' || parsed.songId !== songId) return null;
-    valkeyWips.expire(key, WIP_TTL_SECONDS).catch(() => {});
+    valkeyWips.expire(key, WIP_TTL_SECONDS).catch(() => { });
     return parsed;
   } catch {
     return null;
@@ -122,8 +139,9 @@ export async function deleteWipState(songId: string): Promise<boolean> {
 }
 
 export async function closeWips(): Promise<void> {
-  if (valkeyWipsReader !== valkeyWips) await valkeyWipsReader.quit().catch(() => {});
-  await valkeyWips.quit().catch(() => {});
+  if (valkeyWipsReader !== valkeyWips) await valkeyWipsReader.quit().catch(() => { });
+  if (valkeyWips !== valkey) await valkeyWips.quit().catch(() => { });
+  if (valkeyCache !== valkey && valkeyCache !== valkeyWips) await valkeyCache.quit().catch(() => { });
 }
 export interface TaskJob {
   id: string;
@@ -339,7 +357,7 @@ export async function closeSubscriptions(): Promise<void> {
 }
 
 function peakCacheKey(url: string): string {
-  return `rawchunks:peaks:v1:${url}`;
+  return `rawchunks:peaks:${url}`;
 }
 
 export async function getCachedPeaks(
