@@ -2,13 +2,18 @@ import { randomUUID } from 'node:crypto';
 import { userSql, songSql } from './client.js';
 import type { FastifyRequest } from 'fastify';
 import { getSongById } from './songs.js';
+import { verifyCachedTokenAddress } from '../credits/auth.js';
+import { cacheGet, cacheMGet, cacheSet, singleFlight } from './cache.js';
 
 export const STARTER_SONG_ID = 'sng-95ee3b8a-e8a0-4f6d-bef4-69bac7528e35';
+
+const PAIR_L2_TTL_SEC = 3600;
+const PAIR_L1_TTL_MS = 300_000;
+const pairCacheKey = (addr: string) => `rawchunks:id:pair:${addr}`;
 
 export class RequestError extends Error {
   constructor(message: string, public readonly statusCode = 400) { super(message); }
 }
-
 
 const EVM_REGEX = /^0x[a-fA-F0-9]{40}$/;
 const SVM_REGEX = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -21,22 +26,48 @@ function isSvmAddress(value: string): boolean {
   while (number > 0n) { bytes++; number >>= 8n; }
   return bytes === 32;
 }
+
 export interface WalletPair {
-  evmAddress: string; svmAddress: string;
-  consentedAt?: string | null; consentVersion?: string | null; consentSignature?: string | null;
-  consentMessage?: string | null; consentMetadata?: Record<string, unknown> | null;
-  nickname?: string | null; avatar?: string | null;
+  evmAddress: string;
+  svmAddress: string;
+  consentedAt?: string | null;
+  consentVersion?: string | null;
+  consentSignature?: string | null;
+  consentMessage?: string | null;
+  consentMetadata?: Record<string, unknown> | null;
+  nickname?: string | null;
+  avatar?: string | null;
+  bio?: string | null;
   guidesSeen?: string[];
 }
+
 export interface UserConsentRecord {
-  evmAddress: string; svmAddress: string; policyVersion: string; signature: string; message: string;
-  metadata?: Record<string, unknown>; signedAt: string;
+  evmAddress: string;
+  svmAddress: string;
+  policyVersion: string;
+  signature: string;
+  message: string;
+  metadata?: Record<string, unknown>;
+  signedAt: string;
 }
+
 export interface RecordConsentInput {
-  address: string; svmAddress?: string; disclaimerType?: string; policyVersion?: string;
-  signature: string; message?: string; metadata?: Record<string, unknown>; chainId?: number;
+  address: string;
+  svmAddress?: string;
+  disclaimerType?: string;
+  policyVersion?: string;
+  signature: string;
+  message?: string;
+  metadata?: Record<string, unknown>;
+  chainId?: number;
 }
-export interface ConsentLookupQuery { address: string; disclaimerType?: string; policyVersion?: string }
+
+export interface ConsentLookupQuery {
+  address: string;
+  disclaimerType?: string;
+  policyVersion?: string;
+}
+
 export function parseAddress(raw: unknown): { kind: 'evm' | 'svm'; value: string } {
   if (typeof raw !== 'string' || !raw.trim()) throw new Error('Invalid wallet address');
   const clean = raw.trim();
@@ -45,13 +76,30 @@ export function parseAddress(raw: unknown): { kind: 'evm' | 'svm'; value: string
   if (isSvmAddress(svm)) return { kind: 'svm', value: svm };
   throw new Error('Invalid wallet address');
 }
+
+async function cachePair(pair: WalletPair): Promise<void> {
+  const writes: Promise<void>[] = [];
+  if (pair.evmAddress) {
+    writes.push(cacheSet(pairCacheKey(pair.evmAddress.toLowerCase()), pair, PAIR_L2_TTL_SEC, PAIR_L1_TTL_MS));
+  }
+  if (pair.svmAddress) {
+    writes.push(cacheSet(pairCacheKey(pair.svmAddress), pair, PAIR_L2_TTL_SEC, PAIR_L1_TTL_MS));
+  }
+  if (writes.length > 0) {
+    await Promise.all(writes);
+  }
+}
+
 function pairFromRow(row: any): WalletPair | null {
   if (!row) return null;
-  const evm = parseAddress(row.evm_address);
-  if (evm.kind !== 'evm') throw new Error('Invalid wallet pair');
+  const evm = row.evm_address ? parseAddress(row.evm_address) : null;
+  const svm = row.svm_address ? parseAddress(row.svm_address) : null;
+  if ((evm && evm.kind !== 'evm') || (svm && svm.kind !== 'svm') || (!evm && !svm)) {
+    throw new Error('Invalid wallet pair');
+  }
   return {
-    evmAddress: evm.value,
-    svmAddress: row.svm_address ?? '',
+    evmAddress: evm?.value ?? '',
+    svmAddress: svm?.value ?? '',
     consentedAt: row.consented_at ? new Date(row.consented_at).toISOString() : null,
     consentVersion: row.consent_version ?? null,
     consentSignature: row.consent_signature ?? null,
@@ -59,15 +107,11 @@ function pairFromRow(row: any): WalletPair | null {
     consentMetadata: row.consent_metadata ?? null,
     nickname: row.nickname ?? null,
     avatar: row.avatar ?? null,
+    bio: row.bio ?? null,
     guidesSeen: Array.isArray(row.guides_seen)
       ? row.guides_seen.filter((item: unknown): item is string => typeof item === 'string')
       : [],
   };
-}
-function consentFromRow(row: any): UserConsentRecord | null {
-  if (!row?.consented_at || !row.consent_signature || !row.consent_version) return null;
-  const pair = pairFromRow(row);
-  return pair ? { evmAddress: pair.evmAddress, svmAddress: pair.svmAddress, policyVersion: row.consent_version, signature: row.consent_signature, message: row.consent_message, metadata: row.consent_metadata ?? undefined, signedAt: new Date(row.consented_at).toISOString() } : null;
 }
 
 function remapJsonIds(value: unknown, idMap: Map<string, string>): unknown {
@@ -229,7 +273,9 @@ export interface UpdateProfileInput {
   address: string;
   nickname?: string | null;
   avatar?: string | null;
+  bio?: string | null;
   svmAddress?: string | null;
+  evmAddress?: string | null;
 }
 
 export async function updateProfile(input: UpdateProfileInput): Promise<WalletPair> {
@@ -288,42 +334,153 @@ export async function updateProfile(input: UpdateProfileInput): Promise<WalletPa
 }
 
 export async function putWalletPair(input: {
-  evmAddress: string;
-  svmAddress: string;
+  evmAddress?: string | null;
+  svmAddress?: string | null;
   nickname?: string | null;
   avatar?: string | null;
 }): Promise<WalletPair> {
-  const evm = parseAddress(input.evmAddress), svm = parseAddress(input.svmAddress);
-  if (evm.kind !== 'evm' || svm.kind !== 'svm') throw new Error('evmAddress must be EVM (0x...) and svmAddress must be Solana base58');
-  // Completing an EVM-only or legacy pending pair retains its signed policy.
-  const rows = await userSql`
-    INSERT INTO public.wallet_pairs (evm_address, svm_address, nickname, avatar)
-    VALUES (${evm.value}, ${svm.value}, ${input.nickname ?? null}, ${input.avatar ?? null})
-    ON CONFLICT (evm_address) DO UPDATE SET
-      svm_address = EXCLUDED.svm_address,
-      nickname = COALESCE(EXCLUDED.nickname, wallet_pairs.nickname),
-      avatar = COALESCE(EXCLUDED.avatar, wallet_pairs.avatar),
-      consented_at = CASE WHEN wallet_pairs.svm_address IS NOT NULL AND LEFT(wallet_pairs.svm_address, 12) <> 'svm_pending_' AND wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consented_at END,
-      consent_version = CASE WHEN wallet_pairs.svm_address IS NOT NULL AND LEFT(wallet_pairs.svm_address, 12) <> 'svm_pending_' AND wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_version END,
-      consent_signature = CASE WHEN wallet_pairs.svm_address IS NOT NULL AND LEFT(wallet_pairs.svm_address, 12) <> 'svm_pending_' AND wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_signature END,
-      consent_message = CASE WHEN wallet_pairs.svm_address IS NOT NULL AND LEFT(wallet_pairs.svm_address, 12) <> 'svm_pending_' AND wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_message END,
-      consent_metadata = CASE WHEN wallet_pairs.svm_address IS NOT NULL AND LEFT(wallet_pairs.svm_address, 12) <> 'svm_pending_' AND wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_metadata END
-    RETURNING *
-  `;
+  const hasEvm = typeof input.evmAddress === 'string' && input.evmAddress.trim().length > 0;
+  const hasSvm = typeof input.svmAddress === 'string' && input.svmAddress.trim().length > 0;
+  if (!hasEvm && !hasSvm) {
+    throw new Error('At least one wallet address (evmAddress or svmAddress) is required');
+  }
+  const evm = hasEvm ? parseAddress(input.evmAddress) : null;
+  const svm = hasSvm ? parseAddress(input.svmAddress) : null;
+  if ((evm && evm.kind !== 'evm') || (svm && svm.kind !== 'svm')) {
+    throw new Error('evmAddress must be EVM (0x...) and svmAddress must be Solana base58');
+  }
+
+  let rows: any[];
+  if (evm && svm) {
+    rows = await userSql`
+      INSERT INTO public.wallet_pairs (evm_address, svm_address, nickname, avatar)
+      VALUES (${evm.value}, ${svm.value}, ${input.nickname ?? null}, ${input.avatar ?? null})
+      ON CONFLICT (evm_address) DO UPDATE SET
+        svm_address = EXCLUDED.svm_address,
+        nickname = COALESCE(EXCLUDED.nickname, wallet_pairs.nickname),
+        avatar = COALESCE(EXCLUDED.avatar, wallet_pairs.avatar),
+        consented_at = CASE WHEN wallet_pairs.svm_address IS NOT NULL AND wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consented_at END,
+        consent_version = CASE WHEN wallet_pairs.svm_address IS NOT NULL AND wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_version END,
+        consent_signature = CASE WHEN wallet_pairs.svm_address IS NOT NULL AND wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_signature END,
+        consent_message = CASE WHEN wallet_pairs.svm_address IS NOT NULL AND wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_message END,
+        consent_metadata = CASE WHEN wallet_pairs.svm_address IS NOT NULL AND wallet_pairs.svm_address IS DISTINCT FROM EXCLUDED.svm_address THEN NULL ELSE wallet_pairs.consent_metadata END
+      RETURNING *
+    `;
+  } else if (evm) {
+    rows = await userSql`
+      INSERT INTO public.wallet_pairs (evm_address, svm_address, nickname, avatar)
+      VALUES (${evm.value}, NULL, ${input.nickname ?? null}, ${input.avatar ?? null})
+      ON CONFLICT (evm_address) DO UPDATE SET
+        nickname = COALESCE(EXCLUDED.nickname, wallet_pairs.nickname),
+        avatar = COALESCE(EXCLUDED.avatar, wallet_pairs.avatar)
+      RETURNING *
+    `;
+  } else {
+    rows = await userSql`
+      INSERT INTO public.wallet_pairs (evm_address, svm_address, nickname, avatar)
+      VALUES (NULL, ${svm!.value}, ${input.nickname ?? null}, ${input.avatar ?? null})
+      ON CONFLICT (svm_address) DO UPDATE SET
+        nickname = COALESCE(EXCLUDED.nickname, wallet_pairs.nickname),
+        avatar = COALESCE(EXCLUDED.avatar, wallet_pairs.avatar)
+      RETURNING *
+    `;
+  }
+
   const pair = pairFromRow(rows[0]);
   if (!pair) throw new Error('Failed to create or update wallet pair');
+  await cachePair(pair);
   if (!pair.consentedAt) {
-    await seedStarterSongForNewUser(pair.evmAddress);
+    await seedStarterSongForNewUser(pair.evmAddress || pair.svmAddress);
   }
   return pair;
 }
+
 export async function getWalletPair(rawAddress: string): Promise<WalletPair | null> {
   const parsed = parseAddress(rawAddress);
-  const rows = parsed.kind === 'evm'
-    ? await userSql`SELECT * FROM public.wallet_pairs WHERE evm_address = ${parsed.value} LIMIT 1`
-    : await userSql`SELECT * FROM public.wallet_pairs WHERE svm_address = ${parsed.value} LIMIT 1`;
-  return pairFromRow(rows[0]);
+  const key = pairCacheKey(parsed.value);
+  const hit = await cacheGet<WalletPair>(key, PAIR_L1_TTL_MS);
+  if (hit !== undefined) return hit;
+
+  return singleFlight(`sf:${key}`, async () => {
+    const rows = parsed.kind === 'evm'
+      ? await userSql`SELECT * FROM public.wallet_pairs WHERE evm_address = ${parsed.value} LIMIT 1`
+      : await userSql`SELECT * FROM public.wallet_pairs WHERE svm_address = ${parsed.value} LIMIT 1`;
+    const pair = pairFromRow(rows[0]);
+    if (pair) {
+      await cachePair(pair);
+    }
+    return pair;
+  });
 }
+
+export async function resolveIdentityAddresses(rawAddress: string): Promise<string[]> {
+  const parsed = parseAddress(rawAddress);
+  const addresses = [parsed.value];
+  const pair = await getWalletPair(parsed.value);
+  if (pair) {
+    if (pair.evmAddress && !addresses.includes(pair.evmAddress)) addresses.push(pair.evmAddress);
+    if (pair.svmAddress && !addresses.includes(pair.svmAddress)) addresses.push(pair.svmAddress);
+  }
+  return addresses;
+}
+
+export async function getWalletPairsByAddresses(rawAddresses: string[]): Promise<WalletPair[]> {
+  const parsedList: Array<{ kind: 'evm' | 'svm'; value: string }> = [];
+  const seenAddr = new Set<string>();
+  for (const raw of rawAddresses) {
+    try {
+      const parsed = parseAddress(raw);
+      if (!seenAddr.has(parsed.value)) {
+        seenAddr.add(parsed.value);
+        parsedList.push(parsed);
+      }
+    } catch { }
+  }
+  if (parsedList.length === 0) return [];
+
+  const keys = parsedList.map(p => pairCacheKey(p.value));
+  const cachedMap = await cacheMGet<WalletPair>(keys, PAIR_L1_TTL_MS);
+
+  const resultByIdentity = new Map<string, WalletPair>();
+  const addPair = (pair: WalletPair) => {
+    const idKey = `${pair.evmAddress}:${pair.svmAddress}`;
+    resultByIdentity.set(idKey, pair);
+  };
+
+  const missingEvm: string[] = [];
+  const missingSvm: string[] = [];
+  for (const p of parsedList) {
+    const hit = cachedMap.get(pairCacheKey(p.value));
+    if (hit) {
+      addPair(hit);
+    } else if (p.kind === 'evm') {
+      missingEvm.push(p.value);
+    } else {
+      missingSvm.push(p.value);
+    }
+  }
+
+  if (missingEvm.length > 0 || missingSvm.length > 0) {
+    const rows = await userSql`
+      SELECT * FROM public.wallet_pairs
+      WHERE evm_address = ANY(${missingEvm}) OR svm_address = ANY(${missingSvm})
+    `;
+    const cacheWrites: Promise<void>[] = [];
+    for (const row of rows) {
+      const pair = pairFromRow(row);
+      if (pair) {
+        addPair(pair);
+        cacheWrites.push(cachePair(pair));
+      }
+    }
+    if (cacheWrites.length > 0) {
+      await Promise.all(cacheWrites);
+    }
+  }
+
+  return Array.from(resultByIdentity.values());
+}
+
 export async function putUserConsent(input: RecordConsentInput): Promise<UserConsentRecord> {
   const parsed = parseAddress(input.address);
   if (!input.signature?.trim() || input.signature === '0x' || !input.message?.trim()) throw new RequestError('A signature and signed message are required');
@@ -398,15 +555,34 @@ export async function putUserGuides(input: {
   return merged;
 }
 
-export function readUser(request: FastifyRequest): string {
-  const value = (request.headers['x-session-user-address'] as string | undefined)
-    || (request.headers['x-user-address'] as string | undefined)
-    || (request.headers['x-account-address'] as string | undefined)
-    || (request.query as Record<string, string>)?.userAddress;
-  if (value === undefined) throw new RequestError('userAddress header is required');
-  try { return parseAddress(value).value; }
-  catch { throw new RequestError('Invalid userAddress header'); }
+const syncedSessionPairs = new Set<string>();
+export function ensureSessionPairLinked(addrs: string[]): void {
+  if (process.env.VITEST) return;
+  const evm = addrs.find(a => /^0x[0-9a-fA-F]{40}$/.test(a))?.toLowerCase();
+  const svm = addrs.find(a => !a.startsWith('0x') && a.length >= 32);
+  if (!evm && !svm) return;
+  const key = `${evm ?? ''}:${svm ?? ''}`;
+  if (syncedSessionPairs.has(key)) return;
+  syncedSessionPairs.add(key);
+  void putWalletPair({ evmAddress: evm ?? null, svmAddress: svm ?? null }).catch(() => {
+    syncedSessionPairs.delete(key);
+  });
 }
+
+export function readUser(request: FastifyRequest): string {
+  const value = request.headers['x-session-user-address'];
+  if (value === undefined) throw new RequestError('userAddress header is required');
+  if (typeof value !== 'string') throw new RequestError('Invalid userAddress header');
+  let parsed: string;
+  try { parsed = parseAddress(value).value; }
+  catch { throw new RequestError('Invalid userAddress header'); }
+  const walletToken = request.headers['x-wallet-auth-token'];
+  if (typeof walletToken === 'string' && walletToken.length > 0 && !verifyCachedTokenAddress(walletToken, parsed)) {
+    throw new RequestError('userAddress does not belong to authenticated wallet', 403);
+  }
+  return parsed;
+}
+
 export async function checkUser(userAddress: string, raw: string): Promise<void> {
   let value: string;
   try { value = parseAddress(raw).value; }
@@ -436,4 +612,11 @@ export async function readTake(request: FastifyRequest, takeId: string, songId?:
   const rows = await songSql`SELECT song_id FROM takes WHERE id = ${takeId} LIMIT 1`;
   if (!rows[0] || songId && rows[0].song_id !== songId) throw new RequestError('Take not found', 404);
   return readSong(request, rows[0].song_id);
+}function consentFromRow(row: any): UserConsentRecord | null {
+  if (!row?.consented_at || !row.consent_signature || !row.consent_version) return null;
+  const pair = pairFromRow(row);
+  return pair ? { evmAddress: pair.evmAddress, svmAddress: pair.svmAddress, policyVersion: row.consent_version, signature: row.consent_signature, message: row.consent_message, metadata: row.consent_metadata ?? undefined, signedAt: new Date(row.consented_at).toISOString() } : null;
 }
+
+
+
