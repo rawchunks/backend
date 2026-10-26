@@ -7,32 +7,54 @@ export async function runMigrations() {
   console.log('Migrating User Database...');
   await userSql`
     CREATE TABLE IF NOT EXISTS public.wallet_pairs (
-      evm_address TEXT PRIMARY KEY,
-      svm_address TEXT NOT NULL UNIQUE,
+      evm_address TEXT UNIQUE,
+      svm_address TEXT UNIQUE,
       created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
       consented_at TIMESTAMPTZ,
       consent_version TEXT,
       consent_signature TEXT,
       consent_message TEXT,
-      consent_metadata JSONB
-    );
-  `;
-  await userSql`
-    CREATE TABLE IF NOT EXISTS public.users (
-      evm_address TEXT PRIMARY KEY,
-      svm_address TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
-      consented_at TIMESTAMPTZ,
-      consent_signature TEXT,
-      policy_version TEXT DEFAULT '1.0.0' NOT NULL,
+      consent_metadata JSONB,
       nickname TEXT,
-      avatar TEXT
+      avatar TEXT,
+      bio TEXT,
+      guides_seen JSONB DEFAULT '[]'::jsonb NOT NULL
     );
   `;
-  await userSql`ALTER TABLE public.wallet_pairs ADD COLUMN IF NOT EXISTS nickname TEXT, ADD COLUMN IF NOT EXISTS avatar TEXT, ADD COLUMN IF NOT EXISTS guides_seen JSONB DEFAULT '[]'::jsonb NOT NULL;`;
-  await userSql`ALTER TABLE public.wallet_pairs ALTER COLUMN svm_address DROP NOT NULL;`;
-  await userSql`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS nickname TEXT, ADD COLUMN IF NOT EXISTS avatar TEXT, ADD COLUMN IF NOT EXISTS guides_seen JSONB DEFAULT '[]'::jsonb NOT NULL;`;
-  console.log('✓ User database schema verified (wallet_pairs, users).');
+  await userSql`DROP TABLE IF EXISTS public.users;`;
+  await userSql`ALTER TABLE public.wallet_pairs ADD COLUMN IF NOT EXISTS nickname TEXT, ADD COLUMN IF NOT EXISTS avatar TEXT, ADD COLUMN IF NOT EXISTS bio TEXT, ADD COLUMN IF NOT EXISTS guides_seen JSONB DEFAULT '[]'::jsonb NOT NULL;`;
+  await userSql`UPDATE public.wallet_pairs SET svm_address = NULL WHERE svm_address LIKE 'svm_pending_%';`;
+  await userSql`
+    DO $$ BEGIN
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'wallet_pairs_pkey' AND conrelid = 'public.wallet_pairs'::regclass
+      ) THEN
+        ALTER TABLE public.wallet_pairs DROP CONSTRAINT wallet_pairs_pkey;
+      END IF;
+      ALTER TABLE public.wallet_pairs ALTER COLUMN evm_address DROP NOT NULL;
+      ALTER TABLE public.wallet_pairs ALTER COLUMN svm_address DROP NOT NULL;
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'wallet_pairs_evm_address_key' AND conrelid = 'public.wallet_pairs'::regclass
+      ) THEN
+        ALTER TABLE public.wallet_pairs ADD CONSTRAINT wallet_pairs_evm_address_key UNIQUE (evm_address);
+      END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'wallet_pairs_svm_address_key' AND conrelid = 'public.wallet_pairs'::regclass
+      ) THEN
+        ALTER TABLE public.wallet_pairs ADD CONSTRAINT wallet_pairs_svm_address_key UNIQUE (svm_address);
+      END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'wallet_pairs_address_present_check' AND conrelid = 'public.wallet_pairs'::regclass
+      ) THEN
+        ALTER TABLE public.wallet_pairs ADD CONSTRAINT wallet_pairs_address_present_check CHECK (evm_address IS NOT NULL OR svm_address IS NOT NULL);
+      END IF;
+    END $$;
+  `;
+  console.log('✓ User database schema verified (wallet_pairs).');
 
   // 2. Song Database Migrations
   console.log('Migrating Song Database (songs, stems, takes, commits)...');
@@ -75,6 +97,7 @@ export async function runMigrations() {
     );
   `;
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS image TEXT;`;
+  await songSql`UPDATE songs SET image = '' WHERE image = '/hero.png';`;
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS album_id TEXT REFERENCES albums(id) ON DELETE SET NULL;`;
 
   await songSql`

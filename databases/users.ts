@@ -114,6 +114,19 @@ function pairFromRow(row: any): WalletPair | null {
   };
 }
 
+function consentFromPair(pair: WalletPair | null): UserConsentRecord | null {
+  if (!pair?.consentedAt || !pair.consentSignature || !pair.consentVersion) return null;
+  return {
+    evmAddress: pair.evmAddress,
+    svmAddress: pair.svmAddress,
+    policyVersion: pair.consentVersion,
+    signature: pair.consentSignature,
+    message: pair.consentMessage ?? '',
+    metadata: pair.consentMetadata ?? undefined,
+    signedAt: pair.consentedAt,
+  };
+}
+
 function remapJsonIds(value: unknown, idMap: Map<string, string>): unknown {
   if (!value || idMap.size === 0) return value;
   let serialized = typeof value === 'string' ? value : JSON.stringify(value);
@@ -129,16 +142,15 @@ function remapJsonIds(value: unknown, idMap: Map<string, string>): unknown {
   }
 }
 
-export async function seedStarterSongForNewUser(evmAddress: string): Promise<void> {
+export async function seedStarterSongForNewUser(rawAddress: string): Promise<void> {
   try {
     if (typeof songSql !== 'function') return;
-    const normalized = evmAddress.trim().toLowerCase();
-    if (!EVM_REGEX.test(normalized)) return;
+    const normalized = parseAddress(rawAddress).value;
 
     const templateRows = await songSql`SELECT * FROM songs WHERE id = ${STARTER_SONG_ID} LIMIT 1`;
     if (!Array.isArray(templateRows) || !templateRows[0]) return;
     const template = templateRows[0];
-    if (String(template.creator ?? '').trim().toLowerCase() === normalized) return;
+    if (String(template.creator ?? '').trim().toLowerCase() === normalized.toLowerCase()) return;
 
     const newSongId = `sng-${randomUUID()}`;
     const tagsJson = JSON.stringify(Array.isArray(template.tags) ? template.tags : []);
@@ -282,54 +294,74 @@ export async function updateProfile(input: UpdateProfileInput): Promise<WalletPa
   const parsed = parseAddress(input.address);
   const nickname = input.nickname !== undefined ? (input.nickname ? input.nickname.trim() : null) : undefined;
   const avatar = input.avatar !== undefined ? (input.avatar ? input.avatar.trim() : null) : undefined;
+  const hasBio = input.bio !== undefined;
+  const bio = hasBio ? (input.bio ? input.bio.trim().slice(0, 280) : null) : null;
 
-  let existing = await getWalletPair(parsed.value);
+  const existing = await getWalletPair(parsed.value);
   if (existing) {
+    const nextSvm = input.svmAddress && !existing.svmAddress ? parseAddress(input.svmAddress).value : null;
+    const nextEvm = input.evmAddress && !existing.evmAddress ? parseAddress(input.evmAddress).value : null;
+    const rows = existing.evmAddress
+      ? await userSql`
+          UPDATE public.wallet_pairs
+          SET
+            svm_address = COALESCE(${nextSvm}, svm_address),
+            nickname = COALESCE(${nickname !== undefined ? nickname : null}, nickname),
+            avatar = COALESCE(${avatar !== undefined ? avatar : null}, avatar),
+            bio = CASE WHEN ${hasBio} THEN ${bio} ELSE bio END
+          WHERE evm_address = ${existing.evmAddress}
+          RETURNING *
+        `
+      : await userSql`
+          UPDATE public.wallet_pairs
+          SET
+            evm_address = COALESCE(${nextEvm}, evm_address),
+            nickname = COALESCE(${nickname !== undefined ? nickname : null}, nickname),
+            avatar = COALESCE(${avatar !== undefined ? avatar : null}, avatar),
+            bio = CASE WHEN ${hasBio} THEN ${bio} ELSE bio END
+          WHERE svm_address = ${existing.svmAddress}
+          RETURNING *
+        `;
+    const pair = pairFromRow(rows[0]);
+    if (!pair) throw new RequestError('Failed to update profile');
+    await cachePair(pair);
+    return pair;
+  }
+
+  if (parsed.kind === 'evm') {
+    const svm = input.svmAddress ? parseAddress(input.svmAddress).value : null;
     const rows = await userSql`
-      UPDATE public.wallet_pairs
-      SET
-        nickname = COALESCE(${nickname !== undefined ? nickname : null}, nickname),
-        avatar = COALESCE(${avatar !== undefined ? avatar : null}, avatar)
-      WHERE evm_address = ${existing.evmAddress}
+      INSERT INTO public.wallet_pairs (evm_address, svm_address, nickname, avatar, bio)
+      VALUES (${parsed.value}, ${svm}, ${nickname ?? null}, ${avatar ?? null}, ${bio ?? null})
+      ON CONFLICT (evm_address) DO UPDATE SET
+        svm_address = COALESCE(wallet_pairs.svm_address, EXCLUDED.svm_address),
+        nickname = COALESCE(EXCLUDED.nickname, wallet_pairs.nickname),
+        avatar = COALESCE(EXCLUDED.avatar, wallet_pairs.avatar),
+        bio = CASE WHEN ${hasBio} THEN EXCLUDED.bio ELSE wallet_pairs.bio END
       RETURNING *
     `;
     const pair = pairFromRow(rows[0]);
-    if (!pair) throw new RequestError('Failed to update profile');
+    if (!pair) throw new RequestError('Failed to create profile');
+    await cachePair(pair);
+    await seedStarterSongForNewUser(pair.evmAddress);
     return pair;
   } else {
-    if (parsed.kind === 'evm') {
-      const svm = input.svmAddress ? parseAddress(input.svmAddress).value : null;
-      const rows = await userSql`
-        INSERT INTO public.wallet_pairs (evm_address, svm_address, nickname, avatar)
-        VALUES (${parsed.value}, ${svm}, ${nickname ?? null}, ${avatar ?? null})
-        ON CONFLICT (evm_address) DO UPDATE SET
-          nickname = COALESCE(EXCLUDED.nickname, wallet_pairs.nickname),
-          avatar = COALESCE(EXCLUDED.avatar, wallet_pairs.avatar)
-        RETURNING *
-      `;
-      const pair = pairFromRow(rows[0]);
-      if (!pair) throw new RequestError('Failed to create profile');
-      await seedStarterSongForNewUser(pair.evmAddress);
-      return pair;
-    } else {
-      const rows = await userSql`
-        SELECT * FROM public.wallet_pairs WHERE svm_address = ${parsed.value} LIMIT 1
-      `;
-      if (rows[0]) {
-        const updated = await userSql`
-          UPDATE public.wallet_pairs
-          SET
-            nickname = COALESCE(${nickname !== undefined ? nickname : null}, nickname),
-            avatar = COALESCE(${avatar !== undefined ? avatar : null}, avatar)
-          WHERE svm_address = ${parsed.value}
-          RETURNING *
-        `;
-        const pair = pairFromRow(updated[0]);
-        if (!pair) throw new RequestError('Failed to update profile');
-        return pair;
-      }
-      throw new RequestError('EVM address required to initialize profile');
-    }
+    const evm = input.evmAddress ? parseAddress(input.evmAddress).value : null;
+    const rows = await userSql`
+      INSERT INTO public.wallet_pairs (evm_address, svm_address, nickname, avatar, bio)
+      VALUES (${evm}, ${parsed.value}, ${nickname ?? null}, ${avatar ?? null}, ${bio ?? null})
+      ON CONFLICT (svm_address) DO UPDATE SET
+        evm_address = COALESCE(wallet_pairs.evm_address, EXCLUDED.evm_address),
+        nickname = COALESCE(EXCLUDED.nickname, wallet_pairs.nickname),
+        avatar = COALESCE(EXCLUDED.avatar, wallet_pairs.avatar),
+        bio = CASE WHEN ${hasBio} THEN EXCLUDED.bio ELSE wallet_pairs.bio END
+      RETURNING *
+    `;
+    const pair = pairFromRow(rows[0]);
+    if (!pair) throw new RequestError('Failed to create profile');
+    await cachePair(pair);
+    await seedStarterSongForNewUser(pair.evmAddress || pair.svmAddress);
+    return pair;
   }
 }
 
@@ -483,41 +515,70 @@ export async function getWalletPairsByAddresses(rawAddresses: string[]): Promise
 
 export async function putUserConsent(input: RecordConsentInput): Promise<UserConsentRecord> {
   const parsed = parseAddress(input.address);
-  if (!input.signature?.trim() || input.signature === '0x' || !input.message?.trim()) throw new RequestError('A signature and signed message are required');
+  if (!input.signature?.trim() || input.signature === '0x' || !input.message?.trim()) {
+    throw new RequestError('A signature and signed message are required');
+  }
   let pair = await getWalletPair(parsed.value);
   const isNewAccount = !pair || !pair.consentedAt;
-  if (!pair && parsed.kind === 'evm' && !input.svmAddress) pair = await updateProfile({ address: parsed.value });
-  if (!pair?.svmAddress && input.svmAddress) {
-    const evm = parseAddress(parsed.kind === 'evm' ? parsed.value : input.metadata?.evmAddress);
+
+  if (!pair) {
+    const rawEvm = parsed.kind === 'evm' ? parsed.value : (typeof input.metadata?.evmAddress === 'string' ? input.metadata.evmAddress : undefined);
+    const rawSvm = parsed.kind === 'svm' ? parsed.value : input.svmAddress;
+    const evm = rawEvm ? parseAddress(rawEvm) : null;
+    const svm = rawSvm ? parseAddress(rawSvm) : null;
+    if ((evm && evm.kind !== 'evm') || (svm && svm.kind !== 'svm') || (parsed.value !== evm?.value && parsed.value !== svm?.value)) {
+      throw new RequestError('Invalid wallet pair');
+    }
+    pair = await putWalletPair({ evmAddress: evm?.value ?? null, svmAddress: svm?.value ?? null });
+  } else if (!pair.svmAddress && input.svmAddress) {
+    const evm = parseAddress(pair.evmAddress || input.metadata?.evmAddress);
     const svm = parseAddress(input.svmAddress);
-    if (evm.kind !== 'evm' || svm.kind !== 'svm' || parsed.value !== evm.value && parsed.value !== svm.value) throw new RequestError('Invalid wallet pair');
+    if (evm.kind !== 'evm' || svm.kind !== 'svm') throw new RequestError('Invalid wallet pair');
+    pair = await putWalletPair({ evmAddress: evm.value, svmAddress: svm.value });
+  } else if (!pair.evmAddress && typeof input.metadata?.evmAddress === 'string') {
+    const evm = parseAddress(input.metadata.evmAddress);
+    const svm = parseAddress(pair.svmAddress);
+    if (evm.kind !== 'evm' || svm.kind !== 'svm') throw new RequestError('Invalid wallet pair');
     pair = await putWalletPair({ evmAddress: evm.value, svmAddress: svm.value });
   }
-  if (!pair || input.svmAddress && input.svmAddress !== pair.svmAddress) throw new RequestError('Wallet pair not found');
+
+  if (!pair || (input.svmAddress && pair.svmAddress && parseAddress(input.svmAddress).value !== pair.svmAddress)) {
+    throw new RequestError('Wallet pair not found');
+  }
+
   const version = input.policyVersion ?? '1.0.0';
   const metadata = JSON.stringify({ ...input.metadata, disclaimerType: input.disclaimerType });
-  const updated = await userSql`
-    UPDATE public.wallet_pairs SET consented_at = NOW(), consent_version = ${version},
-      consent_signature = ${input.signature}, consent_message = ${input.message}, consent_metadata = ${metadata}::jsonb
-    WHERE evm_address = ${pair.evmAddress} AND svm_address IS NOT DISTINCT FROM ${pair.svmAddress || null} RETURNING *
-  `;
-  const record = consentFromRow(updated[0]);
+  const updated = pair.evmAddress
+    ? await userSql`
+        UPDATE public.wallet_pairs SET consented_at = NOW(), consent_version = ${version},
+          consent_signature = ${input.signature}, consent_message = ${input.message}, consent_metadata = ${metadata}::jsonb
+        WHERE evm_address = ${pair.evmAddress} AND svm_address IS NOT DISTINCT FROM ${pair.svmAddress || null} RETURNING *
+      `
+    : await userSql`
+        UPDATE public.wallet_pairs SET consented_at = NOW(), consent_version = ${version},
+          consent_signature = ${input.signature}, consent_message = ${input.message}, consent_metadata = ${metadata}::jsonb
+        WHERE svm_address = ${pair.svmAddress} AND evm_address IS NULL RETURNING *
+      `;
+  const updatedPair = pairFromRow(updated[0]);
+  if (updatedPair) await cachePair(updatedPair);
+  const record = consentFromPair(updatedPair);
   if (!record) throw new RequestError('Account pair changed while recording consent', 409);
   if (isNewAccount) {
-    await seedStarterSongForNewUser(record.evmAddress);
+    await seedStarterSongForNewUser(record.evmAddress || record.svmAddress);
   }
   return record;
 }
 
 export async function getUserConsent(lookup: ConsentLookupQuery | string): Promise<UserConsentRecord | null> {
-  const parsed = parseAddress(typeof lookup === 'string' ? lookup : lookup.address);
-  const rows = await userSql`SELECT * FROM public.wallet_pairs WHERE evm_address = ${parsed.value} OR svm_address = ${parsed.value} LIMIT 1`;
-  const record = consentFromRow(rows[0]);
+  const rawAddress = typeof lookup === 'string' ? lookup : lookup.address;
+  const pair = await getWalletPair(rawAddress);
+  const record = consentFromPair(pair);
   if (!record) return null;
   const version = typeof lookup === 'object' ? lookup.policyVersion : undefined;
   const type = typeof lookup === 'object' ? lookup.disclaimerType : undefined;
   return (!version || record.policyVersion === version) && (!type || !record.metadata?.disclaimerType || record.metadata.disclaimerType === type) ? record : null;
 }
+
 export async function checkUserConsent(address: string): Promise<{ hasConsented: boolean; evmAddress?: string | null; svmAddress?: string | null; record: UserConsentRecord | null }> {
   if (!address) return { hasConsented: false, record: null };
   const record = await getUserConsent(address);
@@ -525,12 +586,8 @@ export async function checkUserConsent(address: string): Promise<{ hasConsented:
 }
 
 export async function getUserGuides(rawAddress: string): Promise<string[]> {
-  const parsed = parseAddress(rawAddress);
-  const rows = parsed.kind === 'evm'
-    ? await userSql`SELECT guides_seen FROM public.wallet_pairs WHERE evm_address = ${parsed.value} LIMIT 1`
-    : await userSql`SELECT guides_seen FROM public.wallet_pairs WHERE svm_address = ${parsed.value} LIMIT 1`;
-  const raw = rows[0]?.guides_seen;
-  return Array.isArray(raw) ? raw.filter((item: unknown): item is string => typeof item === 'string') : [];
+  const pair = await getWalletPair(rawAddress);
+  return pair?.guidesSeen ?? [];
 }
 
 export async function putUserGuides(input: {
@@ -541,17 +598,25 @@ export async function putUserGuides(input: {
   const parsed = parseAddress(input.address);
   const incoming = Array.from(new Set((input.guides || []).map(item => String(item).trim()).filter(Boolean)));
   let existing = await getWalletPair(parsed.value);
-  if (!existing && parsed.kind === 'evm') {
+  if (!existing) {
     existing = await updateProfile({ address: parsed.value, svmAddress: input.svmAddress ?? null });
   }
-  if (!existing) throw new RequestError('Wallet pair not found', 404);
   const merged = Array.from(new Set([...(existing.guidesSeen ?? []), ...incoming]));
   const serialized = JSON.stringify(merged);
-  await userSql`
-    UPDATE public.wallet_pairs
-    SET guides_seen = ${serialized}::jsonb
-    WHERE evm_address = ${existing.evmAddress}
-  `;
+  if (existing.evmAddress) {
+    await userSql`
+      UPDATE public.wallet_pairs
+      SET guides_seen = ${serialized}::jsonb
+      WHERE evm_address = ${existing.evmAddress}
+    `;
+  } else {
+    await userSql`
+      UPDATE public.wallet_pairs
+      SET guides_seen = ${serialized}::jsonb
+      WHERE svm_address = ${existing.svmAddress}
+    `;
+  }
+  await cachePair({ ...existing, guidesSeen: merged });
   return merged;
 }
 
