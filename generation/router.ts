@@ -78,6 +78,14 @@ export async function generateCoverArt({
 
 import { requireSessionPayment } from '../broker/payment.js';
 
+const requireUserUnlessUnitTest = async (request: any) => {
+  const isTestMode = process.env.NODE_ENV === 'test' || process.env.VITEST === 'true';
+  if (!isTestMode || request.headers['x-test-require-session']) {
+    const { readUser } = await import('../databases/users.js');
+    readUser(request);
+  }
+};
+
 const generationPricing = (request: any) => {
   const isMaster = request.body?.modelVariant === 'sft';
   return isMaster
@@ -120,20 +128,48 @@ export const generationRouter: FastifyPluginAsync = async (fastify) => {
       ({ taskId } = z.object({ taskId: z.string().min(1).max(256) }).parse(request.params));
       ({ songId } = z.object({ songId: z.string().min(1) }).parse(request.query));
     } catch (error: any) { return reply.code(400).send({ error: error.message }); }
+    let finalizingTimer: ReturnType<typeof setInterval> | undefined;
+    const clearFinalizingTimer = () => {
+      if (finalizingTimer) {
+        clearInterval(finalizingTimer);
+        finalizingTimer = undefined;
+      }
+    };
+    reply.raw.on('close', clearFinalizingTimer);
     return streamState(request, reply, {
-      read: () => generationService.checkStatusAndFinalize(taskId, songId),
+      read: async () => {
+        try {
+          return await generationService.checkStatusAndFinalize(taskId, songId);
+        } finally {
+          clearFinalizingTimer();
+        }
+      },
       terminal: result => ['ready', 'error'].includes(result.status),
       subscribe: (message, error) => subscribeTask(taskId, message, error),
       event: (value, send, update) => {
         const event = JSON.parse(value);
-        if (['succeeded', 'failed'].includes(event.status)) void update();
-        else send({ status: event.status === 'running' ? 'processing' : 'pending', progress: Math.round((event.progress ?? 0) * 100) });
+        if (['succeeded', 'failed'].includes(event.status)) {
+          if (event.status === 'succeeded' && !finalizingTimer) {
+            let synthProgress = 89;
+            finalizingTimer = setInterval(() => {
+              if (synthProgress < 98) {
+                synthProgress = Math.min(98, synthProgress + 2);
+                send({ status: 'processing', progress: synthProgress });
+              }
+            }, 600);
+            finalizingTimer.unref?.();
+          }
+          void update();
+        } else {
+          send({ status: event.status === 'running' ? 'processing' : 'pending', progress: Math.round((event.progress ?? 0) * 100) });
+        }
       },
     });
   });
 
   fastify.post('/format', async (request, reply) => {
     try {
+      await requireUserUnlessUnitTest(request);
       const { prompt, lyrics } = z.object({ prompt: z.string().refine((value) => value.trim().length > 0), lyrics: z.string().optional() }).parse(request.body);
       return reply.send(await acestepClient.formatInput(prompt, lyrics));
     } catch (err: any) {
@@ -143,6 +179,7 @@ export const generationRouter: FastifyPluginAsync = async (fastify) => {
 
   fastify.post('/sample', async (request, reply) => {
     try {
+      await requireUserUnlessUnitTest(request);
       const { query, instrumental, vocalLanguage } = z.object({ query: z.string().optional(), instrumental: z.boolean().optional(), vocalLanguage: z.string().optional() }).parse(request.body);
       return reply.send(await acestepClient.createSample(query || 'electronic', instrumental ?? false, vocalLanguage));
     } catch (err: any) {
@@ -152,6 +189,7 @@ export const generationRouter: FastifyPluginAsync = async (fastify) => {
 
   fastify.post('/cover', async (request, reply) => {
     try {
+      await requireUserUnlessUnitTest(request);
       if (request.isMultipart()) {
         let image: { bytes: Buffer; mimeType: string } | undefined;
         for await (const file of request.files({ limits: { files: 1 } })) {

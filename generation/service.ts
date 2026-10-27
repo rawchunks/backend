@@ -147,14 +147,17 @@ export class Service {
     if (initial.songId !== songId) throw failure('Task does not belong to the supplied song', 409);
     if (initial.result) return initial.result;
     return withJobLock(`song:${songId}`, async (assertLease) => {
-      const ctx = await getTaskContext<Context>(taskId);
+      const [ctx, parent] = await Promise.all([
+        getTaskContext<Context>(taskId),
+        getSongById(songId),
+      ]);
       if (!ctx || ctx.kind !== 'generate' || ctx.songId !== songId) throw failure('Unknown generation task', 404);
       if (ctx.result) return ctx.result;
-      const parent = await getSongById(songId);
       if (!parent) throw failure(`Song ${songId} not found`, 404);
       const save = () => assertLease.save(taskId, ctx);
+      let urlsChanged = false;
       if (!ctx.urls) {
-        const task = (await client.queryResult([taskId])).results[taskId];
+        const task = (await client.queryResult([taskId], ...(ctx.model && !ctx.model.endsWith('-turbo') ? [ctx.model] : []))).results[taskId];
         if (!task) return { status: 'pending', progress: 0 };
         if (task.status !== 'ready') {
           const result = { status: task.status, progress: task.progress ?? 0, error: task.error };
@@ -171,16 +174,26 @@ export class Service {
         ctx.urls = task.audio_urls;
         ctx.durations = task.audio_urls.map((_, index) => duration(task.metas?.[index]?.duration, primary));
         ctx.metas = task.metas;
-        await save();
+        urlsChanged = true;
       }
       const urls = ctx.urls;
       const audioUrls = ctx.audioUrls ??= [];
       const identity = createHash('sha256').update(`${songId}:${taskId}`).digest('hex');
-      for (let index = 0; index < urls.length; index++) {
-        if (!audioUrls[index]) {
-          audioUrls[index] = await guarded(assertLease, () => persistAudioToR2('songs', `generated/${identity}/${index + 1}.wav`, urls[index]));
-          await save();
-        }
+      const missingIndices = urls.map((_, index) => index).filter((index) => !audioUrls[index]);
+      if (missingIndices.length === 1) {
+        const index = missingIndices[0];
+        audioUrls[index] = await guarded(assertLease, () => persistAudioToR2('songs', `generated/${identity}/${index + 1}.wav`, urls[index]));
+      } else if (missingIndices.length > 1) {
+        const uploaded = await guarded(assertLease, () =>
+          Promise.all(
+            missingIndices.map((index) =>
+              persistAudioToR2('songs', `generated/${identity}/${index + 1}.wav`, urls[index]),
+            ),
+          ),
+        );
+        missingIndices.forEach((index, i) => {
+          audioUrls[index] = uploaded[i];
+        });
       }
       const master = { id: `stm-master-${identity}`, song_id: songId, name: 'master', url: audioUrls[0], waveform_peaks_url: null, volume: 1, pan: 0, is_muted: false, is_solo: false };
       const outputs = audioUrls.map((url, index) => ({
@@ -197,7 +210,12 @@ export class Service {
         repainting_start: null, repainting_end: null, url, waveform_url: null, is_active: index === 0, seed: ctx.submitted?.seed ?? ctx.metas?.[index]?.seed ?? null,
         provenance: { taskId, sourceUrl: url, sourceTakeId: null, sourceDuration: ctx.durations?.[index] ?? null, target: 'master' as const, targetStemId: master.id, region: null, outputDuration: ctx.durations?.[index] ?? null, parameters: { submitted: ctx.submitted ?? ctx.dispatch ?? {}, resolved: ctx.metas?.[index] ?? {}, ...(ctx.voice ? { voice: ctx.voice } : {}) } },
       }));
-      await guarded(assertLease, () => finalizeSong(songId, outputs, master, versions));
+      try {
+        await guarded(assertLease, () => finalizeSong(songId, outputs, master, versions));
+      } catch (err) {
+        if (urlsChanged || missingIndices.length > 0) await save();
+        throw err;
+      }
       const isInstrumental = Boolean(ctx.submitted?.instrumental ?? ctx.dispatch?.instrumental);
       const primaryLyrics = (ctx.lyrics || ctx.metas?.[0]?.lyrics || '').trim();
       const vocalLanguage = ctx.submitted?.vocalLanguage || ctx.dispatch?.vocal_language || 'en';
@@ -206,20 +224,27 @@ export class Service {
           void alignVocalStemLyrics(songId, primaryLyrics, audioUrls[0], {
             languageCode: vocalLanguage,
             force: true,
-          });
+          }).catch(() => {});
         } else {
           void transcribeVocalStemOnce(songId, audioUrls[0], {
             languageCode: vocalLanguage,
             force: true,
-          });
+          }).catch(() => {});
         }
       }
-      ctx.result = {
-        status: 'ready', progress: 100, primaryUrl: audioUrls[0], audioUrls: ctx.audioUrls, songAId: songId,
+      const completedResult = {
+        status: 'ready' as const, progress: 100, primaryUrl: audioUrls[0], audioUrls: ctx.audioUrls, songAId: songId,
         ...(urls.length > 1 ? { songBId: `${songId}-var2` } : {}), duration: ctx.durations?.[0], durations: ctx.durations, metas: ctx.metas,
       };
-      await assertLease.save(taskId, ctx, { terminal: true });
-      return ctx.result;
+      ctx.result = completedResult;
+      try {
+        await assertLease.save(taskId, ctx, { terminal: true });
+      } catch (err) {
+        ctx.result = undefined;
+        if (urlsChanged || missingIndices.length > 0) await save();
+        throw err;
+      }
+      return completedResult;
     });
   }
 }
