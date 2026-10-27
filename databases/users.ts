@@ -648,40 +648,44 @@ export function readUser(request: FastifyRequest): string {
   return parsed;
 }
 
-export async function checkUser(userAddress: string, raw: string): Promise<void> {
+export function checkUser(userAddress: string, raw: string): void {
   let value: string;
   try { value = parseAddress(raw).value; }
   catch { throw new RequestError('Invalid userAddress'); }
-  if (value === userAddress) return;
-  try {
-    const pair = await getWalletPair(userAddress);
-    if (pair && (value === pair.svmAddress || value === parseAddress(pair.evmAddress).value)) {
-      return;
-    }
-    const targetPair = await getWalletPair(value);
-    if (targetPair && (userAddress === targetPair.svmAddress || userAddress === parseAddress(targetPair.evmAddress).value)) {
-      return;
-    }
-  } catch {}
-  throw new RequestError('userAddress does not match this resource', 403);
+  if (value !== userAddress) throw new RequestError('userAddress does not match this resource', 403);
 }
+
+export async function checkUserOrPair(userAddress: string, raw: string): Promise<void> {
+  try {
+    checkUser(userAddress, raw);
+  } catch (error) {
+    if (!(error instanceof RequestError) || error.statusCode !== 403) throw error;
+    const userParsed = parseAddress(userAddress);
+    const targetParsed = parseAddress(raw);
+    if (userParsed.kind === targetParsed.kind) throw error;
+    const target = targetParsed.value;
+    const pair = (await getWalletPair(userParsed.value)) ?? (await getWalletPair(target));
+    if (
+      !pair ||
+      !((userParsed.value === pair.evmAddress || userParsed.value === pair.svmAddress) &&
+        (target === pair.evmAddress || target === pair.svmAddress))
+    ) {
+      throw error;
+    }
+  }
+}
+
 export async function readSong(request: FastifyRequest, songId: string) {
   const userAddress = readUser(request);
   const song = await getSongById(songId);
   if (!song) throw new RequestError('Song not found', 404);
-  await checkUser(userAddress, song.creator);
+  await checkUserOrPair(userAddress, song.creator);
   return { userAddress, song };
 }
+
 export async function readTake(request: FastifyRequest, takeId: string, songId?: string) {
   readUser(request);
   const rows = await songSql`SELECT song_id FROM takes WHERE id = ${takeId} LIMIT 1`;
-  if (!rows[0] || songId && rows[0].song_id !== songId) throw new RequestError('Take not found', 404);
+  if (!rows[0] || (songId && rows[0].song_id !== songId)) throw new RequestError('Take not found', 404);
   return readSong(request, rows[0].song_id);
-}function consentFromRow(row: any): UserConsentRecord | null {
-  if (!row?.consented_at || !row.consent_signature || !row.consent_version) return null;
-  const pair = pairFromRow(row);
-  return pair ? { evmAddress: pair.evmAddress, svmAddress: pair.svmAddress, policyVersion: row.consent_version, signature: row.consent_signature, message: row.consent_message, metadata: row.consent_metadata ?? undefined, signedAt: new Date(row.consented_at).toISOString() } : null;
 }
-
-
-

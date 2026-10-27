@@ -4,7 +4,7 @@ import { songs, type Song, type NewSong } from './schema/songs.js';
 import { stems, type Stem, type NewStem } from './schema/stems.js';
 import { takes, type Take, type NewTake } from './schema/takes.js';
 import { commits } from './schema/commits.js';
-import { getWalletPair, RequestError } from './users.js';
+import { resolveIdentityAddresses, RequestError } from './users.js';
 import { randomUUID } from 'node:crypto';
 
 export async function createSong(songData: NewSong): Promise<Song> {
@@ -70,19 +70,7 @@ export async function getSongById(id: string): Promise<Song | null> {
 
 export async function listSongsByCreator(creatorAddress: string, limit?: number, offset = 0): Promise<Song[]> {
   validatePagination(limit, offset);
-  const addr = /^0x/i.test(creatorAddress) ? creatorAddress.toLowerCase() : creatorAddress;
-  const addresses = [addr];
-  try {
-    const pair = await getWalletPair(addr);
-    if (pair) {
-      if (pair.evmAddress && !addresses.includes(pair.evmAddress.toLowerCase())) {
-        addresses.push(pair.evmAddress.toLowerCase());
-      }
-      if (pair.svmAddress && !addresses.includes(pair.svmAddress)) {
-        addresses.push(pair.svmAddress);
-      }
-    }
-  } catch (error) { throw error; }
+  const addresses = await resolveIdentityAddresses(creatorAddress);
 
   const query = songDb
     .select()
@@ -146,11 +134,11 @@ export async function getFullSongProject(id: string): Promise<{
 }
 
 export async function countUntitledSongsByCreator(creator: string): Promise<number> {
-  const normalized = /^0x/i.test(creator) ? creator.toLowerCase() : creator;
+  const addresses = await resolveIdentityAddresses(creator);
   const result = await songDb
     .select({ count: sql<number>`count(*)::int` })
     .from(songs)
-    .where(and(eq(songs.creator, normalized), sql`${songs.title} ~* '^Untitled( #[0-9]+)?$'`));
+    .where(and(inArray(songs.creator, addresses), sql`${songs.title} ~* '^Untitled( #[0-9]+)?$'`));
   return result[0]?.count ?? 0;
 }
 
