@@ -115,10 +115,25 @@ function isPrivateHost(host: string): boolean {
   if (isIP(plain) === 6) return plain === '::' || plain === '::1' || /^(fc|fd|fe[89ab])/.test(plain) || plain.startsWith('::ffff:');
   return false;
 }
+function allowedWorkerOrigins(): Set<string> {
+  const origins = new Set<string>();
+  for (const raw of [
+    process.env.ACESTEP_API_URL,
+    process.env.ACESTEP_TURBO_API_URL,
+    process.env.ACESTEP_SFT_API_URL,
+    process.env.ACESTEP_BASE_API_URL,
+  ]) {
+    if (!raw?.trim()) continue;
+    try { origins.add(new URL(raw).origin); } catch { /* ignore */ }
+  }
+  return origins;
+}
 function sourceLocation(sourceUrl: string): { url: URL; workerOrigin: string } {
   if (typeof sourceUrl !== 'string' || !sourceUrl.trim()) throw new Error('Audio source URL is required');
   if (/%(?![\da-f]{2})/i.test(sourceUrl)) throw new URIError('Malformed URL encoding');
   const worker = new URL(process.env.ACESTEP_API_URL!);
+  const workerOrigins = allowedWorkerOrigins();
+  workerOrigins.add(worker.origin);
   let url: URL;
   if (/^\/(?:api\/audio|v1\/audio|audio)(?:[/?]|$)/.test(sourceUrl)) {
     url = new URL(sourceUrl, worker);
@@ -127,51 +142,120 @@ function sourceLocation(sourceUrl: string): { url: URL; workerOrigin: string } {
       if (paths.length !== 1 || !paths[0]) throw new Error('Audio path must be supplied once');
       url = new URL('/v1/audio', worker); url.search = `?path=${encodeURIComponent(paths[0])}`;
     }
-  } else { url = new URL(sourceUrl); }
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || (url.origin !== worker.origin && isPrivateHost(url.hostname))) throw new Error('Unsupported audio source URL');
-  return { url, workerOrigin: worker.origin };
+  } else {
+    url = new URL(sourceUrl);
+    if (workerOrigins.has(url.origin) && /^\/(?:api\/audio|v1\/audio|audio)$/.test(url.pathname) && url.searchParams.has('path')) {
+      const paths = url.searchParams.getAll('path');
+      if (paths.length !== 1 || !paths[0]) throw new Error('Audio path must be supplied once');
+      url = new URL('/v1/audio', url.origin); url.search = `?path=${encodeURIComponent(paths[0])}`;
+    }
+  }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || (!workerOrigins.has(url.origin) && isPrivateHost(url.hostname))) throw new Error('Unsupported audio source URL');
+  return { url, workerOrigin: workerOrigins.has(url.origin) ? url.origin : worker.origin };
 }
 
 const inFlightStemBuffers = new Map<string, { buffer: Buffer; contentType: string; uploadPromise: Promise<string> }>();
 const inFlightAudioReads = new Map<string, Promise<{ buffer: Buffer; contentType: string }>>();
 
+function hasValkeyConfig(): boolean {
+  const uri =
+    process.env.VALKEY_WIPS_SERVICE_URI ||
+    process.env.VALKEY_REQUESTS_SERVICE_URI ||
+    process.env.VALKEY_URI ||
+    process.env.VALKEY_REQUESTS_HOST ||
+    '';
+  return Boolean(uri && !uri.includes('127.0.0.1:1'));
+}
+
+function useAuthenticatedR2Read(): boolean {
+  return !process.env.VITEST && /^[0-9a-f]{32}$/i.test(cfAccountId() || '') && Boolean(cfToken());
+}
+
+export async function waitForInFlightAudio(url: string): Promise<void> {
+  if (typeof url !== 'string' || !url) return;
+  const local = inFlightStemBuffers.get(url);
+  if (local) {
+    await local.uploadPromise.catch(() => {});
+  }
+}
+
 export async function readAudio(sourceUrl: string, fallbackContentType = 'audio/wav'): Promise<{ buffer: Buffer; contentType: string }> {
-  let { url, workerOrigin } = sourceLocation(sourceUrl);
-  let redirectCount = 0;
-  const download = async (): Promise<{ buffer: Buffer; contentType: string }> => {
-    const headers: Record<string, string> = {};
-    if (process.env.ACESTEP_API_KEY && url.origin === workerOrigin) headers.Authorization = `Bearer ${process.env.ACESTEP_API_KEY}`;
-    return request(url.toString(), { headers, redirect: 'manual' }, async res => {
-      if ([301, 302, 303, 307, 308].includes(res.status)) {
-        const location = res.headers.get('location');
-        if (!location || ++redirectCount > 10) throw new Error('Invalid or excessive audio redirect');
-        const next = sourceLocation(new URL(location, url).toString());
-        url = next.url;
-        void res.body?.cancel().catch(() => { });
-        return download();
+  const inFlight = inFlightStemBuffers.get(sourceUrl);
+  if (inFlight) return { buffer: inFlight.buffer, contentType: inFlight.contentType };
+  const readKey = `${sourceUrl}|${fallbackContentType}`;
+  const activeRead = inFlightAudioReads.get(readKey);
+  if (activeRead) return activeRead;
+  const promise = (async (): Promise<{ buffer: Buffer; contentType: string }> => {
+    const owned = parseR2Url(sourceUrl);
+    if (owned && hasValkeyConfig()) {
+      try {
+        const { valkeyWips } = await import('../broker/valkey.js');
+        const workerSource = await valkeyWips.get(`r2:inflight:${sourceUrl}`);
+        if (workerSource && workerSource !== sourceUrl) {
+          return await readAudio(workerSource, fallbackContentType);
+        }
+      } catch {
+        // Fall back to normal R2 read
       }
-      if (!res.ok) throw new Error(`Failed to fetch source audio: ${res.statusText}`);
-      const contentType = res.headers.get('content-type') || fallbackContentType;
-      if (!/^audio\//i.test(contentType) && !/^application\/octet-stream(?:;|$)/i.test(contentType)) throw new Error('Source response is not audio');
-      const length = res.headers.get('content-length');
-      if (length !== null && (!/^\d+$/.test(length) || Number(length) > MAX_OBJECT_BYTES)) throw new Error('Oversized or invalid source audio length');
-      const chunks: Uint8Array[] = []; let size = 0;
-      if (res.body) {
-        const reader = res.body.getReader();
-        try {
-          while (true) {
-            const chunk = await reader.read(); if (chunk.done) break;
-            size += chunk.value.byteLength;
-            if (size > MAX_OBJECT_BYTES) { await reader.cancel(); throw new Error('Source audio exceeds upload limit'); }
-            chunks.push(chunk.value);
+    }
+    let { url, workerOrigin } = sourceLocation(sourceUrl);
+    const useR2Api = Boolean(owned && useAuthenticatedR2Read());
+    if (useR2Api && owned) {
+      url = new URL(apiUrl(owned.bucket, owned.key));
+    }
+    let redirectCount = 0;
+    const download = async (): Promise<{ buffer: Buffer; contentType: string }> => {
+      const headers: Record<string, string> = {};
+      if (useR2Api) {
+        headers.Authorization = `Bearer ${cfToken()}`;
+      } else if (process.env.ACESTEP_API_KEY && url.origin === workerOrigin) {
+        headers.Authorization = `Bearer ${process.env.ACESTEP_API_KEY}`;
+      }
+      return request(url.toString(), { headers, redirect: 'manual' }, async res => {
+        if ([301, 302, 303, 307, 308].includes(res.status)) {
+          const location = res.headers.get('location');
+          if (!location || ++redirectCount > 10) throw new Error('Invalid or excessive audio redirect');
+          const next = sourceLocation(new URL(location, url).toString());
+          url = next.url;
+          void res.body?.cancel().catch(() => { });
+          return download();
+        }
+        if (!res.ok) throw new Error(`Failed to fetch source audio: ${res.statusText}`);
+        const contentType = res.headers.get('content-type') || fallbackContentType;
+        if (!/^audio\//i.test(contentType) && !/^application\/octet-stream(?:;|$)/i.test(contentType)) throw new Error('Source response is not audio');
+        const length = res.headers.get('content-length');
+        if (length !== null && (!/^\d+$/.test(length) || Number(length) > MAX_OBJECT_BYTES)) throw new Error('Oversized or invalid source audio length');
+        const chunks: Uint8Array[] = []; let size = 0;
+        if (res.body) {
+          const reader = res.body.getReader();
+          try {
+            while (true) {
+              const chunk = await reader.read(); if (chunk.done) break;
+              size += chunk.value.byteLength;
+              if (size > MAX_OBJECT_BYTES) { await reader.cancel(); throw new Error('Source audio exceeds upload limit'); }
+              chunks.push(chunk.value);
+            }
+          } finally { reader.releaseLock(); }
+        } else { const chunk = new Uint8Array(await res.arrayBuffer()); size = chunk.byteLength; chunks.push(chunk); }
+        if (!size || size > MAX_OBJECT_BYTES) throw new Error('Empty or oversized source audio');
+        const fetched = { buffer: Buffer.concat(chunks), contentType };
+        if (!process.env.VITEST && owned && !inFlightStemBuffers.has(sourceUrl)) {
+          while (inFlightStemBuffers.size >= 16) {
+            const oldest = inFlightStemBuffers.keys().next().value;
+            if (oldest !== undefined) inFlightStemBuffers.delete(oldest);
           }
-        } finally { reader.releaseLock(); }
-      } else { const chunk = new Uint8Array(await res.arrayBuffer()); size = chunk.byteLength; chunks.push(chunk); }
-      if (!size || size > MAX_OBJECT_BYTES) throw new Error('Empty or oversized source audio');
-      return { buffer: Buffer.concat(chunks), contentType };
-    });
-  };
-  return download();
+          inFlightStemBuffers.set(sourceUrl, { ...fetched, uploadPromise: Promise.resolve(sourceUrl) });
+          setTimeout(() => inFlightStemBuffers.delete(sourceUrl), 60_000).unref?.();
+        }
+        return fetched;
+      });
+    };
+    return download();
+  })().finally(() => {
+    inFlightAudioReads.delete(readKey);
+  });
+  inFlightAudioReads.set(readKey, promise);
+  return promise;
 }
 
 export async function persistAudioToR2(bucket: R2Bucket, key: string, sourceUrl: string, fallbackContentType = 'audio/wav'): Promise<string> {
