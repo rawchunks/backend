@@ -317,7 +317,7 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
     try {
       const { snapshot, ...p } = commitSchema.parse(request.body);
       const res = await service.createCommitSnapshot({ ...p, timelineSnapshot: p.timelineSnapshot ?? snapshot });
-      await deleteWipState(p.songId).catch(() => {});
+      await deleteWipState(p.songId).catch(() => { });
       return reply.status(201).send(res);
     } catch (err: any) {
       request.log.error(err);
@@ -445,7 +445,7 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
       const { songId } = z.object({ songId: z.string().min(1) }).parse({
         songId: params.songId ?? body.songId,
       });
-      await deleteWipState(songId).catch(() => {});
+      await deleteWipState(songId).catch(() => { });
       const history = await service.getTimelineHistory(songId);
       return reply.send({ success: true, songId, ...history });
     } catch (err: any) {
@@ -553,15 +553,17 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
     }
   });
 
+  const boundQueryNumber = z.string().regex(/^\d+(?:\.\d+)?$/).transform(Number).pipe(z.number().finite().min(0)).optional();
+  const statusQuerySchema = z.object({
+    songId: z.string().min(1), stemId: z.string().optional(), userAddress: z.string().min(10),
+    task: z.enum(['repaint', 'lego', 'complete', 'extend', 'cover', 'extract']), prompt: z.string().optional(),
+    repaintingStart: boundQueryNumber, repaintingEnd: boundQueryNumber,
+  }).refine((p) => p.repaintingStart === undefined || p.repaintingEnd === undefined || p.repaintingEnd > p.repaintingStart);
+
   fastify.get('/status/:taskId', async (request, reply) => {
     try {
       const { taskId } = z.object({ taskId: z.string().min(1) }).parse(request.params);
-      const bound = z.string().regex(/^\d+(?:\.\d+)?$/).transform(Number).pipe(z.number().finite().min(0)).optional();
-      const { songId, stemId, userAddress, task, prompt, repaintingStart, repaintingEnd } = z.object({
-        songId: z.string().min(1), stemId: z.string().optional(), userAddress: z.string().min(10),
-        task: z.enum(['repaint', 'lego', 'complete', 'extend', 'cover', 'extract']), prompt: z.string().optional(),
-        repaintingStart: bound, repaintingEnd: bound,
-      }).refine((p) => p.repaintingStart === undefined || p.repaintingEnd === undefined || p.repaintingEnd > p.repaintingStart).parse(request.query);
+      const { songId, stemId, userAddress, task, prompt, repaintingStart, repaintingEnd } = statusQuerySchema.parse(request.query);
 
       const result = await service.finalizeEditResult({
         taskId,
@@ -578,6 +580,63 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
       request.log.error(err);
       return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({ error: err.message || 'Failed to check edit status' });
     }
+  });
+
+  fastify.get('/events/:taskId', async (request, reply) => {
+    let taskId: string;
+    let queryParams: z.infer<typeof statusQuerySchema>;
+    try {
+      ({ taskId } = z.object({ taskId: z.string().min(1).max(256) }).parse(request.params));
+      queryParams = statusQuerySchema.parse(request.query);
+    } catch (err: any) {
+      return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 400).send({ error: err.message || 'Failed to stream edit events' });
+    }
+    let finalizingTimer: ReturnType<typeof setInterval> | undefined;
+    const clearFinalizingTimer = () => {
+      if (finalizingTimer) {
+        clearInterval(finalizingTimer);
+        finalizingTimer = undefined;
+      }
+    };
+    reply.raw.on('close', clearFinalizingTimer);
+    return streamState(request, reply, {
+      read: async () => {
+        try {
+          return await service.finalizeEditResult({
+            taskId,
+            songId: queryParams.songId,
+            stemId: queryParams.stemId,
+            userAddress: queryParams.userAddress,
+            task: queryParams.task,
+            prompt: queryParams.prompt,
+            repaintingStart: queryParams.repaintingStart,
+            repaintingEnd: queryParams.repaintingEnd,
+          });
+        } finally {
+          clearFinalizingTimer();
+        }
+      },
+      terminal: (result: any) => ['ready', 'error'].includes(result?.status),
+      subscribe: (message, error) => subscribeTask(taskId, message, error),
+      event: (value, send, update) => {
+        const event = JSON.parse(value);
+        if (['succeeded', 'failed'].includes(event.status)) {
+          if (event.status === 'succeeded' && !finalizingTimer) {
+            let synthProgress = 89;
+            finalizingTimer = setInterval(() => {
+              if (synthProgress < 98) {
+                synthProgress = Math.min(98, synthProgress + 2);
+                send({ status: 'processing', progress: synthProgress });
+              }
+            }, 600);
+            finalizingTimer.unref?.();
+          }
+          void update();
+        } else {
+          send({ status: event.status === 'running' ? 'processing' : 'pending', progress: Math.round((event.progress ?? 0) * 100) });
+        }
+      },
+    });
   });
 
   const handleActivate = async (request: any, reply: any) => {
