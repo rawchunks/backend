@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { FastifyRequest } from 'fastify';
-import { readUser } from '../databases/users.js';
+import { readUser, ensureSessionPairLinked } from '../databases/users.js';
 import { z } from 'zod';
 import { resolveCreditAddresses } from './identity.js';
+import { cacheGet, cacheSet, l1Get, singleFlight } from '../databases/cache.js';
 
 export interface CreditIdentity {
   owner: string;
@@ -110,12 +111,79 @@ export function createWalletAuthenticator(options: WalletAuthOptions) {
     }
     const pair = addresses.find(([evm, svm]) => evm.toLowerCase() === userAddress || svm === userAddress);
     if (!pair) throw failure('userAddress does not belong to authenticated wallet', 403);
+    ensureSessionPairLinked([pair[0].toLowerCase(), pair[1]]);
     const promoIdentityHash = extractPromoIdentity(result.data.id, result.data.linkedAccounts);
-    return { owner: pair[0].toLowerCase(), userAddress, addresses: [pair[0].toLowerCase(), pair[1]], promoIdentityHash };
+    return { owner: pair[0].toLowerCase(), userAddress, addresses: [pair[0].toLowerCase(), pair[1]], ...(promoIdentityHash ? { promoIdentityHash } : {}) };
   };
 }
 
+interface CachedTokenEntry {
+  pairs: [string, string][];
+  promoIdentityHash: string | null;
+}
+
+const TOKEN_L2_TTL_SEC = 15 * 60; // 15 minutes
+const TOKEN_L1_TTL_MS = 15 * 60 * 1000;
+const tokenCacheKey = (hash: string) => `rawchunks:id:tw:${hash}`;
+
+function identityFromEntry(entry: CachedTokenEntry, userAddress: string): CreditIdentity | null {
+  const pair = entry.pairs.find(([evm, svm]) => evm.toLowerCase() === userAddress || svm === userAddress);
+  if (!pair) return null;
+  return {
+    owner: pair[0].toLowerCase(),
+    userAddress,
+    addresses: [pair[0].toLowerCase(), pair[1]],
+    ...(entry.promoIdentityHash ? { promoIdentityHash: entry.promoIdentityHash } : {}),
+  };
+}
+
+export function getCachedTokenIdentity(token: string, userAddress: string): CreditIdentity | null {
+  const hash = createHash('sha256').update(token).digest('hex');
+  const entry = l1Get<CachedTokenEntry>(tokenCacheKey(hash));
+  if (!entry) return null;
+  return identityFromEntry(entry, userAddress);
+}
+
+export async function getCachedTokenIdentityAsync(token: string, userAddress: string): Promise<CreditIdentity | null> {
+  const hash = createHash('sha256').update(token).digest('hex');
+  const entry = await cacheGet<CachedTokenEntry>(tokenCacheKey(hash), TOKEN_L1_TTL_MS);
+  if (!entry) return null;
+  return identityFromEntry(entry, userAddress);
+}
+
+export function verifyCachedTokenAddress(token: string, userAddress: string): boolean {
+  const hash = createHash('sha256').update(token).digest('hex');
+  const entry = l1Get<CachedTokenEntry>(tokenCacheKey(hash));
+  if (!entry) return true;
+  return entry.pairs.some(([evm, svm]) => evm.toLowerCase() === userAddress || svm === userAddress);
+}
+
 export async function authenticate(request: FastifyRequest): Promise<CreditIdentity> {
+  const walletToken = request.headers['x-wallet-auth-token'];
+
+  if (typeof walletToken === 'string' && walletToken.length > 0 && walletToken.length <= 8192 && !/\s/.test(walletToken)) {
+    const userAddress = readUser(request);
+    const cached = await getCachedTokenIdentityAsync(walletToken, userAddress);
+    if (cached) return cached;
+    const hash = createHash('sha256').update(walletToken).digest('hex');
+    return singleFlight(`tw:${hash}:${userAddress}`, async () => {
+      const identity = await createWalletAuthenticator({
+        clientId: process.env.THIRDWEB_CLIENT_ID || '',
+        resolveAddresses: resolveCreditAddresses,
+      })(request);
+      await cacheSet<CachedTokenEntry>(
+        tokenCacheKey(hash),
+        {
+          pairs: [[identity.addresses[0], identity.addresses[1]]],
+          promoIdentityHash: identity.promoIdentityHash ?? null,
+        },
+        TOKEN_L2_TTL_SEC,
+        TOKEN_L1_TTL_MS,
+      );
+      return identity;
+    });
+  }
+
   return createWalletAuthenticator({
     clientId: process.env.THIRDWEB_CLIENT_ID || '',
     resolveAddresses: resolveCreditAddresses,
