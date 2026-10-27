@@ -114,7 +114,7 @@ export class Service {
       id: songId, title: songTitle,
       version: 1, source: null, creator, url: '', licenses: params.licenses ?? 0, stream_price: params.stream_price ?? 0.02, license_price: params.license_price ?? 25,
       duration: params.audioDuration, tags: params.tags || [],
-      image: params.image || '/hero.png',
+      image: params.image || '',
       album_id: params.albumId || null,
     });
     if (params.albumId) {
@@ -125,13 +125,18 @@ export class Service {
     await setTaskContext(taskId, ctx);
     const response = await client.releaseTask(payload, { idempotencyKey: taskId });
     if (typeof response.task_id !== 'string' || !response.task_id.trim() || !['pending', 'processing', 'ready'].includes(response.status)) throw failure('Invalid worker task release response', 502);
-    await withJobLock(`task:${response.task_id}`, async (assertLease) => {
-      const existing = await getTaskContext<Context>(response.task_id);
-      if (existing && response.task_id !== taskId) throw failure('Worker returned an already bound task identifier', 502);
+    if (response.task_id === taskId) {
       ctx.dispatched = true;
-      await assertLease.save(response.task_id, ctx);
-    });
-    if (response.task_id !== taskId) await setTaskContext(taskId, { ...ctx, workerTaskId: response.task_id }, { terminal: true });
+      await setTaskContext(taskId, ctx);
+    } else {
+      await withJobLock(`task:${response.task_id}`, async (assertLease) => {
+        const existing = await getTaskContext<Context>(response.task_id);
+        if (existing && response.task_id !== taskId) throw failure('Worker returned an already bound task identifier', 502);
+        ctx.dispatched = true;
+        await assertLease.save(response.task_id, ctx);
+      });
+      await setTaskContext(taskId, { ...ctx, workerTaskId: response.task_id }, { terminal: true });
+    }
     return { songId: song.id, taskId: response.task_id, status: response.status, model, steps, lyrics: lyrics || undefined };
   }
 
