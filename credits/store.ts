@@ -257,56 +257,76 @@ export class CreditStore {
     return balance;
   }
 
-  async reserve(owner: string, sid: string, id: string, maximum: bigint, resource: string, creator?: string) {
-    positive(maximum); identifier(id);
-    return this.tx(async c => {
+  async reserve(owner: string, source: CreditLotSource, id: string, maximum: bigint, resource: string, creator?: string) {
+    positive(maximum);
+    identifier(id);
+    if (creator && source === 'promo') {
+      throw fail("Promo credits can't be used for Streaming and Licenses. Use your free credits to generate and edit your songs!", 402);
+    }
+    const hold = await this.tx(async c => {
       await this.account(c, owner);
-      const row = await this.readSession(c, owner, sid);
       const existing = (await c.query('SELECT * FROM credit_holds WHERE environment=$1 AND id=$2', [this.environment, id])).rows[0];
       if (existing) {
-        if (existing.session_id !== sid || String(existing.maximum) !== String(maximum) || existing.resource !== resource || (existing.creator || undefined) !== creator || existing.closed) throw fail('Operation reservation replay mismatch');
+        if (
+          existing.owner !== owner ||
+          existing.credit_source !== source ||
+          String(existing.maximum) !== String(maximum) ||
+          existing.resource !== resource ||
+          (existing.creator || undefined) !== creator ||
+          existing.closed
+        ) {
+          throw fail('Operation reservation replay mismatch');
+        }
         return existing;
       }
-      this.active(row);
-      if (BigInt(row.remaining) < maximum) throw fail('Session Credits exhausted', 402);
-      const hold = (await c.query('INSERT INTO credit_holds(environment,id,session_id,maximum,resource,creator) VALUES($1,$2,$3,$4,$5,$6) RETURNING *', [this.environment, id, sid, String(maximum), resource, creator || null])).rows[0];
+
       const lots = (
         await c.query(
-          creator
-            ? "SELECT * FROM credit_session_lots WHERE environment=$1 AND session_id=$2 AND remaining>0 AND lot_id NOT LIKE 'promo:%' ORDER BY lot_id FOR UPDATE"
-            : "SELECT * FROM credit_session_lots WHERE environment=$1 AND session_id=$2 AND remaining>0 ORDER BY (lot_id LIKE 'promo:%') DESC,lot_id FOR UPDATE",
-          [this.environment, sid],
+          source === 'promo'
+            ? "SELECT * FROM credit_lots WHERE environment=$1 AND owner=$2 AND available>0 AND NOT disputed AND id LIKE 'promo:%' ORDER BY created_at,id FOR UPDATE"
+            : "SELECT * FROM credit_lots WHERE environment=$1 AND owner=$2 AND available>0 AND NOT disputed AND id NOT LIKE 'promo:%' ORDER BY created_at,id FOR UPDATE",
+          [this.environment, owner],
         )
       ).rows;
+
+      const holdRow = (
+        await c.query(
+          'INSERT INTO credit_holds(environment,id,session_id,owner,credit_source,maximum,resource,creator) VALUES($1,$2,$3,$4,$3,$5,$6,$7) RETURNING *',
+          [this.environment, id, source, owner, String(maximum), resource, creator || null],
+        )
+      ).rows[0];
+
       let remaining = maximum;
       for (const lot of lots) {
-        const take = BigInt(lot.remaining) < remaining ? BigInt(lot.remaining) : remaining;
+        const take = BigInt(lot.available) < remaining ? BigInt(lot.available) : remaining;
         if (!take) break;
-        await c.query('UPDATE credit_lots SET allocated=allocated-$3,reserved=reserved+$3 WHERE environment=$1 AND id=$2', [this.environment, lot.lot_id, String(take)]);
-        await c.query('UPDATE credit_session_lots SET remaining=remaining-$4,reserved=reserved+$4 WHERE environment=$1 AND session_id=$2 AND lot_id=$3', [this.environment, sid, lot.lot_id, String(take)]);
-        await c.query('INSERT INTO credit_hold_lots(environment,hold_id,lot_id,remaining) VALUES($1,$2,$3,$4)', [this.environment, id, lot.lot_id, String(take)]);
+        await c.query('UPDATE credit_lots SET available=available-$3,reserved=reserved+$3 WHERE environment=$1 AND id=$2', [this.environment, lot.id, String(take)]);
+        await c.query('INSERT INTO credit_hold_lots(environment,hold_id,lot_id,remaining) VALUES($1,$2,$3,$4)', [this.environment, id, lot.id, String(take)]);
         remaining -= take;
       }
-      if (remaining) {
-        if (creator) throw fail('Campaign Credits can only be used for generation and editing', 402);
-        throw fail('Session capture attribution missing');
+
+      if (remaining > 0n) {
+        throw fail(source === 'promo' ? 'Insufficient available Campaign Credits' : 'Insufficient available Card Credits', 402);
       }
-      await c.query('UPDATE credit_sessions SET remaining=remaining-$3,reserved=reserved+$3 WHERE environment=$1 AND id=$2', [this.environment, sid, String(maximum)]);
-      return hold;
+
+      await c.query('UPDATE credit_accounts SET available=available-$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(maximum)]);
+      return holdRow;
     });
+    await this.invalidateOwner(owner);
+    return hold;
   }
+
   private async hold(c: CreditConnection, owner: string, id: string) {
     await this.account(c, owner);
-    const initial = (await c.query('SELECT h.* FROM credit_holds h JOIN credit_sessions s ON s.environment=h.environment AND s.id=h.session_id WHERE h.environment=$1 AND h.id=$2 AND s.owner=$3', [this.environment, id, owner])).rows[0];
-    if (!initial) throw fail('Unknown operation reservation', 404);
-    const session = await this.readSession(c, owner, initial.session_id);
-    const hold = (await c.query('SELECT * FROM credit_holds WHERE environment=$1 AND id=$2 FOR UPDATE', [this.environment, id])).rows[0];
-    return { session, hold };
+    const hold = (await c.query('SELECT * FROM credit_holds WHERE environment=$1 AND id=$2 AND owner=$3 FOR UPDATE', [this.environment, id, owner])).rows[0];
+    if (!hold) throw fail('Unknown operation reservation', 404);
+    return hold;
   }
+
   async commit(owner: string, id: string, amount: bigint) {
     if (amount < 0n) throw fail('Invalid charge', 400);
     await this.tx(async c => {
-      const { hold, session } = await this.hold(c, owner, id);
+      const hold = await this.hold(c, owner, id);
       const previous = BigInt(hold.charged);
       if (amount <= previous) return;
       if (hold.closed || amount > BigInt(hold.maximum)) throw fail('Charge exceeds reservation');
@@ -318,38 +338,42 @@ export class CreditStore {
         const take = BigInt(lot.remaining) < remaining ? BigInt(lot.remaining) : remaining;
         if (!take) break;
         await c.query('UPDATE credit_lots SET reserved=reserved-$3,spent=spent+$3 WHERE environment=$1 AND id=$2', [this.environment, lot.lot_id, String(take)]);
-        await c.query('UPDATE credit_session_lots SET reserved=reserved-$4 WHERE environment=$1 AND session_id=$2 AND lot_id=$3', [this.environment, session.id, lot.lot_id, String(take)]);
         await c.query('UPDATE credit_hold_lots SET remaining=remaining-$4 WHERE environment=$1 AND hold_id=$2 AND lot_id=$3', [this.environment, id, lot.lot_id, String(take)]);
         remaining -= take;
       }
-      if (remaining) throw fail('Charge attribution missing');
+      if (remaining > 0n) throw fail('Charge attribution missing');
       await c.query('UPDATE credit_accounts SET spent=spent+$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(delta)]);
-      await c.query('UPDATE credit_sessions SET reserved=reserved-$3,spent=spent+$3 WHERE environment=$1 AND id=$2', [this.environment, session.id, String(delta)]);
       await c.query('UPDATE credit_holds SET charged=$3 WHERE environment=$1 AND id=$2', [this.environment, id, String(amount)]);
       if (hold.creator) {
-        const share = (amount - amount * 20n / 100n) - (previous - previous * 20n / 100n);
-        await c.query('INSERT INTO credit_creators(environment,owner,payable) VALUES($1,$2,$3) ON CONFLICT(environment,owner) DO UPDATE SET payable=credit_creators.payable+excluded.payable', [this.environment, hold.creator, String(share)]);
+        const share = (amount - (amount * 20n) / 100n) - (previous - (previous * 20n) / 100n);
+        await c.query(
+          'INSERT INTO credit_creators(environment,owner,payable) VALUES($1,$2,$3) ON CONFLICT(environment,owner) DO UPDATE SET payable=credit_creators.payable+excluded.payable',
+          [this.environment, hold.creator, String(share)],
+        );
       }
     });
+    await this.invalidateOwner(owner);
   }
+
   async release(owner: string, id: string) {
     await this.tx(async c => {
-      const { session, hold } = await this.hold(c, owner, id);
+      const hold = await this.hold(c, owner, id);
       if (hold.closed) return;
       const amount = BigInt(hold.maximum) - BigInt(hold.charged);
       if (!(await this.posting(c, owner, `release:${id}`, amount, 'service-release'))) return;
-      const toAvailable = session.closed || new Date(session.expires_at).getTime() <= Date.now();
       const lots = (await c.query('SELECT * FROM credit_hold_lots WHERE environment=$1 AND hold_id=$2 AND remaining>0 FOR UPDATE', [this.environment, id])).rows;
       for (const lot of lots) {
-        await c.query(`UPDATE credit_lots SET reserved=reserved-$3,${toAvailable ? 'available' : 'allocated'}=${toAvailable ? 'available' : 'allocated'}+$3 WHERE environment=$1 AND id=$2`, [this.environment, lot.lot_id, String(lot.remaining)]);
-        await c.query(`UPDATE credit_session_lots SET reserved=reserved-$4${toAvailable ? '' : ',remaining=remaining+$4'} WHERE environment=$1 AND session_id=$2 AND lot_id=$3`, [this.environment, session.id, lot.lot_id, String(lot.remaining)]);
+        await c.query('UPDATE credit_lots SET reserved=reserved-$3,available=available+$3 WHERE environment=$1 AND id=$2', [this.environment, lot.lot_id, String(lot.remaining)]);
       }
       await c.query('UPDATE credit_hold_lots SET remaining=0 WHERE environment=$1 AND hold_id=$2', [this.environment, id]);
-      await c.query(`UPDATE credit_sessions SET reserved=reserved-$3${toAvailable ? '' : ',remaining=remaining+$3'} WHERE environment=$1 AND id=$2`, [this.environment, session.id, String(amount)]);
-      if (toAvailable) await c.query('UPDATE credit_accounts SET available=available+$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(amount)]);
+      if (amount > 0n) {
+        await c.query('UPDATE credit_accounts SET available=available+$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(amount)]);
+      }
       await c.query('UPDATE credit_holds SET closed=true WHERE environment=$1 AND id=$2', [this.environment, id]);
     });
+    await this.invalidateOwner(owner);
   }
+
   async creditCapture(owner: string, id: string, captureId: string, amount: bigint) {
     positive(amount);
     await this.tx(async c => {
@@ -357,108 +381,20 @@ export class CreditStore {
       const op = (await c.query('SELECT * FROM credit_operations WHERE environment=$1 AND id=$2 AND owner=$3 FOR UPDATE', [this.environment, id, owner])).rows[0];
       if (!op) throw fail('Unknown payment operation', 404);
       if (String(op.amount) !== String(amount) || op.kind !== 'purchase') throw fail('Capture amount mismatch');
-      if (op.status === 'credited') { if (op.capture_id !== captureId) throw fail('Capture replay mismatch'); return; }
+      if (op.status === 'credited') {
+        if (op.capture_id !== captureId) throw fail('Capture replay mismatch');
+        return;
+      }
       if (await this.posting(c, owner, `capture:${captureId}`, amount, 'purchase')) {
         await c.query('INSERT INTO credit_lots(environment,id,owner,capture_id,amount,available) VALUES($1,$2,$3,$4,$5,$5)', [this.environment, id, owner, captureId, String(amount)]);
         await c.query('UPDATE credit_accounts SET available=available+$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(amount)]);
-      } else throw fail('Capture is already attributed to another operation');
+      } else {
+        throw fail('Capture is already attributed to another operation');
+      }
       await c.query("UPDATE credit_operations SET status='credited',capture_id=$3,updated_at=now() WHERE environment=$1 AND id=$2", [this.environment, id, captureId]);
-      const intent: CreditCheckoutIntent | undefined = op.context.checkout;
-      let session;
-      if (intent?.kind === 'start') session = await this.startInTransaction(c, owner, amount, intent.durationSeconds, `purchase:${id}`);
-      if (intent?.kind === 'topup') {
-        const target = await this.readSession(c, owner, intent.sessionId);
-        // A session may end while the card checkout is open. Paid Credits remain available.
-        if (!target.closed && new Date(target.expires_at).getTime() > Date.now()) session = await this.topupInTransaction(c, owner, target.id, amount, `purchase:${id}`);
-      }
-      if (session) await c.query('UPDATE credit_operations SET context=context||$3::jsonb WHERE environment=$1 AND id=$2', [this.environment, id, JSON.stringify({ sessionId: session.id })]);
     });
-  }private async readSession(c: CreditConnection, owner: string, id: string) {
-    const row = (await c.query('SELECT * FROM credit_sessions WHERE environment=$1 AND id=$2 AND owner=$3 FOR UPDATE', [this.environment, id, owner])).rows[0];
-    if (!row) throw fail('Unknown session', 404);
-    return row;
+    await this.invalidateOwner(owner);
   }
-  
-private active(row: any) {
-    if (row.closed || new Date(row.expires_at).getTime() <= Date.now()) throw fail('Session is closed or expired');
-  }
-  
-private async allocate(c: CreditConnection, owner: string, sid: string, amount: bigint) {
-    const lots = (await c.query("SELECT * FROM credit_lots WHERE environment=$1 AND owner=$2 AND available>0 AND NOT disputed ORDER BY (id LIKE 'promo:%') DESC,created_at,id FOR UPDATE", [this.environment, owner])).rows;
-    let remaining = amount;
-    for (const lot of lots) {
-      const take = BigInt(lot.available) < remaining ? BigInt(lot.available) : remaining;
-      if (!take) break;
-      await c.query('UPDATE credit_lots SET available=available-$3,allocated=allocated+$3 WHERE environment=$1 AND id=$2', [this.environment, lot.id, String(take)]);
-      await c.query('INSERT INTO credit_session_lots(environment,session_id,lot_id,remaining) VALUES($1,$2,$3,$4) ON CONFLICT(environment,session_id,lot_id) DO UPDATE SET remaining=credit_session_lots.remaining+excluded.remaining', [this.environment, sid, lot.id, String(take)]);
-      remaining -= take;
-    }
-    if (remaining) throw fail('Insufficient available Credits', 402);
-  }
-  
-private async close(c: CreditConnection, owner: string, row: any) {
-    if (row.closed) return row;
-    const amount = BigInt(row.remaining);
-    if (await this.posting(c, owner, `end:${row.id}`, amount, 'session-end')) {
-      const lots = (await c.query('SELECT * FROM credit_session_lots WHERE environment=$1 AND session_id=$2 AND remaining>0 FOR UPDATE', [this.environment, row.id])).rows;
-      for (const lot of lots) await c.query('UPDATE credit_lots SET allocated=allocated-$3,available=available+$3 WHERE environment=$1 AND id=$2', [this.environment, lot.lot_id, String(lot.remaining)]);
-      await c.query('UPDATE credit_session_lots SET remaining=0 WHERE environment=$1 AND session_id=$2', [this.environment, row.id]);
-      await c.query('UPDATE credit_accounts SET available=available+$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(amount)]);
-      await c.query('UPDATE credit_sessions SET remaining=0,closed=true WHERE environment=$1 AND id=$2', [this.environment, row.id]);
-    }
-    return { ...row, remaining: '0', closed: true };
-  }
-  
-async start(owner: string, amount: bigint, duration: number, key: string) {
-    positive(amount); identifier(key);
-    if (!Number.isInteger(duration) || duration < 60 || duration > 604800) throw fail('Invalid session duration', 400);
-    return this.tx(c => this.startInTransaction(c, owner, amount, duration, key));
-  }
-  
-private async startInTransaction(c: CreditConnection, owner: string, amount: bigint, duration: number, key: string) {
-    const id = createHash('sha256').update(`${this.environment}:${owner}:session:${key}`).digest('hex');
-      const account = await this.account(c, owner);
-      const previous = (await c.query('SELECT * FROM credit_sessions WHERE environment=$1 AND id=$2', [this.environment, id])).rows[0];
-      if (previous) {
-        const posting = (await c.query('SELECT amount FROM credit_postings WHERE environment=$1 AND id=$2', [this.environment, `start:${id}`])).rows[0];
-        if (String(posting.amount) !== String(amount) || previous.duration_seconds !== duration) throw fail('Session request replay mismatch');
-        return previous;
-      }
-      if (BigInt(account.available) < amount) throw fail('Insufficient available Credits', 402);
-      const row = (await c.query('INSERT INTO credit_sessions(environment,id,owner,budget,remaining,duration_seconds,expires_at) VALUES($1,$2,$3,$4,$4,$5,now()+$5::integer*interval \'1 second\') RETURNING *', [this.environment, id, owner, String(amount), duration])).rows[0];
-      await this.allocate(c, owner, id, amount);
-      if (await this.posting(c, owner, `start:${id}`, amount, 'session-start')) await c.query('UPDATE credit_accounts SET available=available-$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(amount)]);
-      return row;
-  }
-  
-private async topupInTransaction(c: CreditConnection, owner: string, id: string, amount: bigint, key: string) {
-      const account = await this.account(c, owner);
-      const row = await this.readSession(c, owner, id);
-      const post = `topup:${id}:${key}`;
-      const existing = (await c.query('SELECT * FROM credit_postings WHERE environment=$1 AND id=$2', [this.environment, post])).rows[0];
-      if (existing) { if (String(existing.amount) !== String(amount)) throw fail('Top up replay mismatch'); return row; }
-      this.active(row);
-      if (BigInt(account.available) < amount) throw fail('Insufficient available Credits', 402);
-      await this.allocate(c, owner, id, amount);
-      if (await this.posting(c, owner, post, amount, 'session-topup')) {
-        await c.query('UPDATE credit_accounts SET available=available-$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(amount)]);
-        return (await c.query('UPDATE credit_sessions SET remaining=remaining+$3,budget=budget+$3 WHERE environment=$1 AND id=$2 RETURNING *', [this.environment, id, String(amount)])).rows[0];
-      }
-      return row;
-  }
-  
-async topup(owner: string, id: string, amount: bigint, key: string) {
-    positive(amount); identifier(key);
-    return this.tx(c => this.topupInTransaction(c, owner, id, amount, key));
-  }
-  
-async end(owner: string, id: string) {
-    return this.tx(async c => { await this.account(c, owner); return this.close(c, owner, await this.readSession(c, owner, id)); });
-  }
-  
-async session(owner: string, id: string) { return this.tx(c => this.readSession(c, owner, id)); }
-  
-
 }
 
 let store: CreditStore | undefined;
