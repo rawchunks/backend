@@ -3,10 +3,11 @@ import { z } from 'zod';
 import { service } from './service.js';
 import { readSong, readTake, readUser, checkUser } from '../databases/users.js';
 import { songSql } from '../databases/client.js';
-import { uploadToR2 } from '../storage/r2.js';
-import { readWave, extractWavBipolarPeaks } from './audio.js';
+import { uploadToR2, readAudio } from '../storage/r2.js';
+import { readWave, extractWavBipolarPeaks, getInMemoryPeaks, setInMemoryPeaks } from './audio.js';
 import { randomUUID } from 'node:crypto';
-import { getWipState, setWipState, deleteWipState, getCachedPeaks, setCachedPeaks, WIP_TTL_SECONDS } from '../broker/valkey.js';
+import { getWipState, setWipState, deleteWipState, getCachedPeaks, setCachedPeaks, subscribeTask, WIP_TTL_SECONDS } from '../broker/valkey.js';
+import { stateStreams } from '../broker/stream.js';
 
 const baseSchema = {
   songId: z.string().min(1),
@@ -137,6 +138,7 @@ const resolveEditAction = (url: string, routeUrl?: string): string | null => {
 };
 
 export const editingRouter: FastifyPluginAsync = async (fastify) => {
+  const streamState = stateStreams(fastify);
   fastify.addHook('preHandler', async (request, reply) => {
     if (request.method === 'POST') {
       const action = resolveEditAction(request.url, request.routeOptions?.url);
@@ -343,6 +345,8 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
     }
   });
 
+  const inFlightPeaks = new Map<string, Promise<{ mins: number[]; maxs: number[]; duration: number }>>();
+
   fastify.get('/peaks', async (request, reply) => {
     try {
       const { url, bins } = z
@@ -353,18 +357,45 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
         .parse(request.query);
       const targetBins = bins ?? 512;
       const cacheKey = `${url}|${targetBins}`;
+      const memPeaks = getInMemoryPeaks(cacheKey) ?? (targetBins === 512 ? getInMemoryPeaks(url) : undefined);
+      if (memPeaks) {
+        reply.header('Cache-Control', 'public, max-age=604800, immutable');
+        return reply.send(memPeaks);
+      }
       const cached = await getCachedPeaks(cacheKey);
       if (cached) {
+        setInMemoryPeaks(cacheKey, cached);
+        if (targetBins === 512) setInMemoryPeaks(url, cached);
         reply.header('Cache-Control', 'public, max-age=604800, immutable');
         return reply.send(cached);
       }
-      const resp = await fetch(url);
-      if (!resp.ok) {
-        return reply.status(resp.status).send({ error: `Failed to fetch audio (${resp.status})` });
+      let pending = inFlightPeaks.get(cacheKey);
+      if (!pending) {
+        pending = (async () => {
+          let buf: Buffer;
+          try {
+            const loaded = await readAudio(url);
+            buf = loaded.buffer;
+          } catch {
+            const resp = await fetch(url);
+            if (!resp.ok) {
+              const err: any = new Error(`Failed to fetch audio (${resp.status})`);
+              err.statusCode = resp.status;
+              throw err;
+            }
+            buf = Buffer.from(await resp.arrayBuffer());
+          }
+          const computed = extractWavBipolarPeaks(buf, targetBins);
+          setInMemoryPeaks(cacheKey, computed);
+          if (targetBins === 512) setInMemoryPeaks(url, computed);
+          void setCachedPeaks(cacheKey, computed).catch(() => {});
+          return computed;
+        })().finally(() => {
+          inFlightPeaks.delete(cacheKey);
+        });
+        inFlightPeaks.set(cacheKey, pending);
       }
-      const buf = Buffer.from(await resp.arrayBuffer());
-      const peaks = extractWavBipolarPeaks(buf, targetBins);
-      void setCachedPeaks(cacheKey, peaks);
+      const peaks = await pending;
       reply.header('Cache-Control', 'public, max-age=604800, immutable');
       return reply.send(peaks);
     } catch (err: any) {

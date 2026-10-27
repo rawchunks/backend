@@ -8,7 +8,7 @@ import type { TakeProvenance } from '../databases/schema/takes.js';
 import { createStem, updateStemMixer, listStemsBySong } from '../databases/stems.js';
 import { createCommit, listCommitsBySong } from '../databases/commits.js';
 import { persistAudioToR2, readAudio, uploadToR2 } from '../storage/r2.js';
-import { composeEdit, decodeWave, mixWaves, readWave, sliceWave, padWave, silentWave } from './audio.js';
+import { composeEdit, decodeWave, mixWaves, readWave, sliceWave, padWave, silentWave, getInMemoryPeaks } from './audio.js';
 import { transcribeVocalStemOnce, alignVocalStemLyrics, getSongLyricsStatus } from './scribe.js';
 
 export interface Edit {
