@@ -152,6 +152,10 @@ export class Service {
     });
   }
 
+  async sliceSection(params: { songId: string; stemId?: string; sourceTakeId?: string; srcAudioUrl?: string; userAddress: string; start: number; end: number }) {
+    return this.extractSection(params);
+  }
+
   async createCommitSnapshot(params: { songId: string; message: string; userAddress: string; timelineSnapshot?: any }) {
     return withJobLock(`song:${params.songId}`, async (assertLease) => {
       const stems = await listStemsBySong(params.songId);
@@ -186,31 +190,37 @@ export class Service {
     }
     const operationId = `sep-${randomUUID()}`;
     const payload = { src_audio_path: srcAudio, stem_type: requestedStem };
-    const ctx: Context = { kind: 'edit', params: { songId: params.songId, userAddress, task: 'extract', srcAudioUrl: srcAudio }, model: 'demucs-htdemucs', dispatch: payload };
+    const ctx: Context = { kind: 'edit', params: { songId: params.songId, userAddress, task: 'extract', srcAudioUrl: srcAudio }, model: 'demucs-htdemucs', dispatch: payload, dispatched: true };
     await setTaskContext(operationId, ctx);
     const response = await client.separate(payload, { idempotencyKey: operationId });
     const taskId = response.task_id || operationId;
-    ctx.dispatched = true;
     if (response.status === 'ready') {
       const stems = Object.fromEntries(Object.entries(response.stems ?? {}).filter((entry): entry is [string, string] => typeof entry[1] === 'string' && !!entry[1]));
       if (!Object.keys(stems).length) throw failure('Separation completed without valid stems', 502);
       ctx.stems = stems;
     } else if (response.status === 'error') ctx.result = { taskId, status: 'error', progress: 0, songId: params.songId, task: 'extract' };
-    await withJobLock(`task:${taskId}`, async (assertLease) => {
-      if (taskId !== operationId && await getTaskContext(taskId)) throw failure('Worker returned an already bound task identifier', 502);
-      await guarded(assertLease, () => setTaskContext(taskId, ctx, { terminal: !!ctx.result }));
-    });
-    if (taskId !== operationId) await setTaskContext(operationId, { ...ctx, workerTaskId: taskId }, { terminal: true });
+    if (taskId !== operationId || ctx.stems || ctx.result) {
+      await withJobLock(`task:${taskId}`, async (assertLease) => {
+        if (taskId !== operationId && await getTaskContext(taskId)) throw failure('Worker returned an already bound task identifier', 502);
+        await guarded(assertLease, () => setTaskContext(taskId, ctx, { terminal: !!ctx.result }));
+      });
+      if (taskId !== operationId) await setTaskContext(operationId, { ...ctx, workerTaskId: taskId }, { terminal: true });
+    }
     if (response.status !== 'ready') return { taskId, status: response.status, songId: params.songId, task: 'extract' };
     return { ...await this.finalizeEditResult({ ...ctx.params, taskId }), taskId, songId: params.songId, task: 'extract' };
+  }
+
+  async isolateStems(params: { songId: string; stemType?: string; srcAudioUrl?: string; userAddress?: string }): Promise<any> {
+    return this.separateStems(params);
   }
 
   async dispatchEditTask(params: Edit): Promise<any> {
     if (!taskSchema.safeParse(params.task).success) throw failure(`Invalid editing task '${params.task}'`);
     editSchema.parse(params);
     if (params.modelQuality && params.modelVariant && params.modelQuality !== params.modelVariant) throw failure('Conflicting modelQuality and modelVariant');
-    if (params.task === 'extract' && !params.trackName?.trim()) {
-      return this.separateStems({ songId: params.songId, stemType: (params as any).stemType || 'all', srcAudioUrl: params.srcAudioUrl, userAddress: params.userAddress });
+    const rawExtractTrack = params.trackName?.trim().toLowerCase();
+    if (params.task === 'extract' && (!rawExtractTrack || rawExtractTrack === 'all' || rawExtractTrack === 'other' || rawExtractTrack === 'instrumental')) {
+      return this.separateStems({ songId: params.songId, stemType: rawExtractTrack || (params as any).stemType || 'all', srcAudioUrl: params.srcAudioUrl, userAddress: params.userAddress });
     }
     if (params.task === 'repaint' && (params.repaintingStart === undefined || params.repaintingEnd === undefined || params.repaintingEnd <= params.repaintingStart)) throw failure('Repainting start and end bounds must define a positive interval');
     if (params.task === 'extend' && params.audioDuration === undefined) throw failure('Target audio duration is required for extension');
@@ -348,19 +358,21 @@ export class Service {
     };
     let sourceDuration = currentTake?.provenance?.outputDuration ?? song.duration ?? null;
     if (params.task === 'extend' || params.task === 'repaint') {
-      const source = await decodeWave((await readAudio(srcAudio)).buffer);
-      sourceDuration = readWave(source).duration;
-      if (params.task === 'extend') {
-        if (params.audioDuration! <= sourceDuration) throw failure('Extension duration must be greater than the source duration');
-        const extLength = params.audioDuration! - sourceDuration;
-        const insertPoint = (params.repaintingEnd !== undefined && params.repaintingEnd > 0 && params.repaintingEnd < sourceDuration - 0.05)
-          ? params.repaintingEnd
-          : sourceDuration;
-        const targetDuration = insertPoint + extLength;
-        const prefixWave = insertPoint < sourceDuration - 0.05 ? sliceWave(source, { start: 0, end: insertPoint }) : source;
-        params = { ...params, repaintingStart: insertPoint, repaintingEnd: targetDuration };
-        payload.src_audio_path = await uploadToR2('versions', `sources/${params.songId}/${randomUUID()}.wav`, padWave(prefixWave, Math.ceil(targetDuration)));
-        payload.audio_duration = targetDuration;
+      if (params.task === 'extend' || !sourceDuration || sourceDuration <= 0) {
+        const source = await decodeWave((await readAudio(srcAudio)).buffer);
+        sourceDuration = readWave(source).duration;
+        if (params.task === 'extend') {
+          if (params.audioDuration! <= sourceDuration) throw failure('Extension duration must be greater than the source duration');
+          const extLength = params.audioDuration! - sourceDuration;
+          const insertPoint = (params.repaintingEnd !== undefined && params.repaintingEnd > 0 && params.repaintingEnd < sourceDuration - 0.05)
+            ? params.repaintingEnd
+            : sourceDuration;
+          const targetDuration = insertPoint + extLength;
+          const prefixWave = insertPoint < sourceDuration - 0.05 ? sliceWave(source, { start: 0, end: insertPoint }) : source;
+          params = { ...params, repaintingStart: insertPoint, repaintingEnd: targetDuration };
+          payload.src_audio_path = await uploadToR2('versions', `sources/${params.songId}/${randomUUID()}.wav`, padWave(prefixWave, Math.ceil(targetDuration)));
+          payload.audio_duration = targetDuration;
+        }
       }
       Object.assign(payload, { chunk_mask_mode: 'explicit', repainting_start: params.repaintingStart, repainting_end: params.repaintingEnd, repaint_mode: params.repaintMode, repaint_strength: params.repaintStrength, repaint_latent_crossfade_frames: params.repaintLatentCrossfadeFrames, repaint_wav_crossfade_sec: params.repaintWavCrossfadeSec });
     }
@@ -375,7 +387,7 @@ export class Service {
       if (contextStems.length > 1 && contextStems.some(stem => stem.name.toLowerCase() === normalizedTrack)) {
         contextStems = contextStems.filter(stem => stem.name.toLowerCase() !== normalizedTrack);
       }
-      if (contextStems.length > 0) {
+      if (!params.srcAudioUrl && contextStems.length > 0) {
         const stemBuffers = await Promise.all(contextStems.map(async stem => (await readAudio(stem.url)).buffer));
         const mixedBacking = await mixWaves(stemBuffers);
         payload.src_audio_path = await uploadToR2('versions', `sources/${params.songId}/${randomUUID()}.wav`, mixedBacking);

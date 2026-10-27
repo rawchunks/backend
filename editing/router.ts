@@ -121,11 +121,12 @@ import { requireSessionPayment } from '../broker/payment.js';
 
 const PAID_EDIT_ACTIONS: Record<string, string> = {
   '/extract': 'edit-extract',
+  '/slice': 'edit-extract',
   '/repaint': 'edit-repaint',
   '/layer': 'edit-layer',
   '/extend': 'edit-extend',
   '/remix': 'edit-remix',
-  '/separate': 'edit-separate',
+  '/isolate': 'edit-isolate',
   '/apply': 'edit-apply',
 };
 
@@ -200,16 +201,48 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
       return reply.code(error.code === 'FST_REQ_FILE_TOO_LARGE' ? 413 : error instanceof z.ZodError || /WAV/.test(error.message) ? 400 : error.statusCode ?? 500).send({ error: 'Could not save reference audio' });
     }
   });
+  const sliceSchema = z.object({
+    songId: z.string().min(1),
+    stemId: z.string().optional(),
+    sourceTakeId: z.string().optional(),
+    srcAudioUrl: z.string().refine((value) => !/^[a-z][a-z\d+.-]*:/i.test(value) || /^https?:\/\//i.test(value)).optional(),
+    start: z.number().finite().min(0),
+    end: z.number().finite().min(0),
+  }).refine(params => params.end > params.start);
+  const extractAiSchema = z.object({
+    ...baseSchema,
+    trackName: z.string().optional(),
+    stemType: z.string().optional(),
+    prompt: z.string().optional(),
+    lyrics: z.string().optional(),
+    globalCaption: z.string().optional(),
+    start: z.number().finite().min(0).optional(),
+    end: z.number().finite().min(0).optional(),
+    repaintingStart: z.number().finite().min(0).optional(),
+    repaintingEnd: z.number().finite().min(0).optional(),
+  });
+  fastify.post('/slice', async (request, reply) => {
+    try {
+      const params = sliceSchema.parse(request.body);
+      return reply.code(201).send(await service.extractSection({ ...params, userAddress: readUser(request) }));
+    } catch (error: any) { return reply.code(error instanceof z.ZodError ? 400 : error.statusCode ?? 400).send({ error: error.message }); }
+  });
   fastify.post('/extract', async (request, reply) => {
     try {
-      const params = z.object({
-        songId: z.string().min(1),
-        stemId: z.string().optional(),
-        sourceTakeId: z.string().optional(),
-        srcAudioUrl: z.string().refine((value) => !/^[a-z][a-z\d+.-]*:/i.test(value) || /^https?:\/\//i.test(value)).optional(),
-        start: z.number().finite().min(0),
-        end: z.number().finite().min(0),
-      }).refine(params => params.end > params.start).parse(request.body);
+      const raw = (request.body ?? {}) as Record<string, unknown>;
+      if (typeof raw.trackName === 'string' || typeof raw.stemType === 'string') {
+        const p = extractAiSchema.parse(request.body);
+        const res = await service.dispatchEditTask({
+          ...p,
+          task: 'extract',
+          trackName: (p.trackName || p.stemType || 'vocals').trim(),
+          modelQuality: 'base',
+          repaintingStart: p.repaintingStart ?? p.start,
+          repaintingEnd: p.repaintingEnd ?? p.end,
+        });
+        return reply.status(202).send(res);
+      }
+      const params = sliceSchema.parse(request.body);
       return reply.code(201).send(await service.extractSection({ ...params, userAddress: readUser(request) }));
     } catch (error: any) { return reply.code(error instanceof z.ZodError ? 400 : error.statusCode ?? 400).send({ error: error.message }); }
   });
@@ -488,7 +521,7 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
     }
   });
 
-  fastify.post('/separate', async (request, reply) => {
+  const handleIsolate = async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       const p = separateSchema.parse(request.body);
       const res = await service.separateStems({
@@ -500,9 +533,10 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
       return reply.status(200).send(res);
     } catch (err: any) {
       request.log.error(err);
-      return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({ error: err.message || 'Separate failed to initiate' });
+      return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({ error: err.message || 'Isolate failed to initiate' });
     }
-  });
+  };
+  fastify.post('/isolate', handleIsolate);
 
   fastify.post('/apply', async (request, reply) => {
     try {

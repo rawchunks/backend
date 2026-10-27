@@ -12,7 +12,7 @@ const tasks = {
   extend: { id: 'extend', label: 'Extend', description: 'Continue the song beyond its ending.' },
   complete: { id: 'complete', label: 'Accompany', description: 'Create accompaniment for the source.' },
   cover: { id: 'cover', label: 'Restyle', description: 'Rework the song in a different style.' },
-  extract: { id: 'extract', label: 'Separate', description: 'Separate the recording into tracks.' },
+  extract: { id: 'extract', label: 'Extract', description: 'Extract the recording into tracks.' },
 };
 const number = (label: string, min: number, max: number, extra: Record<string, unknown> = {}) => ({ label, type: 'number', min, max, ...extra });
 
