@@ -266,3 +266,19 @@ export function extractWavBipolarPeaks(
   };
 }
 
+const inMemoryPeaksCache = new Map<string, { mins: number[]; maxs: number[]; duration: number }>();
+
+export function setInMemoryPeaks(url: string, peaks: { mins: number[]; maxs: number[]; duration: number }): void {
+  if (!url) return;
+  if (inMemoryPeaksCache.size >= 256) {
+    const oldest = inMemoryPeaksCache.keys().next().value;
+    if (oldest !== undefined) inMemoryPeaksCache.delete(oldest);
+  }
+  inMemoryPeaksCache.set(url, peaks);
+}
+
+export function getInMemoryPeaks(url: string): { mins: number[]; maxs: number[]; duration: number } | undefined {
+  return inMemoryPeaksCache.get(url);
+}
+
+

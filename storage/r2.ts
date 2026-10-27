@@ -1,6 +1,7 @@
 import * as dotenv from 'dotenv';
 import { resolve } from 'path';
 import { isIP } from 'node:net';
+import { extractWavBipolarPeaks, setInMemoryPeaks } from '../editing/audio.js';
 
 dotenv.config({ path: resolve(process.cwd(), '.env') });
 
@@ -68,7 +69,30 @@ export async function uploadToR2(bucket: R2Bucket, key: string, data: Buffer | U
     const result = await providerResult(res, `Failed to upload object to R2 bucket "${bucket}"`);
     if (!result.result || result.result.key !== cleanKey) throw new Error('R2 upload did not acknowledge the requested object');
   });
-  return `${bucketDomain(bucket)}/${encodedKey(cleanKey)}`;
+  const destination = `${bucketDomain(bucket)}/${encodedKey(cleanKey)}`;
+  if (!process.env.VITEST && (bucket === 'versions' || bucket === 'songs') && /^audio\//i.test(contentType)) {
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    try {
+      const peaks = extractWavBipolarPeaks(buf, 512);
+      setInMemoryPeaks(destination, peaks);
+      if (hasValkeyConfig()) {
+        void import('../broker/valkey.js')
+          .then(({ setCachedPeaks }) => setCachedPeaks(`${destination}|512`, peaks))
+          .catch(() => {});
+      }
+    } catch {
+      // Non-WAV or synthetic payloads skip in-memory peak precomputation
+    }
+    if (!inFlightStemBuffers.has(destination)) {
+      while (inFlightStemBuffers.size >= 16) {
+        const oldest = inFlightStemBuffers.keys().next().value;
+        if (oldest !== undefined) inFlightStemBuffers.delete(oldest);
+      }
+      inFlightStemBuffers.set(destination, { buffer: buf, contentType, uploadPromise: Promise.resolve(destination) });
+      setTimeout(() => inFlightStemBuffers.delete(destination), 60_000).unref?.();
+    }
+  }
+  return destination;
 }
 
 /** Returns the raw bucket/key for one of this application's exact public origins. */
@@ -107,6 +131,9 @@ function sourceLocation(sourceUrl: string): { url: URL; workerOrigin: string } {
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || (url.origin !== worker.origin && isPrivateHost(url.hostname))) throw new Error('Unsupported audio source URL');
   return { url, workerOrigin: worker.origin };
 }
+
+const inFlightStemBuffers = new Map<string, { buffer: Buffer; contentType: string; uploadPromise: Promise<string> }>();
+const inFlightAudioReads = new Map<string, Promise<{ buffer: Buffer; contentType: string }>>();
 
 export async function readAudio(sourceUrl: string, fallbackContentType = 'audio/wav'): Promise<{ buffer: Buffer; contentType: string }> {
   let { url, workerOrigin } = sourceLocation(sourceUrl);
