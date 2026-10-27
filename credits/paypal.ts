@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { CreditStore, type CreditCheckoutIntent } from './store.js';
+import { CreditStore } from './store.js';
 
 export const packs = [
   { id: 'usd-10', amountAtomics: '10000000', usd: '10.00' },
@@ -50,21 +50,16 @@ export class PayPal {
     if (op.kind === 'license') return typeof op.context?.usd === 'string' ? op.context.usd : undefined;
     return packs.find(p => p.amountAtomics === String(op.amount))?.usd;
   }
-  async create(owner: string, packId: string, key: string, checkout: CreditCheckoutIntent = { kind: 'balance' }) {
+  async create(owner: string, packId: string, key: string) {
     const pack = packs.find(p => p.id === packId);
     if (!pack) throw fail('Unknown credit package', 400);
-    if (checkout.kind === 'topup') {
-      const target = await this.store.session(owner, checkout.sessionId);
-      if (target.closed || new Date(target.expires_at).getTime() <= Date.now()) throw fail('Session is closed or expired', 409);
-    }
     const id = createHash('sha256').update(`${this.store.environment}:${owner}:${key}`).digest('hex').slice(0, 36);
     await this.store.tx(async c => {
       await c.query('INSERT INTO credit_accounts(environment,owner) VALUES($1,$2) ON CONFLICT DO NOTHING', [this.store.environment, owner]);
-      await c.query("INSERT INTO credit_operations(environment,id,owner,kind,amount,context) VALUES($1,$2,$3,'purchase',$4,$5) ON CONFLICT DO NOTHING", [this.store.environment, id, owner, pack.amountAtomics, JSON.stringify({ packId, checkout })]);
+      await c.query("INSERT INTO credit_operations(environment,id,owner,kind,amount,context) VALUES($1,$2,$3,'purchase',$4,$5) ON CONFLICT DO NOTHING", [this.store.environment, id, owner, pack.amountAtomics, JSON.stringify({ packId })]);
     });
     const existing = await this.operation(id, owner);
     if (String(existing.amount) !== pack.amountAtomics) throw fail('Idempotency key reused for a different package', 409);
-    if (JSON.stringify(existing.context.checkout ?? { kind: 'balance' }) !== JSON.stringify(checkout)) throw fail('Idempotency key reused for a different checkout intent', 409);
     return this.createOrder(id);
   }
   async createLicense(

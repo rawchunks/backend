@@ -342,7 +342,7 @@ export function requireSessionPayment(
   options?: SessionPaymentOptions
 ) {
   return async function sessionPaymentPreHandler(request: FastifyRequest, reply: FastifyReply) {
-    if (request.headers['x-credit-session-token']) {
+    if (request.headers['x-credit-source']) {
       const { admitCredits } = await import('../credits/billing.js');
       return admitCredits(request, reply, configOrResolver, options);
     }

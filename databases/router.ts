@@ -283,7 +283,8 @@ export const databaseRouter: FastifyPluginAsync = async app => {
 
   const streamCheckpointHandler = async (request: FastifyRequest, reply: FastifyReply) => {
     try {
-      if (request.headers['x-credit-session-token']) {
+      const intentId = String((request.body as any)?.paymentIntentId || '');
+      if (request.headers['x-credit-source'] || intentId.startsWith('crd:')) {
         const { checkpointCredits } = await import('../credits/billing.js');
         return reply.send(await checkpointCredits(request));
       }

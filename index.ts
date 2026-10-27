@@ -103,7 +103,7 @@ async function main() {
   // Register Namespaced Service Routes
   await app.register(optionsRouter, { prefix: '/api' });
   if (process.env.CREDITS_ENABLED === 'true') {
-    if ((process.env.CREDITS_SESSION_SECRET || '').length < 32 || !process.env.THIRDWEB_CLIENT_ID || !process.env.CREDITS_IDENTITY_RPC_URL || !process.env.CREDITS_IDENTITY_FACTORY_ADDRESS) throw new Error('Credit ownership verification is not configured');
+    if (!process.env.THIRDWEB_CLIENT_ID || !process.env.CREDITS_IDENTITY_RPC_URL || !process.env.CREDITS_IDENTITY_FACTORY_ADDRESS) throw new Error('Credit ownership verification is not configured');
     const credits = creditStore();
     await credits.migrate();
     await app.register(creditsRouter, { prefix: '/api' });
@@ -158,7 +158,7 @@ async function main() {
   app.post('/layer', forward('/api/editing/layer'));
   app.post('/extend', forward('/api/editing/extend'));
   app.post('/remix', forward('/api/editing/remix'));
-  app.post('/separate', forward('/api/editing/separate'));
+  app.post('/isolate', forward('/api/editing/isolate'));
   app.post('/reset', forward('/api/editing/reset'));
   app.post('/voice', forward('/voices'));
   app.put('/user', forward('/api/user'));
