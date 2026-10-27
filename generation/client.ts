@@ -176,7 +176,7 @@ export class Client {
     if (!model) return this.baseUrl;
     if (model.endsWith('-turbo')) return this.turboUrl;
     if (model.endsWith('-sft')) return this.sftUrl;
-    if (model.endsWith('-base')) return this.baseModelUrl;
+    if (model.endsWith('-base') || model === 'demucs-htdemucs') return this.baseModelUrl;
     return this.baseUrl;
   }
 
@@ -267,20 +267,38 @@ export class Client {
     return { task_id: id, status: state(data.status), message: data.message ?? json.error };
   }
 
-  async separate(payload: { src_audio_path: string; stem_type?: string }, options: { idempotencyKey?: string } = {}): Promise<{
+  private resolveStemMap(rawStems: unknown, targetBaseUrl?: string): Record<string, string> {
+    if (!record(rawStems)) return {};
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(rawStems)) {
+      if (typeof v !== 'string' || !v) continue;
+      if (/^https?:\/\//i.test(v)) {
+        out[k] = v;
+      } else if (targetBaseUrl && targetBaseUrl !== this.baseUrl) {
+        const path = cleanAudioPath(v);
+        out[k] = path ? `${targetBaseUrl}/v1/audio?path=${encodeURIComponent(path)}` : `${targetBaseUrl}${v.startsWith('/') ? '' : '/'}${v}`;
+      } else {
+        out[k] = v;
+      }
+    }
+    return out;
+  }
+
+  async separate(payload: { src_audio_path: string; stem_type?: string; wait?: boolean }, options: { idempotencyKey?: string } = {}): Promise<{
     task_id: string;
     status: string;
     stems: { vocals?: string; drums?: string; bass?: string; other?: string; instrumental?: string };
     audio_paths?: string[];
   }> {
-    const data = this.unwrap(await this.request('/separate', { ...payload, src_audio_path: cleanAudioPath(payload.src_audio_path), wait: false }, this.timeoutMs, options.idempotencyKey));
+    const data = this.unwrap(await this.request('/isolate', { ...payload, src_audio_path: cleanAudioPath(payload.src_audio_path), wait: payload.wait ?? false }, this.timeoutMs, options.idempotencyKey, this.baseModelUrl));
     const id = data.task_id ?? data.id;
     if (options.idempotencyKey !== undefined && id !== options.idempotencyKey) throw transportError('AceStep separation task identifier does not match the admission key');
-    return { ...data, task_id: id, status: state(data.status), stems: record(data.stems) ? data.stems : {} } as any;
+    return { ...data, task_id: id, status: state(data.status), stems: this.resolveStemMap(data.stems, this.baseModelUrl) } as any;
   }
 
-  async queryResult(taskIds: string[]): Promise<Query> {
-    const json = await this.request('/query_result', { task_id_list: taskIds, task_ids: taskIds });
+  async queryResult(taskIds: string[], model?: string): Promise<Query> {
+    const targetBaseUrl = this.endpointForModel(model);
+    const json = await this.request('/query_result', { task_id_list: taskIds, task_ids: taskIds }, this.timeoutMs, undefined, targetBaseUrl);
     const data = json?.data ?? json?.results ?? json;
     const results: Record<string, Item> = Object.create(null);
     const entries = Array.isArray(data) ? data.map((item) => [undefined, item]) : record(data) ? Object.entries(data) : [];
@@ -298,7 +316,14 @@ export class Client {
       const addAudio = (raw: unknown) => {
         if (typeof raw !== 'string' || !raw) return;
         const path = cleanAudioPath(raw);
-        if (path) audioUrls.push(/^https?:\/\//i.test(path) ? path : `/api/audio?path=${encodeURIComponent(path)}`);
+        if (!path) return;
+        if (/^https?:\/\//i.test(path)) {
+          audioUrls.push(path);
+        } else if (model && targetBaseUrl && targetBaseUrl !== this.baseUrl) {
+          audioUrls.push(`${targetBaseUrl}/v1/audio?path=${encodeURIComponent(path)}`);
+        } else {
+          audioUrls.push(`/api/audio?path=${encodeURIComponent(path)}`);
+        }
       };
       if (Array.isArray(item.audio_urls)) item.audio_urls.forEach(addAudio);
       if (Array.isArray(item.audio_paths)) item.audio_paths.forEach(addAudio);
@@ -312,9 +337,10 @@ export class Client {
         if (typeof part.progress === 'number' && Number.isFinite(part.progress)) progress = Math.round(part.progress * 100);
         if (status === 'pending' && part.stage && part.stage !== 'queued') status = 'processing';
       }
+      const resolvedStems = this.resolveStemMap(item.stems, model ? targetBaseUrl : undefined);
       results[id] = {
         task_id: id, status,
-        ...(record(item.stems) ? { stems: Object.fromEntries(Object.entries(item.stems).filter((entry) => typeof entry[1] === 'string' && !!entry[1])) } : {}),
+        ...(Object.keys(resolvedStems).length ? { stems: resolvedStems } : {}),
         ...(progress === undefined && status !== 'ready' ? {} : { progress: Math.min(100, Math.max(0, progress ?? 100)) }),
         audio_urls: audioUrls.length ? audioUrls : undefined,
         metas: metas.length ? metas : undefined,
