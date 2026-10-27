@@ -3,7 +3,18 @@
 from __future__ import annotations
 
 import os
+import sys
+import types
 from typing import Any, Callable, Optional
+
+try:
+    import torch
+    import torch.nn.functional as F
+    _compile_dynamic = torch.compile(dynamic=True)
+except ImportError:
+    torch = None  # type: ignore[assignment]
+    F = None  # type: ignore[assignment]
+    _compile_dynamic = lambda fn: fn
 
 from acestep.model_downloader import get_checkpoints_dir
 from acestep.gpu_config import (
@@ -12,6 +23,23 @@ from acestep.gpu_config import (
     set_global_gpu_config,
 )
 from acestep.api.startup_llm_init import initialize_llm_at_startup
+
+
+@_compile_dynamic
+def _fused_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    input_dtype = x.dtype
+    variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    return weight * x.to(input_dtype)
+
+
+@_compile_dynamic
+def _fused_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    return F.silu(gate) * up
 
 
 def do_model_initialization(
