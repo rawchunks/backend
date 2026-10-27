@@ -294,6 +294,43 @@ def _install_windowed_cfg_acceleration(model: Any) -> None:
     decoder._windowed_cfg_installed = True
 
 
+def _install_fused_dit_kernels(model: Any) -> None:
+    """Compile whole DiT layers with dynamic=True and pre-populated cross-attention cache."""
+    if torch is None or not torch.cuda.is_available():
+        return
+    decoder = getattr(model, "decoder", None)
+    if decoder is None or getattr(decoder, "_fused_dit_kernels_installed", False):
+        return
+    layers = getattr(decoder, "layers", None)
+    if not layers:
+        return
+    try:
+        torch._dynamo.config.cache_size_limit = 256
+        if hasattr(torch._dynamo.config, "accumulated_cache_size_limit"):
+            torch._dynamo.config.accumulated_cache_size_limit = 1024
+
+        mod = sys.modules.get(decoder.__class__.__module__)
+        if mod is not None and hasattr(mod, "apply_rotary_pos_emb") and not getattr(mod, "_rope_compiled", False):
+            orig_rope = mod.apply_rotary_pos_emb
+            mod.apply_rotary_pos_emb = torch.compile(orig_rope, dynamic=True)
+            mod._rope_compiled = True
+
+        def _norm_forward(self_norm: Any, x: torch.Tensor) -> torch.Tensor:
+            return _fused_rms_norm(x, self_norm.weight, self_norm.variance_epsilon)
+
+        for layer in layers:
+            if not getattr(layer, "_layer_compiled", False):
+                layer.forward = torch.compile(layer.forward, dynamic=True)
+                layer._layer_compiled = True
+        if hasattr(decoder, "norm_out") and getattr(decoder.norm_out, "weight", None) is not None:
+            decoder.norm_out.forward = types.MethodType(_norm_forward, decoder.norm_out)
+
+        decoder._fused_dit_kernels_installed = True
+        print("[API Server] Whole-layer DiT Triton kernels installed (dynamic=True)")
+    except Exception as exc:
+        print(f"[API Server] Warning: DiT fused kernel compilation skipped: {exc}")
+
+
 def do_model_initialization(
     *,
     app: Any,
