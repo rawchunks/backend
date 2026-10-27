@@ -452,6 +452,15 @@ export class Service {
     if (initial.workerTaskId) return this.finalizeEditResult({ ...params, taskId: initial.workerTaskId });
     const bound = initial.params;
     if (bound.songId !== params.songId || bound.task !== params.task || address(bound.userAddress) !== address(params.userAddress) || (params.stemId !== undefined && params.stemId !== bound.stemId)) throw failure('Task does not match supplied song, user, stem or task kind', 409);
+    if (initial.result && !initial.result.take) return initial.result;
+    let prefetchedTask: any;
+    if (!initial.result && !initial.rawUrl && !(initial.params.task === 'extract' && initial.stems)) {
+      prefetchedTask = (await client.queryResult([params.taskId], ...(initial.model && !initial.model.endsWith('-turbo') ? [initial.model] : []))).results[params.taskId];
+      if (!prefetchedTask) return { status: 'pending', progress: 0 };
+      if (prefetchedTask.status !== 'ready' && prefetchedTask.status !== 'error') {
+        return { status: prefetchedTask.status, progress: prefetchedTask.progress, error: prefetchedTask.error };
+      }
+    }
     return withJobLock(`song:${params.songId}`, async (assertLease) => {
       const ctx = await getTaskContext<Context>(params.taskId);
       if (!ctx || ctx.kind !== 'edit') throw failure('Unknown edit task', 404);
@@ -468,7 +477,7 @@ export class Service {
       const id = identity(params.songId, params.taskId);
       if (ctx.params.task === 'extract' && ctx.stems) return this.finalizeSeparation(params.taskId, ctx, id, assertLease);
       if (!ctx.rawUrl) {
-        const task = (await client.queryResult([params.taskId])).results[params.taskId];
+        const task = prefetchedTask ?? (await client.queryResult([params.taskId], ...(ctx.model && !ctx.model.endsWith('-turbo') ? [ctx.model] : []))).results[params.taskId];
         if (!task) return { status: 'pending', progress: 0 };
         if (task.status !== 'ready') {
           const result = { status: task.status, progress: task.progress, error: task.error };
@@ -477,12 +486,10 @@ export class Service {
         }
         if (ctx.params.task === 'extract' && task.stems && Object.keys(task.stems).length) {
           ctx.stems = task.stems;
-          await save();
           return this.finalizeSeparation(params.taskId, ctx, id, assertLease);
         }
         if (ctx.params.task === 'extract' && ctx.params.trackName && Array.isArray(task.audio_urls) && typeof task.audio_urls[0] === 'string' && task.audio_urls[0]) {
           ctx.stems = { [ctx.params.trackName]: task.audio_urls[0] };
-          await save();
           return this.finalizeSeparation(params.taskId, ctx, id, assertLease);
         }
         if (ctx.params.task === 'extract' || !Array.isArray(task.audio_urls) || typeof task.audio_urls[0] !== 'string' || !task.audio_urls[0]) {
@@ -532,32 +539,46 @@ export class Service {
   }
 
   private async finalizeSeparation(taskId: string, ctx: Context, id: string, assertLease: () => Promise<void>) {
+    await assertLease();
     const extracted = ctx.extracted ??= [];
     const extractedTakes = ctx.extractedTakes ??= [];
-    const save = async () => { await guarded(assertLease, () => setTaskContext(taskId, ctx)); };
     const entries = Object.entries(ctx.stems!);
-    const uploadedUrls = await Promise.all(
-      entries.map(async ([, rawUrl], index) => {
-        if (extracted[index]?.url) return extracted[index].url as string;
-        return guarded(assertLease, () => persistAudioToR2('versions', `stems/${id}-${index}.wav`, rawUrl));
+    const needsTakes = entries.some((_, index) => !extractedTakes[index]);
+    const needsCommit = !ctx.commit;
+    const [uploadedUrls, existingTakes, commits] = await Promise.all([
+      Promise.all(
+        entries.map(async ([, rawUrl], index) => {
+          if (extracted[index]?.url) return extracted[index].url as string;
+          return persistAudioToR2('versions', `stems/${id}-${index}.wav`, rawUrl);
+        })
+      ),
+      needsTakes ? listTakesBySong(ctx.params.songId) : Promise.resolve([]),
+      needsCommit ? listCommitsBySong(ctx.params.songId) : Promise.resolve([]),
+    ]);
+    let nextTakeNumber = needsTakes ? nextTake(existingTakes) : 1;
+    await Promise.all(
+      entries.map(async ([name], index) => {
+        if (!extracted[index]) {
+          const url = uploadedUrls[index];
+          const stem = await createStem({ id: `stem-${ctx.params.songId}-${name}`, song_id: ctx.params.songId, name: name.toLowerCase(), url, waveform_peaks_url: null, volume: 1, pan: 0, is_muted: true, is_solo: false });
+          const peaks = getInMemoryPeaks(url);
+          if (peaks) {
+            (stem as any).peaks = peaks;
+          }
+          extracted[index] = stem;
+        }
+        if (!extractedTakes[index]) {
+          const takeId = `take-extract-${id}-${index}`;
+          const takeNum = nextTakeNumber++;
+          if (!existingTakes.some((take) => take.id === takeId)) {
+            await createTake({ id: takeId, song_id: ctx.params.songId, stem_id: extracted[index].id, take_number: takeNum, model: ctx.model, task: 'extract', prompt: null, lyrics: null, url: extracted[index].url, waveform_url: null, is_active: true, seed: null });
+          }
+          extractedTakes[index] = true;
+        }
       })
     );
-    for (let index = 0; index < entries.length; index++) {
-      const [name] = entries[index];
-      if (!extracted[index]) {
-        const url = uploadedUrls[index];
-        extracted[index] = await guarded(assertLease, () => createStem({ id: `stem-${ctx.params.songId}-${name}`, song_id: ctx.params.songId, name: name.toLowerCase(), url, waveform_peaks_url: null, volume: 1, pan: 0, is_muted: true, is_solo: false })); await save();
-      }
-      if (!extractedTakes[index]) {
-        const takes = await listTakesBySong(ctx.params.songId);
-        const takeId = `take-extract-${id}-${index}`;
-        if (!takes.some((take) => take.id === takeId)) await guarded(assertLease, () => createTake({ id: takeId, song_id: ctx.params.songId, stem_id: extracted[index].id, take_number: nextTake(takes), model: ctx.model, task: 'extract', prompt: null, lyrics: null, url: extracted[index].url, waveform_url: null, is_active: true, seed: null }));
-        extractedTakes[index] = true; await save();
-      }
-    }
     if (!ctx.commit) {
-      const commits = await listCommitsBySong(ctx.params.songId);
-      ctx.commit = commits.find((commit) => commit.id === `commit-${id}`) ?? await guarded(assertLease, () => createCommit({ id: `commit-${id}`, song_id: ctx.params.songId, user_address: address(ctx.params.userAddress), parent_commit_id: commits[0]?.id ?? null, message: `Extracted real multi-track stems (${entries.map(([name]) => name).join(', ')})`, timeline_snapshot: { stems: ctx.extracted, stemsCount: extracted.length, timestamp: new Date().toISOString() } })); await save();
+      ctx.commit = commits.find((commit) => commit.id === `commit-${id}`) ?? await createCommit({ id: `commit-${id}`, song_id: ctx.params.songId, user_address: address(ctx.params.userAddress), parent_commit_id: commits[0]?.id ?? null, message: `Extracted real multi-track stems (${entries.map(([name]) => name).join(', ')})`, timeline_snapshot: { stems: ctx.extracted, stemsCount: extracted.length, timestamp: new Date().toISOString() } });
     }
     const vocalsStem = extracted.find((s: any) => s && typeof s.name === 'string' && s.name.toLowerCase() === 'vocals');
     if (vocalsStem?.url) {
@@ -566,7 +587,7 @@ export class Service {
       });
     }
     ctx.result = { status: 'ready', progress: 100, stems: ctx.extracted };
-    await guarded(assertLease, () => setTaskContext(taskId, ctx, { terminal: true })); return ctx.result;
+    await setTaskContext(taskId, ctx, { terminal: true }); return ctx.result;
   }
 
   async switchActiveTake(songId: string, stemId: string | null, takeId: string, userAddress?: string, action: 'base' | 'merge' = 'base', merge?: Merge) {
@@ -590,7 +611,7 @@ export class Service {
       const currentUrl = isLayerTake
         ? (existingLayerStem?.url ?? null)
         : (take.stem_id ? stems.find(stem => stem.id === take!.stem_id)?.url : song.url);
-      if (action === 'merge' && !take.provenance?.region && !isLayerTake && !isFullSongCover) throw failure('Select a segment to merge');
+      if (action === 'merge' && !take.provenance?.region && !isLayerTake) throw failure('Select a segment to merge');
       if (action === 'merge' && take.provenance?.region && currentUrl) {
         const [current, version] = await Promise.all([readAudio(currentUrl), readAudio(take.url)]);
         const composed = await composeEdit(current.buffer, version.buffer, take.provenance.region, take.provenance.audioOffset ?? take.provenance.region.start);
