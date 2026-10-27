@@ -126,37 +126,111 @@ export class CreditStore {
     return false;
   }
 
-  private async promoStatus(c: CreditConnection, owner: string, identityHash?: string | null): Promise<CreditPromoStatus> {
+  private async getPromoRemaining(c: CreditConnection): Promise<number> {
+    const key = this.promoCountKey();
+    const hit = await cacheGet<number>(key, PROMO_COUNT_L1_TTL_MS);
+    if (hit !== undefined) return hit;
     const countRow = (await c.query('SELECT count(*)::int AS count FROM credit_lots WHERE environment=$1 AND id LIKE $2', [this.environment, `${PROMO_CAMPAIGN_ID}:%`])).rows[0];
     const remaining = Math.max(0, PROMO_MAX_CLAIMS - Number(countRow?.count ?? 0));
+    await cacheSet(key, remaining, PROMO_COUNT_L2_TTL_SEC, PROMO_COUNT_L1_TTL_MS);
+    return remaining;
+  }
+
+  async publicPromoRemaining(): Promise<number> {
+    const key = this.promoCountKey();
+    const hit = await cacheGet<number>(key, PROMO_COUNT_L1_TTL_MS);
+    if (hit !== undefined) return hit;
+    return singleFlight(`sf:${key}`, async () => {
+      const conn = await this.pool.connect();
+      try {
+        return await this.getPromoRemaining(conn);
+      } finally {
+        conn.release();
+      }
+    });
+  }
+
+  async publicPromoStatus(): Promise<CreditPromoStatus> {
+    const remaining = await this.publicPromoRemaining();
+    return {
+      eligible: remaining > 0,
+      claimed: false,
+      remaining,
+      maxClaims: PROMO_MAX_CLAIMS,
+      amountAtomics: String(PROMO_AMOUNT_ATOMICS),
+      availableAtomics: '0',
+      reservedAtomics: '0',
+      spentAtomics: '0',
+      ...(remaining <= 0 ? { reason: 'exhausted' } : {}),
+    };
+  }
+
+  private async promoStatus(c: CreditConnection, owner: string, identityHash?: string | null): Promise<CreditPromoStatus> {
+    const remaining = await this.getPromoRemaining(c);
+    const maxClaims = PROMO_MAX_CLAIMS;
     const lotId = `${PROMO_CAMPAIGN_ID}:${owner}`;
     const claimedRow = identityHash
       ? (await c.query('SELECT id FROM credit_lots WHERE environment=$1 AND (id=$2 OR capture_id=$3) LIMIT 1', [this.environment, lotId, `${PROMO_CAMPAIGN_ID}:${identityHash}`])).rows[0]
       : (await c.query('SELECT id FROM credit_lots WHERE environment=$1 AND id=$2 LIMIT 1', [this.environment, lotId])).rows[0];
     const claimed = Boolean(claimedRow);
     const amountAtomics = String(PROMO_AMOUNT_ATOMICS);
-    if (claimed) return { eligible: false, claimed: true, remaining, amountAtomics, reason: 'claimed' };
-    if (remaining <= 0) return { eligible: false, claimed: false, remaining: 0, amountAtomics, reason: 'exhausted' };
-    if (!identityHash) return { eligible: false, claimed: false, remaining, amountAtomics, reason: 'identity_required' };
-    return { eligible: true, claimed: false, remaining, amountAtomics };
+    const totals = (await c.query(
+      "SELECT coalesce(sum(available+allocated),0)::text AS available,coalesce(sum(reserved),0)::text AS reserved,coalesce(sum(spent),0)::text AS spent FROM credit_lots WHERE environment=$1 AND owner=$2 AND id LIKE 'promo:%' AND NOT disputed",
+      [this.environment, owner],
+    )).rows[0];
+    const balances = {
+      availableAtomics: totals?.available ?? '0',
+      reservedAtomics: totals?.reserved ?? '0',
+      spentAtomics: totals?.spent ?? '0',
+    };
+    if (claimed) return { eligible: false, claimed: true, remaining, maxClaims, amountAtomics, ...balances, reason: 'claimed' };
+    if (remaining <= 0) return { eligible: false, claimed: false, remaining: 0, maxClaims, amountAtomics, ...balances, reason: 'exhausted' };
+    if (!identityHash) return { eligible: false, claimed: false, remaining, maxClaims, amountAtomics, ...balances, reason: 'identity_required' };
+    return { eligible: true, claimed: false, remaining, maxClaims, amountAtomics, ...balances };
   }
-  async balance(owner: string, identityHash?: string | null) {
-    return this.tx(async c => {
-      const promo = await this.promoStatus(c, owner, identityHash);
-      const account = (await c.query('SELECT * FROM credit_accounts WHERE environment=$1 AND owner=$2 FOR UPDATE', [this.environment, owner])).rows[0];
-      if (!account) return { availableAtomics: '0', allocatedAtomics: '0', reservedAtomics: '0', spentAtomics: '0', suspendedAtomics: '0', promo };
-      const expired = (await c.query('SELECT * FROM credit_sessions WHERE environment=$1 AND owner=$2 AND NOT closed AND expires_at<=now() FOR UPDATE', [this.environment, owner])).rows;
-      for (const row of expired) await this.close(c, owner, row);
-      const fresh = (await c.query('SELECT * FROM credit_accounts WHERE environment=$1 AND owner=$2', [this.environment, owner])).rows[0];
-      const totals = (await c.query('SELECT coalesce(sum(remaining),0)::text allocated,coalesce(sum(reserved),0)::text reserved FROM credit_sessions WHERE environment=$1 AND owner=$2', [this.environment, owner])).rows[0];
-      return { availableAtomics: String(fresh.available), allocatedAtomics: totals.allocated, reservedAtomics: totals.reserved, spentAtomics: String(fresh.spent), suspendedAtomics: String(fresh.suspended), promo };
+
+  private async balanceInConnection(c: CreditConnection, owner: string, identityHash?: string | null): Promise<CreditBalanceSnapshot> {
+    const account = (await c.query('SELECT * FROM credit_accounts WHERE environment=$1 AND owner=$2', [this.environment, owner])).rows[0];
+    const promo = await this.promoStatus(c, owner, identityHash);
+    if (!account) {
+      return {
+        availableAtomics: '0',
+        reservedAtomics: '0',
+        spentAtomics: '0',
+        suspendedAtomics: '0',
+        promo,
+      };
+    }
+    const cardTotals = (await c.query(
+      "SELECT coalesce(sum(available+allocated),0)::text AS available,coalesce(sum(reserved),0)::text AS reserved,coalesce(sum(spent),0)::text AS spent,coalesce(sum(suspended),0)::text AS suspended FROM credit_lots WHERE environment=$1 AND owner=$2 AND id NOT LIKE 'promo:%' AND NOT disputed",
+      [this.environment, owner],
+    )).rows[0];
+    return {
+      availableAtomics: cardTotals.available,
+      reservedAtomics: cardTotals.reserved,
+      spentAtomics: cardTotals.spent,
+      suspendedAtomics: cardTotals.suspended,
+      promo,
+    };
+  }
+
+  async balance(owner: string, identityHash?: string | null): Promise<CreditBalanceSnapshot> {
+    const key = this.ownerSnapKey(owner);
+    const hit = await cacheGet<{ balance: CreditBalanceSnapshot; hasIdentityHash: boolean }>(key, SNAPSHOT_L1_TTL_MS);
+    if (hit && (hit.hasIdentityHash || !identityHash)) {
+      return hit.balance;
+    }
+    return singleFlight(`sf:${key}`, async () => {
+      const balance = await this.tx(c => this.balanceInConnection(c, owner, identityHash));
+      await cacheSet(key, { balance, hasIdentityHash: Boolean(identityHash) }, SNAPSHOT_L2_TTL_SEC, SNAPSHOT_L1_TTL_MS);
+      return balance;
     });
   }
-  async claimPromo(owner: string, identityHash: string | null | undefined, duration: number, key: string) {
+
+  async claimPromo(owner: string, identityHash: string | null | undefined, key: string): Promise<CreditBalanceSnapshot> {
     identifier(key);
-    if (!Number.isInteger(duration) || duration < 60 || duration > 604800) throw fail('Invalid session duration', 400);
     if (!identityHash) throw fail('A verified email or social account is required to claim Campaign Credits', 403);
-    return this.tx(async c => {
+    const balance = await this.tx(async c => {
       await c.query('SELECT pg_advisory_xact_lock($1)', [20261000]);
       await this.account(c, owner);
       const lotId = `${PROMO_CAMPAIGN_ID}:${owner}`;
@@ -166,16 +240,23 @@ export class CreditStore {
       const countRow = (await c.query('SELECT count(*)::int AS count FROM credit_lots WHERE environment=$1 AND id LIKE $2', [this.environment, `${PROMO_CAMPAIGN_ID}:%`])).rows[0];
       if (Number(countRow?.count ?? 0) >= PROMO_MAX_CLAIMS) throw fail('Campaign Credits exhausted (first 1,000 users reached)', 409);
       if (await this.posting(c, owner, `capture:${captureId}`, PROMO_AMOUNT_ATOMICS, 'promo')) {
-        await c.query('INSERT INTO credit_lots(environment,id,owner,capture_id,amount,available) VALUES($1,$2,$3,$4,$5,$5)', [this.environment, lotId, owner, captureId, String(PROMO_AMOUNT_ATOMICS)]);
-        await c.query('UPDATE credit_accounts SET available=available+$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(PROMO_AMOUNT_ATOMICS)]);
+        await c.query(
+          'INSERT INTO credit_lots(environment,id,owner,capture_id,amount,available) VALUES($1,$2,$3,$4,$5,$5)',
+          [this.environment, lotId, owner, captureId, String(PROMO_AMOUNT_ATOMICS)],
+        );
+        await c.query(
+          'UPDATE credit_accounts SET available=available+$3 WHERE environment=$1 AND owner=$2',
+          [this.environment, owner, String(PROMO_AMOUNT_ATOMICS)],
+        );
       } else {
         throw fail('Campaign Credits already claimed', 409);
       }
-      const openSession = (await c.query('SELECT * FROM credit_sessions WHERE environment=$1 AND owner=$2 AND NOT closed AND expires_at>now() ORDER BY created_at DESC LIMIT 1 FOR UPDATE', [this.environment, owner])).rows[0];
-      if (openSession) return this.topupInTransaction(c, owner, openSession.id, PROMO_AMOUNT_ATOMICS, `promo:${key}`);
-      return this.startInTransaction(c, owner, PROMO_AMOUNT_ATOMICS, duration, `promo:${key}`);
+      return this.balanceInConnection(c, owner, identityHash);
     });
+    await this.invalidateOwner(owner, true);
+    return balance;
   }
+
   async reserve(owner: string, sid: string, id: string, maximum: bigint, resource: string, creator?: string) {
     positive(maximum); identifier(id);
     return this.tx(async c => {
