@@ -1,11 +1,11 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { getWalletPair, putWalletPair, getUserConsent, putUserConsent, getUserGuides, putUserGuides, parseAddress, updateProfile } from './users.js';
+import { getWalletPair, getWalletPairsByAddresses, putWalletPair, getUserConsent, putUserConsent, getUserGuides, putUserGuides, parseAddress, updateProfile } from './users.js';
 import { listSongsByCreator, listAllSongs, getFullSongProject, updateSong, deleteSong, getSongById, createSong, copySong } from './songs.js';
 import { randomUUID } from 'node:crypto';
 import { listStemsBySong } from './stems.js';
 import { listTakesBySong, deleteTake } from './takes.js';
-import { RequestError, readUser, readSong, readTake, checkUser } from './users.js';
+import { RequestError, readUser, readSong, readTake, checkUser, checkUserOrPair } from './users.js';
 import { requireSessionPayment, extractSessionToken, parseComposeToken, settleStreamCheckpoint, type SessionPaymentConfig } from '../broker/payment.js';
 import {
   createAlbum,
@@ -21,12 +21,17 @@ import {
 
 const text = z.string().refine(value => value.trim().length > 0, 'Value must not be empty');
 const address = text.refine(value => { try { parseAddress(value); return true; } catch { return false; } }, 'Invalid wallet address');
-const pairBody = z.object({ evmAddress: address, svmAddress: address });
+const pairBody = z.object({
+  evmAddress: address.optional(),
+  svmAddress: address.optional(),
+}).refine(data => Boolean(data.evmAddress || data.svmAddress), 'At least one wallet address is required');
 const profileBody = z.object({
   address: address.optional(),
   nickname: z.string().max(50).nullable().optional(),
   avatar: z.string().max(2048).nullable().optional(),
+  bio: z.string().max(280).nullable().optional(),
   svmAddress: address.optional(),
+  evmAddress: address.optional(),
 });
 const consentBody = z.object({
   address: address.optional(), evmAddress: address.optional(), svmAddress: address.optional(),
@@ -154,10 +159,20 @@ export const databaseRouter: FastifyPluginAsync = async app => {
     try {
       const parsed = pairBody.parse(request.body);
       const userAddress = readUser(request);
-      if (userAddress !== parseAddress(parsed.evmAddress).value && userAddress !== parseAddress(parsed.svmAddress).value) throw new RequestError('userAddress does not match this pair', 403);
+      const evmVal = parsed.evmAddress ? parseAddress(parsed.evmAddress).value : null;
+      const svmVal = parsed.svmAddress ? parseAddress(parsed.svmAddress).value : null;
+      if (userAddress !== evmVal && userAddress !== svmVal) throw new RequestError('userAddress does not match this pair', 403);
       return reply.send(await putWalletPair(parsed));
     }
     catch (error) { return failure(request, reply, error, 'Failed to register wallet pair'); }
+  });
+  app.get('/users', async (request, reply) => {
+    try {
+      const { addresses } = request.query as { addresses?: string };
+      if (!addresses || typeof addresses !== 'string') return reply.send([]);
+      const rawList = Array.from(new Set(addresses.split(',').map(s => s.trim()).filter(Boolean))).slice(0, 100);
+      return reply.send(await getWalletPairsByAddresses(rawList));
+    } catch (error) { return failure(request, reply, error, 'Failed to lookup wallet pairs'); }
   });
   app.get('/user/:address', async (request, reply) => {
     try {
@@ -172,12 +187,14 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       const parsed = profileBody.parse(request.body || {});
       const userAddress = readUser(request);
       const targetAddress = parsed.address || userAddress;
-      await checkUser(userAddress, targetAddress);
+      await checkUserOrPair(userAddress, targetAddress);
       const pair = await updateProfile({
         address: targetAddress,
         nickname: parsed.nickname,
         avatar: parsed.avatar,
+        bio: parsed.bio,
         svmAddress: parsed.svmAddress,
+        evmAddress: parsed.evmAddress,
       });
       return reply.send(pair);
     } catch (error) { return failure(request, reply, error, 'Failed to update user profile'); }
@@ -199,7 +216,7 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       const parsed = consentBody.parse(request.body);
       const userAddress = readUser(request);
       const signingAddress = parsed.address ?? parsed.evmAddress ?? parsed.svmAddress!;
-      await checkUser(userAddress, signingAddress);
+      await checkUserOrPair(userAddress, signingAddress);
       const record = await putUserConsent({
         address: signingAddress, svmAddress: parsed.svmAddress, chainId: parsed.chainId,
         disclaimerType: parsed.disclaimerType, policyVersion: parsed.policyVersion, signature: parsed.signature,
@@ -222,7 +239,7 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       const parsed = guidesBody.parse(request.body || {});
       const userAddress = readUser(request);
       const targetAddress = parsed.address || userAddress;
-      await checkUser(userAddress, targetAddress);
+      await checkUserOrPair(userAddress, targetAddress);
       const guides = await putUserGuides({ address: targetAddress, guides: parsed.guides });
       return reply.send({ guides });
     } catch (error) { return failure(request, reply, error, 'Failed to update user guides'); }
@@ -234,7 +251,7 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       const query = listQuery.parse(request.query);
       if (query.creator) {
         address.parse(query.creator);
-        await checkUser(readUser(request), query.creator);
+        await checkUserOrPair(readUser(request), query.creator);
         const rows = query.limit === undefined && query.offset === undefined
           ? await listSongsByCreator(query.creator)
           : await listSongsByCreator(query.creator, query.limit, query.offset);
@@ -409,6 +426,8 @@ export const databaseRouter: FastifyPluginAsync = async app => {
   app.post('/albums', async (request, reply) => {
     try {
       const body = albumCreate.parse(request.body);
+      const userAddress = readUser(request);
+      await checkUserOrPair(userAddress, body.creator);
       const id = `alb-${randomUUID()}`;
       const creator = body.creator.startsWith('0x') ? body.creator.toLowerCase() : body.creator;
       const album = await createAlbum({
@@ -440,6 +459,10 @@ export const databaseRouter: FastifyPluginAsync = async app => {
   app.patch('/albums/:id', async (request, reply) => {
     try {
       const { id } = request.params as { id: string };
+      const userAddress = readUser(request);
+      const existing = await getAlbumById(id);
+      if (!existing) return reply.status(404).send({ error: 'Album not found' });
+      await checkUserOrPair(userAddress, existing.creator);
       const updates = albumPatch.parse(request.body);
       const updated = await updateAlbum(id, updates);
       if (!updated) return reply.status(404).send({ error: 'Album not found' });
@@ -452,6 +475,10 @@ export const databaseRouter: FastifyPluginAsync = async app => {
   app.delete('/albums/:id', async (request, reply) => {
     try {
       const { id } = request.params as { id: string };
+      const userAddress = readUser(request);
+      const existing = await getAlbumById(id);
+      if (!existing) return reply.status(404).send({ error: 'Album not found' });
+      await checkUserOrPair(userAddress, existing.creator);
       const deleted = await deleteAlbum(id);
       if (!deleted) return reply.status(404).send({ error: 'Album not found' });
       return reply.send({ success: true, id });
@@ -463,7 +490,12 @@ export const databaseRouter: FastifyPluginAsync = async app => {
   app.post('/albums/:id/songs', async (request, reply) => {
     try {
       const { id } = request.params as { id: string };
+      const userAddress = readUser(request);
+      const existing = await getAlbumById(id);
+      if (!existing) return reply.status(404).send({ error: 'Album not found' });
+      await checkUserOrPair(userAddress, existing.creator);
       const { songId } = z.object({ songId: text }).parse(request.body);
+      await readSong(request, songId);
       const ok = await addSongToAlbum(id, songId);
       if (!ok) return reply.status(404).send({ error: 'Song not found' });
       return reply.send({ success: true, albumId: id, songId });
@@ -474,7 +506,11 @@ export const databaseRouter: FastifyPluginAsync = async app => {
 
   app.delete('/albums/:id/songs/:songId', async (request, reply) => {
     try {
-      const { songId } = request.params as { id: string; songId: string };
+      const { id, songId } = request.params as { id: string; songId: string };
+      const userAddress = readUser(request);
+      const existing = await getAlbumById(id);
+      if (!existing) return reply.status(404).send({ error: 'Album not found' });
+      await checkUserOrPair(userAddress, existing.creator);
       const ok = await removeSongFromAlbum(songId);
       if (!ok) return reply.status(404).send({ error: 'Song not found' });
       return reply.send({ success: true, songId });
