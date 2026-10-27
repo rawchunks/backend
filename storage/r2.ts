@@ -261,8 +261,42 @@ export async function readAudio(sourceUrl: string, fallbackContentType = 'audio/
 export async function persistAudioToR2(bucket: R2Bucket, key: string, sourceUrl: string, fallbackContentType = 'audio/wav'): Promise<string> {
   const destination = getR2Url(bucket, key);
   const owned = parseR2Url(sourceUrl);
-  if (owned?.bucket === bucket && owned.key === objectKey(key)) return destination;
+  const cleanKey = objectKey(key);
+  if (owned?.bucket === bucket && owned.key === cleanKey) return destination;
   const { buffer, contentType } = await readAudio(sourceUrl, fallbackContentType);
+  if (!process.env.VITEST && bucket === 'versions' && cleanKey.startsWith('stems/') && /^audio\//i.test(contentType)) {
+    try {
+      const peaks = extractWavBipolarPeaks(buffer, 512);
+      setInMemoryPeaks(destination, peaks);
+      if (hasValkeyConfig()) {
+        void import('../broker/valkey.js')
+          .then(({ setCachedPeaks, valkeyWips }) => Promise.all([
+            setCachedPeaks(`${destination}|512`, peaks),
+            valkeyWips.set(`r2:inflight:${destination}`, sourceUrl, 'EX', 120),
+          ]))
+          .catch(() => {});
+      }
+    } catch {
+      // Non-WAV or synthetic payloads skip in-memory peak precomputation
+    }
+    while (inFlightStemBuffers.size >= 16) {
+      const oldest = inFlightStemBuffers.keys().next().value;
+      if (oldest !== undefined) inFlightStemBuffers.delete(oldest);
+    }
+    const uploadPromise = uploadToR2(bucket, key, buffer, contentType).finally(() => {
+      if (hasValkeyConfig()) {
+        void import('../broker/valkey.js')
+          .then(({ valkeyWips }) => valkeyWips.del(`r2:inflight:${destination}`))
+          .catch(() => {});
+      }
+    });
+    inFlightStemBuffers.set(destination, { buffer, contentType, uploadPromise });
+    setTimeout(() => inFlightStemBuffers.delete(destination), 120_000).unref?.();
+    void uploadPromise.catch((err) => {
+      console.error(`[r2] Background stem upload failed for ${destination}:`, err);
+    });
+    return destination;
+  }
   return uploadToR2(bucket, key, buffer, contentType);
 }
 

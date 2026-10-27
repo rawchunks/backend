@@ -7,6 +7,7 @@ import { listStemsBySong } from './stems.js';
 import { listTakesBySong, deleteTake } from './takes.js';
 import { RequestError, readUser, readSong, readTake, checkUser, checkUserOrPair } from './users.js';
 import { requireSessionPayment, extractSessionToken, parseComposeToken, settleStreamCheckpoint, type SessionPaymentConfig } from '../broker/payment.js';
+import { waitForInFlightAudio } from '../storage/r2.js';
 import {
   createAlbum,
   getAlbumById,
@@ -279,6 +280,10 @@ export const databaseRouter: FastifyPluginAsync = async app => {
 
       const isCreator = reply.getHeader('x-creator-exempt') === 'true';
       const paymentIntentId = (request as any).paymentIntentId || null;
+
+      if (typeof waitForInFlightAudio === 'function' && song.url) {
+        await waitForInFlightAudio(song.url);
+      }
 
       if (request.headers.accept?.includes('application/json')) {
         return reply.send({
