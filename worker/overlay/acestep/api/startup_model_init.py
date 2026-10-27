@@ -101,6 +101,199 @@ def _fused_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return F.silu(gate) * up
 
 
+def _prepopulate_cross_attn_cache(
+    decoder: Any,
+    past_key_values: Any,
+    encoder_hidden_states: Optional[torch.Tensor],
+) -> None:
+    """Pre-populate cross-attention K/V cache for all DiT layers before layer execution.
+
+    Ensuring ``len(cross_attention_cache) == num_layers`` and ``is_updated[layer_idx] = True``
+    on step 0 prevents duplicate K/V concatenation and prevents TorchDynamo from specializing
+    step 0 on ``is_updated`` (False) and recompiling on step 1 when ``is_updated`` becomes True.
+    """
+    if past_key_values is None or encoder_hidden_states is None:
+        return
+    cross_cache = getattr(past_key_values, "cross_attention_cache", None)
+    is_updated = getattr(past_key_values, "is_updated", None)
+    if cross_cache is None or len(cross_cache) > 0:
+        return
+    layers = getattr(decoder, "layers", None)
+    if not layers or not hasattr(decoder, "condition_embedder"):
+        return
+    embedded_enc = decoder.condition_embedder(encoder_hidden_states)
+    bsz, tgt_len = embedded_enc.shape[:-1]
+    for layer in layers:
+        if not getattr(layer, "use_cross_attention", False) or not hasattr(layer, "cross_attn"):
+            continue
+        cross_attn = layer.cross_attn
+        target_shape = (bsz, tgt_len, -1, cross_attn.head_dim)
+        key_states = cross_attn.k_norm(cross_attn.k_proj(embedded_enc).view(target_shape)).transpose(1, 2)
+        value_states = cross_attn.v_proj(embedded_enc).view(target_shape).transpose(1, 2)
+        cross_cache.update(key_states, value_states, cross_attn.layer_idx)
+        if is_updated is not None:
+            is_updated[cross_attn.layer_idx] = True
+
+
+def _install_windowed_cfg_acceleration(model: Any) -> None:
+    """Skip unconditional CFG half-batch evaluation on timesteps outside [cfg_interval_start, cfg_interval_end]."""
+    if torch is None:
+        return
+    decoder = getattr(model, "decoder", None)
+    if decoder is None or getattr(decoder, "_windowed_cfg_installed", False):
+        return
+    if not hasattr(model, "generate_audio") or not hasattr(decoder, "forward"):
+        return
+
+    orig_generate_audio = model.generate_audio
+    orig_decoder_forward = decoder.forward
+
+    def _fast_decoder_forward(
+        self_decoder: Any,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        timestep_r: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        encoder_hidden_states: Optional[torch.Tensor],
+        encoder_attention_mask: Optional[torch.Tensor],
+        context_latents: Optional[torch.Tensor],
+        use_cache: Optional[bool] = None,
+        past_key_values: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> Any:
+        from transformers.cache_utils import DynamicCache, EncoderDecoderCache
+        effective_use_cache = use_cache if use_cache is not None else getattr(self_decoder.config, "use_cache", True)
+        cfg_window = getattr(self_decoder, "_cfg_window", None)
+        if cfg_window is not None and hidden_states.shape[0] >= 2 and hidden_states.shape[0] % 2 == 0:
+            cfg_start, cfg_end = cfg_window
+            t_val = float(timestep[0].item()) if torch.is_tensor(timestep) else float(timestep)
+            if t_val < cfg_start or t_val > cfg_end:
+                half = hidden_states.shape[0] // 2
+                if effective_use_cache:
+                    main_kv_id = id(past_key_values) if past_key_values is not None else None
+                    if (
+                        getattr(self_decoder, "_cond_kv_cache", None) is None
+                        or getattr(self_decoder, "_last_main_kv_id", None) != main_kv_id
+                    ):
+                        self_decoder._cond_kv_cache = EncoderDecoderCache(DynamicCache(), DynamicCache())
+                        self_decoder._last_main_kv_id = main_kv_id
+                    cond_kv = self_decoder._cond_kv_cache
+                else:
+                    cond_kv = EncoderDecoderCache(DynamicCache(), DynamicCache())
+                sliced_enc = encoder_hidden_states[:half] if encoder_hidden_states is not None else None
+                if effective_use_cache:
+                    _prepopulate_cross_attn_cache(self_decoder, cond_kv, sliced_enc)
+                cond_out = orig_decoder_forward(
+                    hidden_states=hidden_states[:half],
+                    timestep=timestep[:half] if torch.is_tensor(timestep) else timestep,
+                    timestep_r=timestep_r[:half] if torch.is_tensor(timestep_r) else timestep_r,
+                    attention_mask=attention_mask[:half] if attention_mask is not None else None,
+                    encoder_hidden_states=sliced_enc,
+                    encoder_attention_mask=encoder_attention_mask[:half] if encoder_attention_mask is not None else None,
+                    context_latents=context_latents[:half] if context_latents is not None else None,
+                    use_cache=use_cache,
+                    past_key_values=cond_kv,
+                    **kwargs,
+                )
+                vt_cond = cond_out[0]
+                return (torch.cat([vt_cond, vt_cond], dim=0), past_key_values) + cond_out[2:]
+        if effective_use_cache:
+            if past_key_values is None:
+                past_key_values = EncoderDecoderCache(DynamicCache(), DynamicCache())
+            _prepopulate_cross_attn_cache(self_decoder, past_key_values, encoder_hidden_states)
+        return orig_decoder_forward(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            timestep_r=timestep_r,
+            attention_mask=attention_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            context_latents=context_latents,
+            use_cache=use_cache,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+
+    def _fast_generate_audio(self_model: Any, *args: Any, **kwargs: Any) -> Any:
+        cfg_start = float(kwargs.get("cfg_interval_start", 0.0))
+        cfg_end = float(kwargs.get("cfg_interval_end", 1.0))
+        guidance = float(kwargs.get("diffusion_guidance_scale", kwargs.get("diffusion_guidance_sale", 7.0)))
+        if guidance > 1.0 and (cfg_start > 0.0 or cfg_end < 1.0):
+            self_model.decoder._cfg_window = (cfg_start, cfg_end)
+            self_model.decoder._cond_kv_cache = None
+            self_model.decoder._last_main_kv_id = None
+        else:
+            self_model.decoder._cfg_window = None
+        try:
+            return orig_generate_audio(*args, **kwargs)
+        finally:
+            self_model.decoder._cfg_window = None
+            self_model.decoder._cond_kv_cache = None
+            self_model.decoder._last_main_kv_id = None
+
+    decoder.forward = types.MethodType(_fast_decoder_forward, decoder)
+    model.generate_audio = types.MethodType(_fast_generate_audio, model)
+    if hasattr(model, "prepare_condition") and not getattr(model, "_fast_prepare_condition_installed", False):
+        orig_prepare_condition = model.prepare_condition
+
+        @torch.no_grad()
+        def _fast_prepare_condition(
+            self_model: Any,
+            text_hidden_states: torch.Tensor,
+            text_attention_mask: torch.Tensor,
+            lyric_hidden_states: torch.Tensor,
+            lyric_attention_mask: torch.Tensor,
+            refer_audio_acoustic_hidden_states_packed: torch.Tensor,
+            refer_audio_order_mask: torch.Tensor,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor,
+            silence_latent: torch.Tensor,
+            src_latents: torch.Tensor,
+            chunk_masks: torch.Tensor,
+            is_covers: torch.Tensor,
+            precomputed_lm_hints_25Hz: Optional[torch.Tensor] = None,
+            audio_codes: Optional[torch.Tensor] = None,
+        ) -> Any:
+            if (
+                precomputed_lm_hints_25Hz is None
+                and audio_codes is None
+                and is_covers is not None
+                and not bool((is_covers > 0).any())
+                and hasattr(self_model, "encoder")
+            ):
+                dtype = hidden_states.dtype
+                encoder_hidden_states, encoder_attention_mask = self_model.encoder(
+                    text_hidden_states=text_hidden_states,
+                    text_attention_mask=text_attention_mask,
+                    lyric_hidden_states=lyric_hidden_states,
+                    lyric_attention_mask=lyric_attention_mask,
+                    refer_audio_acoustic_hidden_states_packed=refer_audio_acoustic_hidden_states_packed,
+                    refer_audio_order_mask=refer_audio_order_mask,
+                )
+                context_latents = torch.cat([src_latents, chunk_masks.to(dtype)], dim=-1)
+                return encoder_hidden_states, encoder_attention_mask, context_latents
+            return orig_prepare_condition(
+                text_hidden_states=text_hidden_states,
+                text_attention_mask=text_attention_mask,
+                lyric_hidden_states=lyric_hidden_states,
+                lyric_attention_mask=lyric_attention_mask,
+                refer_audio_acoustic_hidden_states_packed=refer_audio_acoustic_hidden_states_packed,
+                refer_audio_order_mask=refer_audio_order_mask,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                silence_latent=silence_latent,
+                src_latents=src_latents,
+                chunk_masks=chunk_masks,
+                is_covers=is_covers,
+                precomputed_lm_hints_25Hz=precomputed_lm_hints_25Hz,
+                audio_codes=audio_codes,
+            )
+
+        model.prepare_condition = types.MethodType(_fast_prepare_condition, model)
+        model._fast_prepare_condition_installed = True
+    decoder._windowed_cfg_installed = True
+
+
 def do_model_initialization(
     *,
     app: Any,
