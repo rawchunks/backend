@@ -26,6 +26,65 @@ from acestep.api.startup_llm_init import initialize_llm_at_startup
 
 
 @_compile_dynamic
+def _fused_pre_self_attn(
+    hidden_states: torch.Tensor,
+    scale_shift_table: torch.Tensor,
+    temb: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+):
+    shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+        scale_shift_table + temb
+    ).chunk(6, dim=1)
+    input_dtype = hidden_states.dtype
+    variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    norm_hs = weight * (hidden_states * torch.rsqrt(variance + eps)).to(input_dtype)
+    modulated = (norm_hs * (1.0 + scale_msa) + shift_msa).type_as(hidden_states)
+    return modulated, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa
+
+
+@_compile_dynamic
+def _fused_post_self_pre_cross(
+    hidden_states: torch.Tensor,
+    attn_output: torch.Tensor,
+    gate_msa: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+):
+    hs = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
+    input_dtype = hs.dtype
+    variance = hs.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    norm_hs = (weight * (hs * torch.rsqrt(variance + eps)).to(input_dtype)).type_as(hs)
+    return hs, norm_hs
+
+
+@_compile_dynamic
+def _fused_post_cross_pre_mlp(
+    hidden_states: torch.Tensor,
+    cross_attn_output: torch.Tensor,
+    c_shift_msa: torch.Tensor,
+    c_scale_msa: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+):
+    hs = hidden_states + cross_attn_output
+    input_dtype = hs.dtype
+    variance = hs.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    norm_hs = weight * (hs * torch.rsqrt(variance + eps)).to(input_dtype)
+    modulated = (norm_hs * (1.0 + c_scale_msa) + c_shift_msa).type_as(hs)
+    return hs, modulated
+
+
+@_compile_dynamic
+def _fused_final_add(
+    hidden_states: torch.Tensor,
+    ff_output: torch.Tensor,
+    c_gate_msa: torch.Tensor,
+) -> torch.Tensor:
+    return (hidden_states + ff_output * c_gate_msa).type_as(hidden_states)
+
+
+@_compile_dynamic
 def _fused_rms_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
