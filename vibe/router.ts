@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { PassThrough } from 'node:stream';
 import { requireSessionPayment, PRICING } from '../broker/payment.js';
+import { readUser } from '../databases/users.js';
 import { generateCoverArt } from '../generation/router.js';
 import { LYRICS_CANVAS_TAGS, LYRICS_SYSTEM_PROMPT } from './lyrics.js';
 import { STYLE_TAGS_LIBRARY, normalizeStyleTags } from './styles.js';
@@ -86,6 +87,7 @@ export async function vibeRouter(fastify: FastifyInstance) {
       prompt?: string;
     };
   }>('/audio', async (request, reply) => {
+    try { readUser(request); } catch (err: any) { return reply.code(err.statusCode || 401).send({ error: err.message }); }
     const audio = request.body?.audio?.trim();
     if (!audio) {
       return reply.code(400).send({ error: 'audio is required' });
@@ -107,6 +109,7 @@ export async function vibeRouter(fastify: FastifyInstance) {
       prompt?: string;
     };
   }>('/vision', async (request, reply) => {
+    try { readUser(request); } catch (err: any) { return reply.code(err.statusCode || 401).send({ error: err.message }); }
     const image = request.body?.image?.trim();
     if (!image) {
       return reply.code(400).send({ error: 'image is required' });
@@ -136,6 +139,7 @@ export async function vibeRouter(fastify: FastifyInstance) {
       stream?: boolean;
     };
   }>('/lyrics', async (request, reply) => {
+    try { readUser(request); } catch (err: any) { return reply.code(err.statusCode || 401).send({ error: err.message }); }
     const prompt = request.body?.prompt?.trim();
     if (!prompt) {
       return reply.code(400).send({ error: 'Prompt is required' });
@@ -234,6 +238,7 @@ export async function vibeRouter(fastify: FastifyInstance) {
     };
   }>('/cover', async (request, reply) => {
     try {
+      readUser(request);
       const url = await generateCoverArt({
         prompt: request.body?.prompt,
         title: request.body?.title,

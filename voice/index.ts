@@ -4,7 +4,7 @@ import { subscribeVoice } from '../broker/valkey.js';
 import type { MultipartFile } from '@fastify/multipart';
 import { voiceService } from './service.js';
 import { validateVoiceFormat, validateVoiceCreator, VoiceInputError } from './format.js';
-import { RequestError, checkUser, readUser, readSong } from '../databases/users.js';
+import { RequestError, checkUserOrPair, readUser, readSong } from '../databases/users.js';
 
 const validText = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 function multipartText(field: unknown): string | undefined {
@@ -41,10 +41,10 @@ export default async function voiceRoutes(app: FastifyInstance) {
 
     try {
       const userAddress = readUser(req);
-      validateVoiceCreator(creator);
-      await checkUser(userAddress, creator);
-      const { song } = await readSong(req, songId);
-      const result = await voiceService.cloneVoiceFromSong({ songId, name, creator: song.creator });
+      const requestedCreator = validateVoiceCreator(creator);
+      await checkUserOrPair(userAddress, requestedCreator);
+      await readSong(req, songId);
+      const result = await voiceService.cloneVoiceFromSong({ songId, name, creator });
       return reply.status(202).send(result);
     } catch (err: any) {
       req.log.error(err);
@@ -70,7 +70,7 @@ export default async function voiceRoutes(app: FastifyInstance) {
       const name = multipartText(data.fields.name);
       if (!validText(creator)) throw new VoiceInputError('creator is required');
       validateVoiceCreator(creator);
-      await checkUser(userAddress, creator);
+      await checkUserOrPair(userAddress, creator);
       validateVoiceFormat(buffer!, data.filename, data.mimetype);
 
       const result = await voiceService.cloneVoiceFromAudio({
@@ -101,8 +101,8 @@ export default async function voiceRoutes(app: FastifyInstance) {
 
     try {
       const userAddress = readUser(req);
-      validateVoiceCreator(creator);
-      await checkUser(userAddress, creator);
+      const requestedCreator = validateVoiceCreator(creator);
+      await checkUserOrPair(userAddress, requestedCreator);
       const voices = await voiceService.listVoices(creator);
       return reply.send({ voices });
     } catch (err: any) {
@@ -116,13 +116,14 @@ export default async function voiceRoutes(app: FastifyInstance) {
       const user = readUser(req);
       const voice = await voiceService.getVoice(req.params.id);
       if (!voice) return reply.status(404).send({ error: 'Voice not found' });
-      await checkUser(user, voice.creator);
+      await checkUserOrPair(user, voice.creator);
       return streamState(req, reply, {
         read: async () => {
           const current = await voiceService.getVoice(req.params.id);
           if (!current) throw new Error('Voice not found');
-          await checkUser(user, current.creator);
-          return { voice: current, status: current.status, ...(current.error ? { error: current.error } : {}) };
+          await checkUserOrPair(user, current.creator);
+          const projected = current.creator === user ? current : { ...current, creator: user };
+          return { voice: projected, status: current.status, ...(current.error ? { error: current.error } : {}) };
         },
         terminal: state => ['ready', 'error'].includes(state.status),
         subscribe: (message, error) => subscribeVoice(req.params.id, message, error),
@@ -143,8 +144,9 @@ export default async function voiceRoutes(app: FastifyInstance) {
       if (!voice) {
         return reply.status(404).send({ error: 'Voice not found' });
       }
-      await checkUser(userAddress, voice.creator);
-      return reply.send({ voice });
+      await checkUserOrPair(userAddress, voice.creator);
+      const projected = voice.creator === userAddress ? voice : { ...voice, creator: userAddress };
+      return reply.send({ voice: projected });
     } catch (err: any) {
       req.log.error(err);
       return errorReply(reply, err, 'Failed to retrieve voice');

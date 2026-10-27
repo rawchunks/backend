@@ -9,7 +9,7 @@ import { client } from '../generation/client.js';
 import { withJobLock, publishVoice } from '../broker/valkey.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { validateVoiceFormat, validateVoiceCreator, VoiceInputError } from './format.js';
-import { RequestError } from '../databases/users.js';
+import { RequestError, checkUserOrPair, getWalletPair } from '../databases/users.js';
 
 export const VOICE_MODELS = { turbo: 'acestep-v15-xl-turbo', sft: 'acestep-v15-xl-sft' } as const;
 export type VoiceMode = 'reference' | 'trained';
@@ -128,7 +128,10 @@ export class VoiceService {
     if (params.name !== undefined && typeof params.name !== 'string') throw new VoiceInputError('name must be a string');
     const song = await this.d.getSong(params.songId);
     if (!song || !text(song.url)) throw new Error(`Song ${params.songId} not found or has no audio.`);
-    if (validateVoiceCreator(song.creator) !== creator) throw new RequestError('Account does not own this song', 403);
+    if (validateVoiceCreator(song.creator) !== creator) {
+      const ok = await checkUserOrPair(creator, song.creator).then(() => true, () => false);
+      if (!ok) throw new RequestError('Account does not own this song', 403);
+    }
     const identity = hash(`${creator}:${song.id}:${song.url}`);
     const voice = await this.serial(identity, () => this.d.lock(`voice-source:${identity}`, async lease => {
       const existing = await this.d.store.findVoiceBySource(creator, song.id, song.url); if (existing) return existing;
@@ -164,7 +167,16 @@ export class VoiceService {
     return { ...voice, status, availability: Object.fromEntries(Object.entries(VOICE_MODELS).map(([kind, model]) => [kind, this.availability(adapters.find(a => a.model === model), model)])) };
   }
   async listVoices(creator: string) {
-    const voices = await Promise.all((await this.d.store.listVoicesByCreator(validateVoiceCreator(creator))).map(v => this.serialize(v)));
+    const normalized = validateVoiceCreator(creator);
+    const pair = await getWalletPair(normalized).catch(() => null);
+    const addresses = Array.from(new Set([
+      normalized,
+      ...(pair?.evmAddress && !pair.evmAddress.startsWith('evm_pending_') ? [validateVoiceCreator(pair.evmAddress)] : []),
+      ...(pair?.svmAddress && !pair.svmAddress.startsWith('svm_pending_') ? [validateVoiceCreator(pair.svmAddress)] : []),
+    ]));
+    const rows = (await Promise.all(addresses.map(addr => this.d.store.listVoicesByCreator(addr)))).flat();
+    rows.sort((a, b) => (b.created_at?.getTime() ?? 0) - (a.created_at?.getTime() ?? 0));
+    const voices = await Promise.all(rows.map(async v => ({ ...(await this.serialize(v)), creator: normalized })));
     const variants = new Map<string, typeof voices[number]>();
     for (const voice of voices) {
       const key = stable([voice.canonical_id ?? voice.id, trainingMetadata(voice.metadata)]);
@@ -182,7 +194,10 @@ export class VoiceService {
     if (!Number.isFinite(strength) || strength < 0 || strength > 1) throw new VoiceInputError('Voice strength must be between zero and one');
     const original = await this.d.store.getVoiceById(id); const voice = await this.d.store.getCanonicalVoice(id);
     if (!original || !voice || original.creator !== voice.creator) throw new RequestError('Voice not found', 404);
-    if (creator !== undefined && validateVoiceCreator(creator) !== voice.creator) throw new RequestError('Account does not own this voice', 403);
+    if (creator !== undefined && validateVoiceCreator(creator) !== voice.creator) {
+      const ok = await checkUserOrPair(validateVoiceCreator(creator), voice.creator).then(() => true, () => false);
+      if (!ok) throw new RequestError('Account does not own this voice', 403);
+    }
     const base = { voiceId: id, canonicalId: voice.id, trainingGroup: voice.training_group, mode, provenance: { voice_id: id, canonical_voice_id: voice.id, training_group: voice.training_group, sample_hash: voice.hash, voice_mode: mode, voice_strength: strength } };
     if (mode === 'reference') {
       if (!text(voice.sample_url)) throw new RequestError('Voice reference is not ready', 409);
