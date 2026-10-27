@@ -1,3 +1,4 @@
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import type { FastifyRequest, FastifyReply } from 'fastify';
 
 export interface KeyPayload {
@@ -33,6 +34,23 @@ export interface SessionPaymentOptions {
 
 // In-memory cache to track local budget increments during burst/concurrent requests (zero latency)
 const localBudgetCache = new Map<string, { used: number; expiresAt: number }>();
+const revokedSessionTokens = new Map<string, number>();
+
+function isRevokedToken(token: string): boolean {
+  const hash = createHash('sha256').update(token).digest('hex');
+  const expiresAt = revokedSessionTokens.get(hash);
+  if (!expiresAt) return false;
+  if (expiresAt <= Date.now()) {
+    revokedSessionTokens.delete(hash);
+    return false;
+  }
+  return true;
+}
+
+function revokeToken(token: string): void {
+  const hash = createHash('sha256').update(token).digest('hex');
+  revokedSessionTokens.set(hash, Date.now() + 30 * 60 * 1000);
+}
 
 function getTrackedBudgetUsed(keyId: string, initialUsed: number): number {
   const now = Date.now();
@@ -64,10 +82,20 @@ export function parseComposeToken(token: string): KeyPayload | null {
   if (!token || typeof token !== 'string') return null;
   const clean = token.startsWith('Bearer ') ? token.slice(7).trim() : token.trim();
   if (!clean.startsWith('compose-')) return null;
+  if (isRevokedToken(clean)) return null;
   const jwt = clean.slice('compose-'.length);
   const parts = jwt.split('.');
-  if (parts.length !== 3) return null;
+  if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) return null;
   try {
+    const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')) as { alg?: string };
+    if (!header || typeof header !== 'object' || String(header.alg || '').toLowerCase() === 'none') return null;
+    const secret = process.env.COMPOSE_JWT_SECRET || process.env.COMPOSE_SESSION_SECRET;
+    if (secret) {
+      const expected = createHmac('sha256', secret).update(`${parts[0]}.${parts[1]}`).digest('base64url');
+      if (expected.length !== parts[2].length || !timingSafeEqual(Buffer.from(expected), Buffer.from(parts[2]))) {
+        return null;
+      }
+    }
     const jsonStr = Buffer.from(parts[1], 'base64url').toString('utf8');
     const payload = JSON.parse(jsonStr) as KeyPayload;
     if (!payload.sub || !payload.keyId) return null;
@@ -176,6 +204,7 @@ export async function settleSessionPaymentAsync(params: {
     });
 
     if (!prepareRes.ok) {
+      if (prepareRes.status === 401 || prepareRes.status === 403) revokeToken(params.token);
       const errText = await prepareRes.text().catch(() => '');
       console.warn(`[Payment] Async prepare failed (${prepareRes.status}):`, errText);
       return;
