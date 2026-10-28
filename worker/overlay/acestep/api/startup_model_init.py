@@ -331,6 +331,58 @@ def _install_fused_dit_kernels(model: Any) -> None:
         print(f"[API Server] Warning: DiT fused kernel compilation skipped: {exc}")
 
 
+def _warmup_handler_pipeline(slot_handler: Any) -> None:
+    """Run a 2-step end-to-end DiT generate_audio warmup so the first user request never compiles."""
+    if torch is None or not torch.cuda.is_available():
+        return
+    model = getattr(slot_handler, "model", None)
+    silence_latent = getattr(slot_handler, "silence_latent", None)
+    if model is None or silence_latent is None or not hasattr(model, "generate_audio"):
+        return
+    try:
+        param = next(model.parameters())
+        device, dtype = param.device, param.dtype
+        text_dim = int(getattr(model.config, "text_hidden_dim", 1024))
+        is_turbo = bool(getattr(model.config, "is_turbo", False))
+        warmup_shapes = ((1, 4500, 770, 512), (2, 1500, 64, 32)) if is_turbo else ((1, 4500, 770, 512), (1, 900, 64, 32))
+        with torch.inference_mode():
+            for bsz, t_len, text_len, lyric_len in warmup_shapes:
+                text_hs = torch.zeros((bsz, text_len, text_dim), device=device, dtype=dtype)
+                lyric_hs = torch.zeros((bsz, lyric_len, text_dim), device=device, dtype=dtype)
+                src_latents = silence_latent[:, :t_len, :].expand(bsz, t_len, -1).to(device=device, dtype=dtype).contiguous()
+                chunk_masks = torch.ones((bsz, t_len, 64), device=device, dtype=dtype)
+                warmup_kwargs: dict[str, Any] = {
+                    "text_hidden_states": text_hs,
+                    "text_attention_mask": torch.ones((bsz, text_len), device=device, dtype=dtype),
+                    "lyric_hidden_states": lyric_hs,
+                    "lyric_attention_mask": torch.ones((bsz, lyric_len), device=device, dtype=dtype),
+                    "refer_audio_acoustic_hidden_states_packed": torch.zeros((bsz, 750, 64), device=device, dtype=dtype),
+                    "refer_audio_order_mask": torch.zeros((bsz,), device=device, dtype=torch.long),
+                    "src_latents": src_latents,
+                    "attention_mask": torch.ones((bsz, t_len), device=device, dtype=dtype),
+                    "silence_latent": src_latents,
+                    "chunk_masks": chunk_masks,
+                    "is_covers": torch.zeros((bsz,), device=device, dtype=torch.bool),
+                    "precomputed_lm_hints_25Hz": None,
+                    "infer_steps": 2,
+                    "infer_method": "ode",
+                    "use_progress_bar": False,
+                }
+                if is_turbo:
+                    warmup_kwargs["diffusion_guidance_scale"] = 1.0
+                else:
+                    warmup_kwargs["timesteps"] = torch.tensor([1.0, 0.75, 0.0], device=device, dtype=dtype)
+                    warmup_kwargs["diffusion_guidance_scale"] = 7.0
+                    warmup_kwargs["cfg_interval_start"] = 0.62
+                    warmup_kwargs["cfg_interval_end"] = 0.90
+                _ = model.generate_audio(**warmup_kwargs)
+                del text_hs, lyric_hs, src_latents, chunk_masks
+        torch.cuda.synchronize()
+        print("[API Server] End-to-end 2-step DiT generate_audio pipeline warmed up")
+    except Exception as exc:
+        print(f"[API Server] Warning: End-to-end DiT pipeline warmup skipped: {exc}")
+
+
 def do_model_initialization(
     *,
     app: Any,
