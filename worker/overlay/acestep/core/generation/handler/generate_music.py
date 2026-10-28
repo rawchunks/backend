@@ -373,6 +373,17 @@ class GenerateMusicMixin:
             cover_noise_strength=cover_noise_strength,
             reference_audio=reference_audio,
         )
+        if (
+            cover_noise_strength > 0.0
+            and getattr(getattr(self, "model", None), "config", None) is not None
+            and int(getattr(self.model.config, "hidden_size", 0) or 0) >= 2048
+        ):
+            logger.info(
+                "[generate_music] XL model detected: clamping cover_noise_strength {:.2f} -> 0.0 "
+                "to prevent out-of-distribution renoise energy collapse (issue #1329).",
+                cover_noise_strength,
+            )
+            cover_noise_strength = 0.0
 
         # Turbo models bake guidance into the distillation process and do not
         # use CFG.  Forcing guidance_scale to 1.0 avoids double-application of
@@ -384,6 +395,10 @@ class GenerateMusicMixin:
                 guidance_scale,
             )
             guidance_scale = 1.0
+        elif not self.is_turbo_model() and guidance_scale > 1.0 and cfg_interval_start <= 0.0 and cfg_interval_end >= 1.0:
+            _os = __import__("os")
+            cfg_interval_start = float(_os.environ.get("ACESTEP_CFG_INTERVAL_START", "0.0"))
+            cfg_interval_end = float(_os.environ.get("ACESTEP_CFG_INTERVAL_END", "1.0"))
         dcw_enabled = self._resolve_dcw_enabled(dcw_enabled)
 
         # When LoRA is active, verify all decoder parameters are on the
@@ -429,11 +444,50 @@ class GenerateMusicMixin:
                 return audio_error
 
             # Cover/repaint/lego/extract + text2music+morph: lock duration to source audio.
+            _windowed_full_src: Optional[torch.Tensor] = None
+            _win_start_idx: int = 0
+            _win_end_idx: int = 0
             if processed_src_audio is not None and (
                 task_type in ("cover", "cover-nofsq", "repaint", "lego", "extract", "complete")
                 or (task_type == "text2music" and flow_edit_morph)
             ):
-                audio_duration = processed_src_audio.shape[-1] / self.sample_rate
+                full_src_samples = int(processed_src_audio.shape[-1])
+                full_src_duration = full_src_samples / self.sample_rate
+                audio_duration = full_src_duration
+                if (
+                    task_type in ("repaint", "lego")
+                    and repainting_start is not None
+                    and repainting_end is not None
+                ):
+                    req_start = float(repainting_start)
+                    req_end = float(repainting_end)
+                    if 0.0 <= req_start < req_end <= full_src_duration + 0.05:
+                        pad_sec = float(__import__("os").environ.get("ACESTEP_REPAINT_CONTEXT_PAD_SEC", "8.0"))
+                        frame_samples = max(1, int(self.sample_rate // 25))
+                        win_start_samples = (int(max(0.0, req_start - pad_sec) * self.sample_rate) // frame_samples) * frame_samples
+                        win_end_samples = min(
+                            full_src_samples,
+                            ((int(min(full_src_duration, req_end + pad_sec) * self.sample_rate) + frame_samples - 1) // frame_samples) * frame_samples,
+                        )
+                        if (win_end_samples - win_start_samples) < (full_src_samples - int(4.0 * self.sample_rate)):
+                            _windowed_full_src = processed_src_audio
+                            _win_start_idx = win_start_samples
+                            _win_end_idx = win_end_samples
+                            win_start_sec = _win_start_idx / self.sample_rate
+                            processed_src_audio = _windowed_full_src[..., _win_start_idx:_win_end_idx]
+                            audio_duration = (_win_end_idx - _win_start_idx) / self.sample_rate
+                            repainting_start = max(0.0, req_start - win_start_sec)
+                            repainting_end = min(audio_duration, req_end - win_start_sec)
+                            logger.info(
+                                "[generate_music] Context-windowed {} edit: cropped {:.2f}s track to [{:.2f}s, {:.2f}s] ({:.2f}s window, local region [{:.2f}s, {:.2f}s])",
+                                task_type,
+                                full_src_duration,
+                                win_start_sec,
+                                _win_end_idx / self.sample_rate,
+                                audio_duration,
+                                repainting_start,
+                                repainting_end,
+                            )
 
             # Flow-edit overlay v1: text2music (silence-context) and
             # cover / cover-nofsq (shared LM-codes context). Repaint /
@@ -597,19 +651,26 @@ class GenerateMusicMixin:
                             seg[:, -f_len:] = seg[:, -f_len:] * fade_out
                         isolated[b_idx, :, s_idx:e_idx] = seg
                 pred_wavs = isolated
-            result = self._build_generate_music_success_payload(
-                outputs=outputs,
-                pred_wavs=pred_wavs,
-                pred_latents_cpu=pred_latents_cpu,
-                time_costs=time_costs,
-                seed_value_for_ui=seed_value_for_ui,
-                actual_batch_size=actual_batch_size,
-                progress=progress,
-                retake_seed_value_for_ui=retake_seed_value_for_ui,
-                retake_variance=retake_variance,
-            )
-            # Clear GPU tensor references from the mutable outputs dict so
-            # accelerator memory is reclaimable before the next generation.
+            if _windowed_full_src is not None:
+                full_samples = int(_windowed_full_src.shape[-1])
+                win_len = min(int(pred_wavs.shape[-1]), max(0, full_samples - _win_start_idx))
+                if task_type == "lego":
+                    full_pred = torch.zeros(
+                        (pred_wavs.shape[0], pred_wavs.shape[1], full_samples),
+                        device=pred_wavs.device,
+                        dtype=pred_wavs.dtype,
+                    )
+                else:
+                    base_src = _windowed_full_src.to(device=pred_wavs.device, dtype=pred_wavs.dtype)
+                    if base_src.dim() == 2:
+                        base_src = base_src.unsqueeze(0)
+                    full_pred = base_src.expand(pred_wavs.shape[0], -1, -1).clone()
+                if win_len > 0:
+                    full_pred[:, :, _win_start_idx : _win_start_idx + win_len] = pred_wavs[:, :, :win_len]
+                pred_wavs = full_pred
+                del _windowed_full_src
+            # Clear GPU tensor references from the mutable outputs dict before
+            # building payload so intermediate GPU tensors are not copied to CPU.
             _gpu_keys = (
                 "src_latents", "target_latents_input", "chunk_masks",
                 "latent_masks", "encoder_hidden_states",
@@ -618,7 +679,19 @@ class GenerateMusicMixin:
             )
             for _k in _gpu_keys:
                 outputs.pop(_k, None)
-            del outputs, pred_wavs, pred_latents_cpu
+            del pred_latents_cpu
+            result = self._build_generate_music_success_payload(
+                outputs=outputs,
+                pred_wavs=pred_wavs,
+                pred_latents_cpu=None,
+                time_costs=time_costs,
+                seed_value_for_ui=seed_value_for_ui,
+                actual_batch_size=actual_batch_size,
+                progress=progress,
+                retake_seed_value_for_ui=retake_seed_value_for_ui,
+                retake_variance=retake_variance,
+            )
+            del outputs, pred_wavs
             if getattr(self, "offload_to_cpu", False):
                 gc.collect()
                 self._empty_cache()
