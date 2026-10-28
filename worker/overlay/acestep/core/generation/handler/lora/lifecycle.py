@@ -177,8 +177,19 @@ def _load_lokr_adapter(decoder: Any, weights_path: str) -> Any:
             logger.warning(f"DoRA mode not supported in current LyCORIS build: {exc}")
 
     lycoris_net.apply_to()
+    try:
+        lycoris_net.load_weights(weights_path)
+        param = next(decoder.parameters(), None)
+        if param is not None:
+            lycoris_net.to(device=param.device, dtype=param.dtype)
+    except Exception:
+        try:
+            lycoris_net.restore()
+        except Exception:
+            pass
+        decoder._lycoris_net = None
+        raise
     decoder._lycoris_net = lycoris_net
-    lycoris_net.load_weights(weights_path)
     return lycoris_net
 
 
@@ -388,7 +399,13 @@ def remove_lora(self, adapter_name: str) -> str:
             if hasattr(self, "_memory_allocated"):
                 mem_before = self._memory_allocated() / (1024**3)
                 logger.info(f"VRAM before LoRA unload: {mem_before:.2f}GB")
-            self.model.decoder = decoder.get_base_model()
+            self.model.decoder = decoder.unload() if hasattr(decoder, "unload") else decoder.get_base_model()
+            for mod in list(self.model.decoder.modules()):
+                for child_name, child in list(mod.named_children()):
+                    if hasattr(child, "base_layer"):
+                        setattr(mod, child_name, child.base_layer)
+            if hasattr(self.model.decoder, "peft_config"):
+                delattr(self.model.decoder, "peft_config")
             load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
             if load_result.missing_keys:
                 logger.warning(f"Missing keys when restoring decoder: {load_result.missing_keys[:5]}")
