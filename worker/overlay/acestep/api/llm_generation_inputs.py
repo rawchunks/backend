@@ -73,7 +73,7 @@ def prepare_llm_generation_inputs(
         and not sample_mode
         and not has_sample_query
         and not use_format
-        and getattr(req, "task_type", "") in ("repaint", "lego", "extract", "complete")
+        and getattr(req, "task_type", "") in ("repaint", "lego", "extract", "complete", "cover", "cover-nofsq")
     )
     use_cot_caption = False if is_non_thinking_edit else bool(req.use_cot_caption)
     use_cot_language = False if is_non_thinking_edit else bool(req.use_cot_language)
@@ -152,6 +152,9 @@ def prepare_llm_generation_inputs(
         time_signature = time_signature or sample_result.timesignature
         if audio_duration is None or float(audio_duration) <= 0:
             audio_duration = sample_result.duration
+        if not thinking:
+            use_cot_caption = False
+            use_cot_language = False
 
     format_has_duration = False
     if req.use_format and (caption or lyrics):
