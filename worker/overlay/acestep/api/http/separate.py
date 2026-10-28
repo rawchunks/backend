@@ -285,9 +285,9 @@ async def execute_separation_job(state,store,job_id,req):
             except FileNotFoundError: pass
 
 def register_separate_route(app,verify_api_key,wrap_response,store):
-    @app.post('/separate')
-    @app.post('/v1/separate')
-    async def separate_endpoint(req:SeparateRequest,request:Request,
+    @app.post('/isolate')
+    @app.post('/v1/isolate')
+    async def separate_endpoint(req:IsolateRequest,request:Request,
             idempotency_key:Optional[str]=Header(None),_:None=Depends(verify_api_key)):
         if not req.src_audio_path: raise HTTPException(400,'src_audio_path is required')
         src=req.src_audio_path
@@ -303,6 +303,11 @@ def register_separate_route(app,verify_api_key,wrap_response,store):
         except ValueError as exc: raise HTTPException(409,str(exc)) from exc
         if not req.wait:
             return wrap_response({'task_id': record.job_id, 'status': record.status})
-        record = await app.state.job_queue.wait(record.job_id)
+        wait_timeout = float(os.environ.get('ACESTEP_ISOLATE_WAIT_TIMEOUT_SEC', '20.0'))
+        try:
+            record = await asyncio.wait_for(app.state.job_queue.wait(record.job_id), timeout=wait_timeout)
+        except asyncio.TimeoutError:
+            cur = store.get(record.job_id) or record
+            return wrap_response({'task_id': record.job_id, 'status': cur.status})
         if record.status=='failed': raise HTTPException(500,f'Separation failed: {record.error}')
         return wrap_response(record.result)
