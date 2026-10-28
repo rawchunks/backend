@@ -214,7 +214,7 @@ class DurableQueue:
     def full(self): return self.maxsize > 0 and self.qsize() >= self.maxsize
     def _target_namespace(self, kind, payload):
         ns = self.store.namespace
-        if ns.startswith('rawchunks:worker:') and kind == 'generate' and isinstance(payload, dict):
+        if ns.startswith('rawchunks:worker') and kind == 'generate' and isinstance(payload, dict):
             model = str(payload.get('model') or '')
             for suffix in ('sft', 'base', 'turbo'):
                 if model.endswith(f'-{suffix}'):
@@ -293,7 +293,7 @@ class DurableQueue:
             record = await asyncio.to_thread(self.store.get,identifier)
             if record is None: raise RuntimeError('Accepted job record is missing')
             if record.status in ('succeeded','failed'): return record
-            await asyncio.sleep(.1)
+            await asyncio.sleep(.02)
     def fatal_lease_loss(self):
         # A CUDA call cannot be cancelled in a Python thread; the process must
         # end if it cannot renew exclusive execution ownership.

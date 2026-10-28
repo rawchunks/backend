@@ -18,7 +18,7 @@ async def _queue_worker_loop(*,app_state,store,run_one_job,cleanup_job_temp_file
         while True:
             item = await asyncio.to_thread(queue.claim)
             if item is None:
-                await asyncio.sleep(.1); continue
+                await asyncio.sleep(.02); continue
             identifier,payload = item
             if payload['kind'] == 'training':
                 from acestep.api.training import execute_training_job
