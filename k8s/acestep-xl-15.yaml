@@ -103,17 +103,17 @@ spec:
             - name: ACESTEP_LORA_HOT_CACHE
               value: "true"
             - name: ACESTEP_INIT_DEMUCS
-              value: "true"
+              value: "false"
             - name: ACESTEP_ON_DEMAND_MODEL_LOAD
               value: "false"
             - name: ACESTEP_MAX_EXECUTORS
               value: "32"
             - name: ACESTEP_QUEUE_WORKERS
-              value: "4"
+              value: "1"
             - name: ACESTEP_API_WORKERS
               value: "1"
             - name: ACESTEP_TMPDIR
-              value: /checkpoints/runtime
+              value: /dev/shm/acestep
             - name: VALKEY_REQUESTS_SERVICE_URI
               valueFrom:
                 secretKeyRef:
@@ -306,17 +306,17 @@ spec:
             - name: ACESTEP_LORA_HOT_CACHE
               value: "true"
             - name: ACESTEP_INIT_DEMUCS
-              value: "true"
+              value: "false"
             - name: ACESTEP_ON_DEMAND_MODEL_LOAD
               value: "false"
             - name: ACESTEP_MAX_EXECUTORS
               value: "32"
             - name: ACESTEP_QUEUE_WORKERS
-              value: "4"
+              value: "1"
             - name: ACESTEP_API_WORKERS
               value: "1"
             - name: ACESTEP_TMPDIR
-              value: /checkpoints/runtime
+              value: /dev/shm/acestep
             - name: VALKEY_REQUESTS_SERVICE_URI
               valueFrom:
                 secretKeyRef:
@@ -515,11 +515,11 @@ spec:
             - name: ACESTEP_MAX_EXECUTORS
               value: "32"
             - name: ACESTEP_QUEUE_WORKERS
-              value: "4"
+              value: "1"
             - name: ACESTEP_API_WORKERS
               value: "1"
             - name: ACESTEP_TMPDIR
-              value: /checkpoints/runtime
+              value: /dev/shm/acestep
             - name: VALKEY_REQUESTS_SERVICE_URI
               valueFrom:
                 secretKeyRef:
