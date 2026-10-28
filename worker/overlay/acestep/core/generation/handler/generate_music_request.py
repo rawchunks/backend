@@ -17,7 +17,18 @@ class GenerateMusicRequestMixin:
     ) -> Callable[..., Any]:
         """Return a callable progress callback, defaulting to no-op."""
         if progress is not None:
-            return progress
+            def _scaled_progress(value: float, *args: Any, **kwargs: Any) -> Any:
+                try:
+                    val = float(value)
+                    if val >= 0.99:
+                        val = 0.88
+                    elif val >= 0.8:
+                        val = 0.80 + (val - 0.80) * (0.08 / 0.19)
+                except (TypeError, ValueError):
+                    val = value
+                return progress(val, *args, **kwargs)
+
+            return _scaled_progress
 
         def _progress(*args: Any, **kwargs: Any) -> Any:
             """No-op callback for non-UI call sites."""
@@ -289,5 +300,5 @@ class GenerateMusicRequestMixin:
             "target_wavs_tensor": target_wavs_tensor,
             "audio_code_hints_batch": audio_code_hints_batch,
             "chunk_mask_modes_batch": [chunk_mask_mode] * actual_batch_size,
-            "should_return_intermediate": True,
+            "should_return_intermediate": False,
         }

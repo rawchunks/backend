@@ -242,6 +242,27 @@ def create_app() -> FastAPI:
         async def _run_one_job(job_id: str, req: GenerateMusicRequest) -> None:
             llm: LLMHandler = app.state.llm_handler
 
+            def _generate_music_aligned(
+                dit_handler: AceStepHandler,
+                llm_handler: LLMHandler,
+                params: Any,
+                config: Any,
+                **kwargs: Any,
+            ) -> Any:
+                if (
+                    not getattr(params, "thinking", False)
+                    and not getattr(params, "use_cot_caption", False)
+                    and not getattr(params, "use_cot_language", False)
+                ):
+                    params.use_cot_metas = False
+                return generate_music(
+                    dit_handler=dit_handler,
+                    llm_handler=llm_handler,
+                    params=params,
+                    config=config,
+                    **kwargs,
+                )
+
             def _build_blocking_result(
                 selected_handler: AceStepHandler,
                 selected_model_name: str,
@@ -266,7 +287,7 @@ def create_app() -> FastAPI:
                     is_instrumental=_is_instrumental,
                     create_sample_fn=create_sample,
                     format_sample_fn=format_sample,
-                    generate_music_fn=generate_music,
+                    generate_music_fn=_generate_music_aligned,
                     default_dit_instruction=DEFAULT_DIT_INSTRUCTION,
                     task_instructions=TASK_INSTRUCTIONS,
                     build_generation_info_fn=_build_generation_info,
