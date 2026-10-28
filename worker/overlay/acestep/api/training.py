@@ -125,16 +125,26 @@ def initialize_training_runtime(state):
     state.training_ready = True
 
 
+_POD_AUDIO_ORIGIN: Optional[str] = None
+_POD_AUDIO_ORIGIN_RESOLVED: bool = False
+
+
 def _pod_audio_origin() -> Optional[str]:
+    global _POD_AUDIO_ORIGIN, _POD_AUDIO_ORIGIN_RESOLVED
+    if _POD_AUDIO_ORIGIN_RESOLVED:
+        return _POD_AUDIO_ORIGIN
     try:
         import socket
         ip = socket.gethostbyname(socket.gethostname())
         if not ip or ip.startswith("127."):
-            return None
-        port = int(os.getenv("ACESTEP_API_PORT", "8001"))
-        return f"http://{ip}:{port}"
+            _POD_AUDIO_ORIGIN = None
+        else:
+            port = int(os.getenv("ACESTEP_API_PORT", "8001"))
+            _POD_AUDIO_ORIGIN = f"http://{ip}:{port}"
     except Exception:
-        return None
+        _POD_AUDIO_ORIGIN = None
+    _POD_AUDIO_ORIGIN_RESOLVED = True
+    return _POD_AUDIO_ORIGIN
 
 
 def cache_audio_file(store, file_path: str | Path, ttl_seconds: int = 900) -> None:
@@ -145,14 +155,14 @@ def cache_audio_file(store, file_path: str | Path, ttl_seconds: int = 900) -> No
             return
         file_size = path.stat().st_size
         origin = _pod_audio_origin()
+        if origin:
+            try:
+                client.set(f"rawchunks:worker:audio-owner:{path.name}", f"{origin}|{path}", ex=ttl_seconds)
+            except Exception:
+                pass
 
         def _write_valkey() -> None:
-            if origin:
-                try:
-                    client.set(f"rawchunks:worker:audio-owner:{path.name}", f"{origin}|{path}", ex=ttl_seconds)
-                except Exception:
-                    pass
-            if file_size > 2 * 1024 * 1024:
+            if file_size > 64 * 1024 * 1024:
                 return
             try:
                 import base64
@@ -246,7 +256,7 @@ def register_role_middleware(app):
                     raw = await asyncio.to_thread(fetch_cached_audio_bytes, store, target)
                     if raw:
                         temp_dir = getattr(request.app.state, "temp_audio_dir", None)
-                        if temp_dir:
+                        if temp_dir and len(raw) <= 1024 * 1024:
                             local_path = Path(temp_dir) / name
                             local_path.parent.mkdir(parents=True, exist_ok=True)
                             local_path.write_bytes(raw)

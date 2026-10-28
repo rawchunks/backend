@@ -360,3 +360,9 @@ def test_cross_pod_audio_cache_and_peer_fetch(training, monkeypatch, tmp_path):
     # From another pod, peer fetch succeeds first; fallback to Valkey works if peer is same origin
     assert training.fetch_cached_audio_bytes(store, wav_file) == b"RIFF-cross-pod-audio"
 
+    # Large WAV (>256 KB) still registers audio-owner synchronously before returning
+    large_wav = tmp_path / "large-cross-pod.wav"
+    large_wav.write_bytes(b"RIFF" + b"X" * (512 * 1024))
+    training.cache_audio_file(store, large_wav)
+    assert kv[f"rawchunks:worker:audio-owner:{large_wav.name}"] == f"http://10.56.4.9:8001|{large_wav}"
+
