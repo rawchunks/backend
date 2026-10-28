@@ -163,26 +163,65 @@ def _local_source(src,temp_dir,store=None):
     return candidate
 
 def _execute(temp_dir,source,job_id,stem_type):
+    import contextlib
     from concurrent.futures import ThreadPoolExecutor
-    separator = get_separator()
-    _, separated = separator.separate_audio_file(str(source))
-    order = ['vocals','drums','bass','other','instrumental'] if stem_type in ('all',None) else [stem_type]
-    if all(name in separated for name in ('drums','bass','other')):
+    with _DEMUCS_LOCK:
+        separator = get_separator()
+        use_amp = torch.cuda.is_available() and hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast')
+        amp_dtype = torch.bfloat16 if (use_amp and hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported()) else torch.float16
+        amp_ctx = torch.amp.autocast('cuda', dtype=amp_dtype) if use_amp else contextlib.nullcontext()
+        no_grad_ctx = torch.no_grad() if hasattr(torch, 'no_grad') else contextlib.nullcontext()
+        with no_grad_ctx, amp_ctx:
+            separated = None
+            if use_amp and hasattr(separator, 'separate_tensor'):
+                try:
+                    import soundfile as sf
+                    import torchaudio
+                    data, sr = sf.read(str(source), dtype='float32', always_2d=True)
+                    wav = torch.from_numpy(data.T).to('cuda', non_blocking=True)
+                    if sr != separator.samplerate:
+                        wav = torchaudio.functional.resample(wav, sr, separator.samplerate)
+                    _, separated = separator.separate_tensor(wav, separator.samplerate)
+                except Exception:
+                    separated = None
+            if separated is None:
+                _, separated = separator.separate_audio_file(str(source))
+    order = ['vocals','drums','bass','other'] if stem_type in ('all',None) else [stem_type]
+    if stem_type == 'instrumental' and all(name in separated for name in ('drums','bass','other')):
         separated['instrumental'] = separated['drums']+separated['bass']+separated['other']
     stems = {}; paths = []; tasks = []
+    def _save_stem(item):
+        tensor, out_path = item
+        if hasattr(tensor, 'detach'):
+            try:
+                import soundfile as sf
+                arr = tensor.numpy() if getattr(tensor, 'dtype', None) == torch.int16 else tensor.detach().cpu().clamp(-1.0, 1.0).numpy()
+                if arr.ndim == 2:
+                    arr = arr.T
+                sf.write(out_path, arr, separator.samplerate, subtype='PCM_16')
+                return
+            except Exception:
+                pass
+        demucs.api.save_audio(tensor, out_path, samplerate=separator.samplerate)
     try:
         for name in order:
             if name not in separated:
                 if stem_type not in ('all',None): raise RuntimeError(f'Separator did not produce {name}')
                 continue
+            tensor = separated[name]
+            if hasattr(tensor, 'detach') and getattr(tensor, 'is_cuda', False):
+                try:
+                    tensor = (tensor.detach().clamp(-1.0, 1.0) * 32767.0).to(torch.int16).cpu()
+                except Exception:
+                    pass
             path = temp_dir/f'{job_id}_{name}.wav'
             paths.append(str(path)); stems[name] = '/v1/audio?'+urllib.parse.urlencode({'path':str(path)})
-            tasks.append((separated[name], str(path)))
+            tasks.append((tensor, str(path)))
         if len(tasks) > 1:
             with ThreadPoolExecutor(max_workers=min(5, len(tasks))) as pool:
-                list(pool.map(lambda item: demucs.api.save_audio(item[0], item[1], samplerate=separator.samplerate), tasks))
+                list(pool.map(_save_stem, tasks))
         elif tasks:
-            demucs.api.save_audio(tasks[0][0], tasks[0][1], samplerate=separator.samplerate)
+            _save_stem(tasks[0])
         return {'task_id':job_id,'status':'ready','stems':stems,'audio_paths':paths,'metas':{'caption':','.join(stems)}}
     except BaseException:
         for path in paths:
@@ -196,16 +235,46 @@ async def execute_separation_job(state,store,job_id,req):
     src = req['src_audio_path']; remote = urllib.parse.urlsplit(src).scheme in ('http','https')
     # Raw task IDs never form filesystem names; caller idempotency keys are
     # accepted by the queue only when safe for public task identifiers.
-    input_path = temp_dir/f'{job_id}_input.audio'
+    shm_dir = Path('/dev/shm') if remote and os.path.isdir('/dev/shm') and os.access('/dev/shm', os.W_OK) else temp_dir
+    input_path = shm_dir/f'{job_id}_input.audio'
+    use_url_cache = remote and 'PYTEST_CURRENT_TEST' not in os.environ and os.environ.get('ACESTEP_DISABLE_URL_CACHE') != '1'
+    cache_path = None
+    if use_url_cache:
+        import hashlib
+        cache_dir = shm_dir / 'acestep' / 'url_cache'
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            ext = Path(urllib.parse.urlsplit(src).path).suffix.lower()
+            if ext not in ('.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aac'):
+                ext = '.wav'
+            cache_path = cache_dir / f'{hashlib.sha256(src.encode("utf-8")).hexdigest()}{ext}'
+        except Exception:
+            cache_path = None
     try:
         try: input_path.unlink()
         except FileNotFoundError: pass
-        source = await asyncio.to_thread(_download,src,input_path) if remote else _local_source(src,temp_dir,store)
-        if remote: source = input_path
-        result = await run_gpu(state,_execute,temp_dir,source,job_id,req.get('stem_type','all'))
-        from acestep.api.training import cache_audio_file
-        for audio_path in (result.get('audio_paths') or []):
-            cache_audio_file(store, audio_path)
+        if remote and cache_path is not None and cache_path.is_file() and cache_path.stat().st_size > 0:
+            source = cache_path
+        else:
+            source = await asyncio.to_thread(_download,src,input_path) if remote else _local_source(src,temp_dir,store)
+            if remote:
+                source = input_path
+                if cache_path is not None and input_path.is_file():
+                    try:
+                        import shutil
+                        existing = sorted(cache_path.parent.glob('*.*'), key=lambda p: p.stat().st_mtime)
+                        for stale in existing[:-15]:
+                            stale.unlink(missing_ok=True)
+                        tmp_cache = cache_path.with_suffix(f'.{os.getpid()}.tmp')
+                        shutil.copyfile(input_path, tmp_cache)
+                        os.replace(tmp_cache, cache_path)
+                    except Exception:
+                        pass
+        result = await run_gpu(state,_execute,temp_dir,source,job_id,req.get('stem_type','all'),shared=True)
+        if os.environ.get('ACESTEP_CACHE_STEMS_IN_REDIS', '').lower() in ('1', 'true', 'yes'):
+            from acestep.api.training import cache_audio_file
+            for audio_path in (result.get('audio_paths') or []):
+                cache_audio_file(store, audio_path)
         store.mark_succeeded(job_id,result)
     except BaseException as exc:
         store.mark_failed(job_id,str(exc))
