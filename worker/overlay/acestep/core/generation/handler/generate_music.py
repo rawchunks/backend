@@ -6,8 +6,9 @@ This module provides the public ``generate_music`` entry point extracted from
 
 import gc
 import os
+import time
 import traceback
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from loguru import logger
@@ -191,6 +192,73 @@ class GenerateMusicMixin:
         if dcw_enabled is not None:
             return bool(dcw_enabled)
         return bool(self.is_turbo_model())
+
+    def _decode_generate_music_pred_latents(
+        self,
+        pred_latents: torch.Tensor,
+        progress: Any,
+        use_tiled_decode: bool,
+        time_costs: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
+        """Fast GPU-resident VAE decode without redundant CPU copies or cache flushes."""
+        if progress:
+            progress(0.8, desc="Decoding audio...")
+        logger.info("[generate_music] Decoding latents with VAE...")
+        start_time = time.time()
+        offload = bool(getattr(self, "offload_to_cpu", False))
+        with torch.inference_mode():
+            with self._load_model_context("vae"):
+                pred_latents_for_decode = pred_latents.transpose(1, 2).contiguous().to(self.vae.dtype)
+                del pred_latents
+                if offload:
+                    self._empty_cache()
+
+                using_mlx_vae = getattr(self, "use_mlx_vae", False) and getattr(self, "mlx_vae", None) is not None
+                vae_cpu = False
+                vae_device = None
+                if not using_mlx_vae:
+                    vae_cpu = os.environ.get("ACESTEP_VAE_ON_CPU", "0").lower() in ("1", "true", "yes")
+                    if vae_cpu:
+                        vae_device = next(self.vae.parameters()).device
+                        self.vae = self.vae.cpu()
+                        pred_latents_for_decode = pred_latents_for_decode.cpu()
+                        self._empty_cache()
+                try:
+                    if use_tiled_decode:
+                        pred_wavs = self.tiled_decode(pred_latents_for_decode, offload_wav_to_cpu=False)
+                    elif using_mlx_vae:
+                        try:
+                            pred_wavs = self._mlx_vae_decode(pred_latents_for_decode)
+                        except Exception as exc:
+                            logger.warning(
+                                f"[generate_music] MLX direct decode failed ({exc}), falling back to PyTorch"
+                            )
+                            decoder_output = self.vae.decode(pred_latents_for_decode)
+                            pred_wavs = decoder_output.sample
+                            del decoder_output
+                    else:
+                        decoder_output = self.vae.decode(pred_latents_for_decode)
+                        pred_wavs = decoder_output.sample
+                        del decoder_output
+                finally:
+                    if vae_cpu and vae_device is not None:
+                        self.vae = self.vae.to(vae_device)
+                    if offload:
+                        self._empty_cache()
+                del pred_latents_for_decode
+                peak = pred_wavs.abs().amax(dim=[1, 2], keepdim=True)
+                if torch.any(peak > 1.0):
+                    pred_wavs = pred_wavs / peak.clamp(min=1.0)
+                if pred_wavs.dtype != torch.float32:
+                    pred_wavs = pred_wavs.float()
+        if offload:
+            gc.collect()
+            self._empty_cache()
+        end_time = time.time()
+        time_costs["vae_decode_time_cost"] = end_time - start_time
+        time_costs["total_time_cost"] = time_costs["total_time_cost"] + time_costs["vae_decode_time_cost"]
+        time_costs["offload_time_cost"] = self.current_offload_cost
+        return pred_wavs, None, time_costs
 
     def generate_music(
         self,
