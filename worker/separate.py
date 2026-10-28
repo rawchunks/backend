@@ -15,6 +15,7 @@ from functools import partial
 
 from fastapi import Depends, Header, HTTPException, Request
 from pydantic import BaseModel
+from threading import RLock
 import torch
 import demucs.api
 from acestep.api.gpu import run_gpu
@@ -22,15 +23,18 @@ from acestep.api.jobs.durable import QueueFull
 
 MAX_AUDIO_BYTES = 200 * 1024 * 1024  # Existing API audio upload boundary.
 DOWNLOAD_TIMEOUT_SECONDS = 90  # Network I/O bound, not a GPU job deadline.
+_DEMUCS_LOCK = RLock()
 _demucs_separator = None
 
 def get_separator():
     global _demucs_separator
     if _demucs_separator is None:
         _demucs_separator = demucs.api.Separator(model='htdemucs',device='cuda' if torch.cuda.is_available() else 'cpu')
+        if hasattr(_demucs_separator, 'update_parameter'):
+            _demucs_separator.update_parameter(shifts=0, overlap=0.1)
     return _demucs_separator
 
-class SeparateRequest(BaseModel):
+class IsolateRequest(BaseModel):
     src_audio_path: str
     stem_type: Optional[Literal['all','vocals','drums','bass','other','instrumental']] = 'all'
     wait: bool = True
@@ -88,11 +92,28 @@ class _SafeRedirect(urllib.request.HTTPRedirectHandler):
 
 def _download(src,target):
     _public_url(src)
+    req_url = src
+    req_headers = {'User-Agent':'rawchunks-audio-worker'}
+    try:
+        from acestep.core.generation.handler.io_audio import r2_authenticated_request
+        req_url, req_headers = r2_authenticated_request(src)
+        if req_url != src:
+            _public_url(req_url)
+    except Exception:
+        req_url = src
+        req_headers = {'User-Agent':'rawchunks-audio-worker'}
     deadline = time.monotonic()+DOWNLOAD_TIMEOUT_SECONDS
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),_SafeRedirect(),_PinnedHTTPHandler(),_PinnedHTTPSHandler())
-    req = urllib.request.Request(src,headers={'User-Agent':'rawchunks-audio-worker'})
+    def _open_req(u, h):
+        return opener.open(urllib.request.Request(u, headers=h), timeout=DOWNLOAD_TIMEOUT_SECONDS)
     try:
-        with opener.open(req,timeout=DOWNLOAD_TIMEOUT_SECONDS) as response, open(target,'xb') as out:
+        try:
+            resp_ctx = _open_req(req_url, req_headers)
+        except urllib.error.HTTPError:
+            if req_url == src:
+                raise
+            resp_ctx = _open_req(src, {'User-Agent':'rawchunks-audio-worker'})
+        with resp_ctx as response, open(target,'xb') as out:
             length = response.headers.get('Content-Length')
             if length is not None and int(length)>MAX_AUDIO_BYTES:
                 raise HTTPException(413,'Source audio exceeds 50 MiB')
