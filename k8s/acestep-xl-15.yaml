@@ -82,6 +82,8 @@ spec:
               value: "true"
             - name: ACESTEP_LM_MODEL_PATH
               value: acestep-5Hz-lm-0.6B
+            - name: ACESTEP_LM_BACKEND
+              value: vllm
             - name: ACESTEP_CONFIG_TURBO
               value: acestep-v15-xl-turbo
             - name: ACESTEP_OFFLOAD_TO_CPU
@@ -91,6 +93,10 @@ spec:
             - name: ACESTEP_LM_OFFLOAD_TO_CPU
               value: "false"
             - name: ACESTEP_SAVE_MEMORY
+              value: "false"
+            - name: ACESTEP_VAE_DECODE_CHUNK_SIZE
+              value: "1536"
+            - name: ACESTEP_MPS_DECODE_OFFLOAD
               value: "false"
             - name: ACESTEP_COMPILE_MODEL
               value: "true"
@@ -281,6 +287,8 @@ spec:
               value: "true"
             - name: ACESTEP_LM_MODEL_PATH
               value: acestep-5Hz-lm-0.6B
+            - name: ACESTEP_LM_BACKEND
+              value: vllm
             - name: ACESTEP_OFFLOAD_TO_CPU
               value: "false"
             - name: ACESTEP_OFFLOAD_DIT_TO_CPU
@@ -288,6 +296,10 @@ spec:
             - name: ACESTEP_LM_OFFLOAD_TO_CPU
               value: "false"
             - name: ACESTEP_SAVE_MEMORY
+              value: "false"
+            - name: ACESTEP_VAE_DECODE_CHUNK_SIZE
+              value: "1536"
+            - name: ACESTEP_MPS_DECODE_OFFLOAD
               value: "false"
             - name: ACESTEP_COMPILE_MODEL
               value: "true"
@@ -478,6 +490,8 @@ spec:
               value: "true"
             - name: ACESTEP_LM_MODEL_PATH
               value: acestep-5Hz-lm-0.6B
+            - name: ACESTEP_LM_BACKEND
+              value: vllm
             - name: ACESTEP_OFFLOAD_TO_CPU
               value: "false"
             - name: ACESTEP_OFFLOAD_DIT_TO_CPU
@@ -485,6 +499,10 @@ spec:
             - name: ACESTEP_LM_OFFLOAD_TO_CPU
               value: "false"
             - name: ACESTEP_SAVE_MEMORY
+              value: "false"
+            - name: ACESTEP_VAE_DECODE_CHUNK_SIZE
+              value: "1536"
+            - name: ACESTEP_MPS_DECODE_OFFLOAD
               value: "false"
             - name: ACESTEP_COMPILE_MODEL
               value: "true"
