@@ -79,7 +79,11 @@ if rec.claim then
  if redis.call('GET',KEYS[2]) ~= ARGV[3] or rec.claim ~= ARGV[4] then return 'LEASE_LOST' end
 end
 if rec.status == 'succeeded' or rec.status == 'failed' then return raw end
-local changes = cjson.decode(ARGV[2]); for k,v in pairs(changes) do rec[k] = v end
+local changes = cjson.decode(ARGV[2])
+if changes.status == 'running' and changes.progress and rec.progress and tonumber(rec.progress) > tonumber(changes.progress) then
+ changes.progress = rec.progress
+end
+for k,v in pairs(changes) do rec[k] = v end
 if ARGV[5] ~= '' then rec.result_json = ARGV[5] end
 redis.call('HSET',KEYS[1],ARGV[1],cjson.encode(rec))
 if changes.status or changes.progress then
@@ -132,6 +136,8 @@ class _JobStore:
         with self._lock:
             rec = self._records.get(identifier)
             if rec is None: rec = self.new_record(identifier); self._records[identifier] = rec
+            if rec.status in ('succeeded', 'failed') and status not in ('succeeded', 'failed'):
+                return rec
             for k,v in data.items(): setattr(rec,k,v)
         return rec
     def create(self): return self.create_with_id(str(uuid4()))
@@ -140,7 +146,7 @@ class _JobStore:
         return self.get(identifier)
     def get(self,identifier):
         raw = self.client.hget(self.key('jobs'),identifier)
-        if not raw and self.namespace.startswith('rawchunks:worker:'):
+        if not raw and self.namespace.startswith('rawchunks:worker'):
             for suffix in ('turbo', 'sft', 'base'):
                 ns_key = f'rawchunks:worker:{suffix}:jobs'
                 if ns_key != self.key('jobs'):
@@ -150,7 +156,7 @@ class _JobStore:
     def _update(self,identifier,changes,missing_ok=False):
         changes['updated_at'] = time.time(); owner,token = self.claims.get(identifier,('',''))
         executor_key = self.key(f'executor:{owner}') if (getattr(self, '_multi_executor', False) and owner) else self.key('executor')
-        shared_event_key = f'rawchunks:worker:events:{identifier}' if self.namespace.startswith('rawchunks:worker:') else ''
+        shared_event_key = f'rawchunks:worker:events:{identifier}' if self.namespace.startswith('rawchunks:worker') else ''
         raw = self.client.eval(_UPDATE,2,self.key('jobs'),executor_key,identifier,json.dumps(changes,allow_nan=False),owner,token,json.dumps(changes['result'],allow_nan=False) if changes.get('result') is not None else '',self.key('events:'+identifier),shared_event_key)
         if raw == 'LEASE_LOST':
             from acestep.api.jobs.durable import LeaseLost
