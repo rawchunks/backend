@@ -42,6 +42,7 @@ def ensure_threadsafe_handlers(app_state, selected_handler) -> None:
         llm_handler._rawchunks_threadsafe = True
     if selected_handler is not None and not getattr(selected_handler, "_rawchunks_threadsafe", False):
         _wrap_method_with_lock(selected_handler, "_prepare_text_conditioning_inputs", _TOKENIZER_LOCK)
+        _wrap_method_with_lock(selected_handler, "_prepare_target_latents_and_wavs", _VAE_LOCK)
         _wrap_method_with_lock(selected_handler, "_execute_service_generate_diffusion", _DIT_LOCK)
         _wrap_method_with_lock(selected_handler, "_decode_generate_music_pred_latents", _VAE_LOCK)
         empty_fn = getattr(selected_handler, "_empty_cache", None)
