@@ -8,7 +8,7 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass
-from threading import Lock
+from threading import Event, Lock, Thread
 import math
 import redis
 from typing import Any, Dict, Literal, Optional
@@ -122,6 +122,25 @@ class _JobStore:
         self._lock = Lock(); self._records = {}; self.claims = {}
         self._multi_executor = False
         self._terminal_statuses = {}
+        self._pending_progress = {}
+        self._progress_event = Event()
+        self._async_progress = getattr(self.client, 'connection_pool', None) is not None
+        if self._async_progress:
+            Thread(target=self._flush_progress_loop, daemon=True, name='jobstore-progress-flusher').start()
+    def _flush_progress_loop(self):
+        while True:
+            self._progress_event.wait()
+            self._progress_event.clear()
+            while True:
+                with self._lock:
+                    if not self._pending_progress:
+                        break
+                    identifier, changes = next(iter(self._pending_progress.items()))
+                    del self._pending_progress[identifier]
+                try:
+                    self._update(identifier, changes, True)
+                except Exception:
+                    pass
     def key(self,name): return f'{self.namespace}:{name}'
     def new_record(self,identifier,env='development'):
         now = time.time(); return _JobRecord(identifier,'queued',now,env=env,updated_at=now)
@@ -144,7 +163,17 @@ class _JobStore:
     def create_with_id(self,identifier,env='development'):
         self.client.hsetnx(self.key('jobs'),identifier,self.encode(self.new_record(identifier,env)))
         return self.get(identifier)
+    def _flush_pending(self,identifier):
+        with self._lock:
+            changes = self._pending_progress.pop(identifier, None)
+        if changes is not None:
+            self._update(identifier, changes, True)
     def get(self,identifier):
+        self._flush_pending(identifier)
+        with self._lock:
+            cached = self._records.get(identifier)
+            if cached is not None and cached.status in ('succeeded', 'failed'):
+                return cached
         raw = self.client.hget(self.key('jobs'),identifier)
         if not raw and self.namespace.startswith('rawchunks:worker'):
             for suffix in ('turbo', 'sft', 'base'):
@@ -166,22 +195,43 @@ class _JobStore:
             return
         self.decode(raw)
     def mark_running(self,identifier):
-        rec = self.get(identifier)
-        if rec is None: raise KeyError(identifier)
-        self._update(identifier,dict(status='running',started_at=time.time(),progress=max(rec.progress,.01),stage='running'))
+        with self._lock:
+            cur = self._records.get(identifier)
+            cur_progress = cur.progress if cur is not None else 0.0
+        self._update(identifier,dict(status='running',started_at=time.time(),progress=max(cur_progress,.01),stage='running'))
     def mark_succeeded(self,identifier,result):
+        with self._lock:
+            self._pending_progress.pop(identifier, None)
         self._update(identifier,dict(status='succeeded',finished_at=time.time(),result=result,error=None,progress=1.0,stage='succeeded'))
     def mark_failed(self,identifier,error):
+        with self._lock:
+            self._pending_progress.pop(identifier, None)
         self._update(identifier,dict(status='failed',finished_at=time.time(),result=None,error=error,stage='failed'))
     def update_progress(self,identifier,progress,stage=None):
-        if self.get(identifier) is None: return
         value = float(progress)
         if not math.isfinite(value): raise ValueError('progress must be finite')
-        changes = {'progress':max(0.0,min(1.0,value))}
+        clamped = max(0.0,min(1.0,value))
+        changes = {'progress':clamped}
         if stage: changes['stage'] = stage
+        if getattr(self, '_async_progress', False):
+            with self._lock:
+                rec = self._records.get(identifier)
+                if rec is not None:
+                    if rec.status in ('succeeded', 'failed'):
+                        return
+                    rec.progress = clamped
+                    if stage: rec.stage = stage
+                prev = self._pending_progress.get(identifier)
+                if prev is not None:
+                    prev.update(changes)
+                else:
+                    self._pending_progress[identifier] = changes
+            self._progress_event.set()
+            return
+        if self.get(identifier) is None: return
         self._update(identifier,changes,True)
-    def update_status_text(self,identifier,text): self._update(identifier,{'status_text':text},True)
-    def update_progress_text(self,identifier,text): self._update(identifier,{'progress_text':text},True)
+    def update_status_text(self,identifier,text): self._flush_pending(identifier); self._update(identifier,{'status_text':text},True)
+    def update_progress_text(self,identifier,text): self._flush_pending(identifier); self._update(identifier,{'progress_text':text},True)
     def temp_files(self,identifier):
         raw = self.client.hget(self.key('files'),identifier); return json.loads(raw) if raw else []
     def clear_temp_files(self,identifier): self.client.hdel(self.key('files'),identifier)
