@@ -95,9 +95,18 @@ def register_reinitialize_route(
 
             if handler.model is not None:
                 if hasattr(handler.model, "decoder") and handler.model.decoder is not None:
-                    first_param = next(handler.model.decoder.parameters(), None)
+                    decoder = handler.model.decoder
+                    lycoris_net = getattr(decoder, "_lycoris_net", None)
+                    if lycoris_net is not None and not getattr(handler, "lora_loaded", False):
+                        try:
+                            lycoris_net.restore()
+                        except Exception:
+                            pass
+                        decoder._lycoris_net = None
+                        reloaded.append("Decoder (restored orphaned LoKr)")
+                    first_param = next(decoder.parameters(), None)
                     if first_param is not None and first_param.device.type == "cpu":
-                        handler.model.decoder = handler.model.decoder.to(handler.device).to(handler.dtype)
+                        handler.model.decoder = decoder.to(handler.device).to(handler.dtype)
                         reloaded.append("Decoder (moved to GPU)")
 
             gc.collect()
