@@ -470,7 +470,7 @@ def do_model_initialization(
             print("[API Server] Auto-setting offload_to_cpu=True based on GPU memory")
 
     offload_dit_to_cpu = env_bool("ACESTEP_OFFLOAD_DIT_TO_CPU", False)
-    compile_model = env_bool("ACESTEP_COMPILE_MODEL", False)
+    compile_model = False if (torch is not None and torch.cuda.is_available()) else env_bool("ACESTEP_COMPILE_MODEL", False)
 
     checkpoint_dir = str(get_checkpoints_dir())
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -504,6 +504,16 @@ def do_model_initialization(
             if not ok:
                 raise RuntimeError(status_msg)
             slot_handler._lora_hot_cache_enabled = env_bool("ACESTEP_LORA_HOT_CACHE", True)
+            if getattr(slot_handler, "gpu_config", None) is not None:
+                slot_handler.gpu_config.save_memory_mode = env_bool("ACESTEP_SAVE_MEMORY", True)
+            if getattr(slot_handler, "model", None) is not None:
+                if hasattr(slot_handler.model, "_orig_mod"):
+                    slot_handler.model = slot_handler.model._orig_mod
+                _install_windowed_cfg_acceleration(slot_handler.model)
+                _install_fused_dit_kernels(slot_handler.model)
+                _warmup_handler_pipeline(slot_handler)
+            if not suffix:
+                _compile_and_warmup_vae_decoder(slot_handler)
             if suffix and handler is not None:
                 if getattr(handler, "vae", None) is not None and getattr(slot_handler, "vae", None) is not None:
                     slot_handler.vae = handler.vae
@@ -533,7 +543,7 @@ def do_model_initialization(
         env_bool=env_bool,
     )
 
-    if env_bool("ACESTEP_INIT_DEMUCS", False):
+    if env_bool("ACESTEP_INIT_DEMUCS", True):
         try:
             from acestep.api.http.separate import get_separator
             get_separator()
@@ -563,9 +573,17 @@ def initialize_models_at_startup(
     By default models are NOT loaded at startup (lazy-loaded on first request).
     Set ``ACESTEP_NO_INIT=false`` to force eager loading at startup.
     """
+    os.environ.setdefault("ACESTEP_VAE_DECODE_CHUNK_SIZE", "1536")
+    os.environ.setdefault("ACESTEP_MPS_DECODE_OFFLOAD", "false")
+    os.environ.setdefault("ACESTEP_SAVE_MEMORY", "true")
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
     no_init = env_bool("ACESTEP_NO_INIT", True)
     gpu_config = get_gpu_config()
+    gpu_config.save_memory_mode = env_bool("ACESTEP_SAVE_MEMORY", True)
     set_global_gpu_config(gpu_config)
     app.state.gpu_config = gpu_config
 
