@@ -317,8 +317,16 @@ def decode_audio(source: Path, destination: Path) -> float:
 
 async def download_source(url: str, destination: Path):
     import httpx
+    req_url = url
+    req_headers: dict[str, str] = {}
+    try:
+        from acestep.core.generation.handler.io_audio import r2_authenticated_request
+        req_url, req_headers = r2_authenticated_request(url)
+    except Exception:
+        req_url = url
+        req_headers = {}
     async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=10), follow_redirects=True) as client:
-        async with client.stream("GET", url) as response:
+        async with client.stream("GET", req_url, headers=req_headers) as response:
             response.raise_for_status()
             with destination.open("wb") as handle:
                 size = 0

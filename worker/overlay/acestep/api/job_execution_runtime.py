@@ -102,6 +102,9 @@ async def run_one_job_runtime(
     t0 = time.time()
     try:
         loop = asyncio.get_running_loop()
+        if getattr(req, "src_audio_path", None) or getattr(req, "reference_audio_path", None):
+            from acestep.core.generation.handler.io_audio import resolve_job_audio_inputs
+            await asyncio.to_thread(resolve_job_audio_inputs, req, job_store)
         shared_gpu = not bool(getattr(req, "lora_path", None))
         result = await run_gpu(app_state, _blocking_generate, shared=shared_gpu)
         from acestep.api.training import cache_audio_file
