@@ -113,6 +113,35 @@ spec:
                 secretKeyRef:
                   name: backend-secrets
                   key: VALKEY_REQUESTS_SERVICE_URI
+            - name: VALKEY_REQUESTS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: VALKEY_REQUESTS_PASSWORD
+            - name: CF_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: CF_ACCOUNT_ID
+                  optional: true
+            - name: CF_GLOBAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: CF_GLOBAL_TOKEN
+                  optional: true
+            - name: CF_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: CF_API_TOKEN
+                  optional: true
+            - name: R2_BUCKET_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: R2_BUCKET_NAME
+                  optional: true
             - name: ACESTEP_ROLE
               value: generation
             - name: ACESTEP_QUEUE_NAMESPACE
@@ -281,6 +310,35 @@ spec:
                 secretKeyRef:
                   name: backend-secrets
                   key: VALKEY_REQUESTS_SERVICE_URI
+            - name: VALKEY_REQUESTS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: VALKEY_REQUESTS_PASSWORD
+            - name: CF_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: CF_ACCOUNT_ID
+                  optional: true
+            - name: CF_GLOBAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: CF_GLOBAL_TOKEN
+                  optional: true
+            - name: CF_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: CF_API_TOKEN
+                  optional: true
+            - name: R2_BUCKET_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: R2_BUCKET_NAME
+                  optional: true
             - name: ACESTEP_ROLE
               value: generation
             - name: ACESTEP_QUEUE_NAMESPACE
@@ -449,6 +507,35 @@ spec:
                 secretKeyRef:
                   name: backend-secrets
                   key: VALKEY_REQUESTS_SERVICE_URI
+            - name: VALKEY_REQUESTS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: VALKEY_REQUESTS_PASSWORD
+            - name: CF_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: CF_ACCOUNT_ID
+                  optional: true
+            - name: CF_GLOBAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: CF_GLOBAL_TOKEN
+                  optional: true
+            - name: CF_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: CF_API_TOKEN
+                  optional: true
+            - name: R2_BUCKET_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: R2_BUCKET_NAME
+                  optional: true
             - name: ACESTEP_ROLE
               value: generation
             - name: ACESTEP_QUEUE_NAMESPACE
@@ -674,6 +761,35 @@ spec:
                 secretKeyRef:
                   name: backend-secrets
                   key: VALKEY_REQUESTS_SERVICE_URI
+            - name: VALKEY_REQUESTS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: VALKEY_REQUESTS_PASSWORD
+            - name: CF_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: CF_ACCOUNT_ID
+                  optional: true
+            - name: CF_GLOBAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: CF_GLOBAL_TOKEN
+                  optional: true
+            - name: CF_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: CF_API_TOKEN
+                  optional: true
+            - name: R2_BUCKET_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: R2_BUCKET_NAME
+                  optional: true
             - name: ACESTEP_ROLE
               value: training
             - name: ACESTEP_QUEUE_NAMESPACE
