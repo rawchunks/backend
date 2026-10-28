@@ -24,7 +24,8 @@ async def process_queue_item(job_id,req,app_state,store,run_one_job,cleanup_job_
                 try: app_state.pending_ids.remove(job_id)
                 except ValueError: pass
         await run_one_job(job_id,req)
-        rec = store.get(job_id)
+        local_rec = getattr(store, '_records', {}).get(job_id)
+        rec = local_rec if (local_rec is not None and local_rec.status in ('succeeded','failed')) else store.get(job_id)
         if rec is not None and rec.status not in ('succeeded','failed'):
             store.mark_failed(job_id,'Worker returned without a terminal result')
     except BaseException as exc:
@@ -36,7 +37,10 @@ async def process_queue_item(job_id,req,app_state,store,run_one_job,cleanup_job_
         except Exception:
             if durable: queue.fatal_lease_loss()
     finally:
-        try: rec = store.get(job_id) or rec
+        try:
+            if rec is None or rec.status not in ('succeeded','failed'):
+                local_rec = getattr(store, '_records', {}).get(job_id)
+                rec = local_rec if (local_rec is not None and local_rec.status in ('succeeded','failed')) else (store.get(job_id) or rec)
         except Exception: pass
         _notify(rec)
         try:
