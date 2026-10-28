@@ -383,6 +383,47 @@ def _warmup_handler_pipeline(slot_handler: Any) -> None:
         print(f"[API Server] Warning: End-to-end DiT pipeline warmup skipped: {exc}")
 
 
+def _compile_and_warmup_vae_decoder(slot_handler: Any) -> None:
+    """Compile AutoencoderOobleck.decoder with dynamic shapes and warm up Triton kernels at startup."""
+    if torch is None or not torch.cuda.is_available():
+        return
+    vae = getattr(slot_handler, "vae", None)
+    if vae is None:
+        return
+    try:
+        if hasattr(vae, "_orig_mod"):
+            vae = vae._orig_mod
+            slot_handler.vae = vae
+        if not getattr(vae, "_contiguous_decode_wrapped", False):
+            orig_vae_decode = vae.decode
+
+            def _contiguous_vae_decode(self_vae: Any, z: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+                return orig_vae_decode(z.contiguous(), *args, **kwargs)
+
+            vae.decode = types.MethodType(_contiguous_vae_decode, vae)
+            vae._contiguous_decode_wrapped = True
+        if not hasattr(vae.decoder, "_orig_mod"):
+            vae.decoder = torch.compile(vae.decoder, dynamic=True)
+        vae_param = next(vae.parameters())
+        with torch.inference_mode():
+            for frames in (256, 1536):
+                dummy = torch.zeros((1, 64, frames), device=vae_param.device, dtype=vae_param.dtype)
+                _ = vae.decode(dummy)
+                del dummy
+            if hasattr(slot_handler, "tiled_decode"):
+                dummy_full = torch.zeros((1, 64, 4500), device=vae_param.device, dtype=vae_param.dtype)
+                _ = slot_handler.tiled_decode(dummy_full, offload_wav_to_cpu=False)
+                del dummy_full
+            if hasattr(slot_handler, "tiled_encode"):
+                dummy_wav = torch.zeros((1, 2, 48000 * 10), device=vae_param.device, dtype=vae_param.dtype)
+                _ = slot_handler.tiled_encode(dummy_wav, offload_latent_to_cpu=False)
+                del dummy_wav
+        torch.cuda.synchronize()
+        print("[API Server] VAE decoder/encoder compiled (dynamic=True) and tiled_decode/encode warmed up on GPU")
+    except Exception as exc:
+        print(f"[API Server] Warning: VAE decoder compile/warmup skipped: {exc}")
+
+
 def do_model_initialization(
     *,
     app: Any,
