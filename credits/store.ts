@@ -185,7 +185,6 @@ export class CreditStore {
     };
     if (claimed) return { eligible: false, claimed: true, remaining, maxClaims, amountAtomics, ...balances, reason: 'claimed' };
     if (remaining <= 0) return { eligible: false, claimed: false, remaining: 0, maxClaims, amountAtomics, ...balances, reason: 'exhausted' };
-    if (!identityHash) return { eligible: false, claimed: false, remaining, maxClaims, amountAtomics, ...balances, reason: 'identity_required' };
     return { eligible: true, claimed: false, remaining, maxClaims, amountAtomics, ...balances };
   }
 
@@ -216,13 +215,13 @@ export class CreditStore {
 
   async balance(owner: string, identityHash?: string | null): Promise<CreditBalanceSnapshot> {
     const key = this.ownerSnapKey(owner);
-    const hit = await cacheGet<{ balance: CreditBalanceSnapshot; hasIdentityHash: boolean }>(key, SNAPSHOT_L1_TTL_MS);
-    if (hit && (hit.hasIdentityHash || !identityHash)) {
-      return hit.balance;
+    const hit = await cacheGet<CreditBalanceSnapshot>(key, SNAPSHOT_L1_TTL_MS);
+    if (hit) {
+      return hit;
     }
     return singleFlight(`sf:${key}`, async () => {
       const balance = await this.tx(c => this.balanceInConnection(c, owner, identityHash));
-      await cacheSet(key, { balance, hasIdentityHash: Boolean(identityHash) }, SNAPSHOT_L2_TTL_SEC, SNAPSHOT_L1_TTL_MS);
+      await cacheSet(key, balance, SNAPSHOT_L2_TTL_SEC, SNAPSHOT_L1_TTL_MS);
       return balance;
     });
   }

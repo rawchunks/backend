@@ -1,6 +1,6 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { authenticate } from './auth.js';
+import { authenticate, resolveCreditOwner } from './auth.js';
 import { creditStore } from './store.js';
 import { PayPal, packs } from './paypal.js';
 
@@ -56,8 +56,8 @@ export const creditsRouter: FastifyPluginAsync = async app => {
   });
 
   app.get('/credits/balance', async req => {
-    const identity = await authenticate(req);
-    const bal = await store.balance(identity.owner, identity.promoIdentityHash);
+    const identity = await resolveCreditOwner(req);
+    const bal = await store.balance(identity.owner);
     return {
       userAddress: identity.userAddress,
       ...bal,
