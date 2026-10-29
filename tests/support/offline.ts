@@ -2,8 +2,12 @@ import { vi } from 'vitest';
 
 // Unit tests never load real .env secrets or contact providers by accident.
 // Live tests explicitly opt in and load only what each probe needs.
+vi.mock('dotenv', async (importOriginal) => {
+  if (process.env.RAWCHUNKS_LIVE === '1') return await importOriginal<typeof import('dotenv')>();
+  return { config: vi.fn(() => ({ parsed: {} })), default: { config: vi.fn(() => ({ parsed: {} })) } };
+});
+
 if (process.env.RAWCHUNKS_LIVE !== '1') {
-  vi.mock('dotenv', () => ({ config: vi.fn(() => ({ parsed: {} })), default: { config: vi.fn(() => ({ parsed: {} })) } }));
   for (const key of ['SONG_DATABASE_URL', 'USER_DATABASE_URL', 'ACESTEP_API_URL', 'ACESTEP_API_KEY', 'CF_API_TOKEN', 'CF_GLOBAL_TOKEN', 'CF_ACCOUNT_ID', 'VALKEY_REQUESTS_SERVICE_URI', 'VALKEY_URI', 'VALKEY_REQUESTS_HOST', 'VALKEY_REQUESTS_PASSWORD', 'PINATA_GATEWAY_URL']) {
     delete process.env[key];
   }

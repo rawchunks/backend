@@ -13,7 +13,7 @@ The API behind the Rawchunks app and third-party music integrations. It provides
 | [databases](databases/README.md) | Songs, users, albums, voices and saved project records. |
 | voice | Vocal references and trained voice preparation. |
 
-Built with TypeScript, Fastify and Zod, with PostgreSQL and Drizzle for project data.
+Built with TypeScript on Cloudflare Workers and Node, with Zod validation, PostgreSQL and Drizzle for project data, and R2 for audio and artwork storage.
 
 ## Call the API
 

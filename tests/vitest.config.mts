@@ -8,7 +8,7 @@ export default defineConfig({
     '@vitest/coverage-v8': fileURLToPath(new URL('./node_modules/@vitest/coverage-v8/dist/index.js', import.meta.url)),
   } },
   test: {
-    include: ['tests/{unit,gates,infrastructure,stress,live}/**/*.test.ts'],
+    include: ['editing/**/*.test.ts', 'tests/{unit,gates,infrastructure,stress,live}/**/*.test.ts'],
     setupFiles: ['tests/support/offline.ts'],
     testTimeout: 10000,
     hookTimeout: 10000,
@@ -19,7 +19,7 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       include: ['index.ts', 'broker/**/*.ts', 'databases/**/*.ts', 'generation/**/*.ts', 'editing/**/*.ts', 'voice/**/*.ts', 'storage/**/*.ts'],
-      exclude: ['**/*.d.ts'],
+      exclude: ['**/*.d.ts', '**/*.test.ts'],
       reportsDirectory: 'tests/coverage',
       reporter: ['text', 'json-summary', 'html'],
       reportOnFailure: true,

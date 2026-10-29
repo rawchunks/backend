@@ -19,7 +19,7 @@ export async function closePostgres() {
   await Promise.all([postgres.user.close(), postgres.song.close()]);
 }
 export async function clearPostgres() {
-  await postgres.user.exec('TRUNCATE public.wallet_pairs, public.users CASCADE');
+  await postgres.user.exec('TRUNCATE public.wallet_pairs CASCADE');
   await postgres.song.exec('TRUNCATE songs, stems, takes, commits, voices CASCADE');
 }
 export function sqlTag(database: 'user' | 'song') {

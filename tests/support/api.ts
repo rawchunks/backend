@@ -28,7 +28,7 @@ vi.mock('../../generation/router.js', () => ({ generationRouter: async (app: Fas
   app.get('/status/:taskId', async req => ({ params: req.params, query: req.query }));
 } }));
 vi.mock('../../editing/router.js', () => ({ editingRouter: async (app: FastifyInstance) => {
-  for (const route of ['repaint', 'layer', 'extend', 'remix', 'separate']) app.post(`/${route}`, async req => ({ body: req.body }));
+  for (const route of ['repaint', 'layer', 'extend', 'remix', 'isolate']) app.post(`/${route}`, async req => ({ body: req.body }));
 } }));
 vi.mock('../../voice/service.js', () => ({ voiceService: { start: vi.fn(), stop: vi.fn(async () => {}) } }));
 vi.mock('../../voice/index.js', () => ({ default: async (app: FastifyInstance) => {
@@ -37,6 +37,7 @@ vi.mock('../../voice/index.js', () => ({ default: async (app: FastifyInstance) =
 
 export async function boot(migrationError?: Error, listenError?: Error) {
   vi.resetModules();
+  process.env.CREDITS_ENABLED = 'false';
   if (listenError) apiState.listen.mockRejectedValue(listenError);
   else apiState.listen.mockResolvedValue('http://127.0.0.1:3005');
   apiState.migrations.mockReset();
