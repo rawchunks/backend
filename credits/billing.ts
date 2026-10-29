@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
-import { authenticate } from './auth.js';
+import { resolveCreditOwner } from './auth.js';
 import { creditStore, type CreditLotSource } from './store.js';
 import type { SessionPaymentConfig, SessionPaymentOptions, SessionPaymentResolver } from '../broker/payment.js';
 
@@ -29,7 +29,7 @@ export async function admitCredits(
   if (process.env.CREDITS_ENABLED !== 'true') {
     throw Object.assign(new Error('Prepaid Credits unavailable'), { statusCode: 503 });
   }
-  const identity = await authenticate(req);
+  const identity = await resolveCreditOwner(req);
   const store = creditStore();
   const rawSource = req.headers['x-credit-source'];
   if (rawSource !== 'promo' && rawSource !== 'card') {
@@ -108,7 +108,7 @@ export async function admitCredits(
 }
 
 export async function checkpointCredits(req: FastifyRequest) {
-  const identity = await authenticate(req);
+  const identity = await resolveCreditOwner(req);
   const store = creditStore();
   const input = req.body as { paymentIntentId?: string; listenedSeconds?: number; terminal?: boolean };
   if (!input?.paymentIntentId || !Number.isFinite(input.listenedSeconds) || input.listenedSeconds! < 0) {

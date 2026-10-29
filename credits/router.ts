@@ -83,19 +83,25 @@ export const creditsRouter: FastifyPluginAsync = async app => {
   });
 
   app.post('/credits/paypal/create-order', async req => {
-    const identity = await authenticate(req);
-    const input = body(z.object({ packId: z.enum(['usd-10', 'usd-25', 'usd-100']) }).strict(), req.body);
+    const identity = await resolveCreditOwner(req);
+    const input = body(
+      z.object({
+        packId: z.enum(['usd-10', 'usd-25', 'usd-100']),
+        checkout: z.object({ kind: z.literal('balance') }).optional(),
+      }).strict(),
+      req.body,
+    );
     return paypal.create(identity.owner, input.packId, key(req.headers));
   });
 
   app.post('/credits/paypal/capture-order', async req => {
-    const identity = await authenticate(req);
+    const identity = await resolveCreditOwner(req);
     const input = body(z.object({ operationId: id, orderId: id }).strict(), req.body);
     return paypal.capture(identity.owner, input.operationId, input.orderId);
   });
 
   app.post('/credits/license/create-order', async req => {
-    const identity = await authenticate(req);
+    const identity = await resolveCreditOwner(req);
     const input = body(
       z.object({
         songId: id,
@@ -110,7 +116,7 @@ export const creditsRouter: FastifyPluginAsync = async app => {
   });
 
   app.post('/credits/license/capture-order', async req => {
-    const identity = await authenticate(req);
+    const identity = await resolveCreditOwner(req);
     const input = body(
       z.object({
         operationId: id,
@@ -131,7 +137,7 @@ export const creditsRouter: FastifyPluginAsync = async app => {
   });
 
   app.get('/credits/operations/:id', async req => {
-    const identity = await authenticate(req);
+    const identity = await resolveCreditOwner(req);
     const input = body(z.object({ id }), req.params);
     const op = await paypal.operation(input.id, identity.owner);
     return {
