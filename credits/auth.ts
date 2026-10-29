@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { FastifyRequest } from 'fastify';
-import { readUser, ensureSessionPairLinked } from '../databases/users.js';
+import { readUser, ensureSessionPairLinked, getWalletPair } from '../databases/users.js';
 import { z } from 'zod';
 import { resolveCreditAddresses } from './identity.js';
 import { cacheGet, cacheSet, l1Get, singleFlight } from '../databases/cache.js';
@@ -156,6 +156,26 @@ export function verifyCachedTokenAddress(token: string, userAddress: string): bo
   const entry = l1Get<CachedTokenEntry>(tokenCacheKey(hash));
   if (!entry) return true;
   return entry.pairs.some(([evm, svm]) => evm.toLowerCase() === userAddress || svm === userAddress);
+}
+
+export async function resolveCreditOwner(request: FastifyRequest): Promise<CreditIdentity> {
+  const userAddress = readUser(request);
+  const walletToken = request.headers['x-wallet-auth-token'];
+  if (typeof walletToken === 'string' && walletToken.length > 0 && walletToken.length <= 8192 && !/\s/.test(walletToken)) {
+    const cached = getCachedTokenIdentity(walletToken, userAddress);
+    if (cached) return cached;
+  }
+  const pair = await getWalletPair(userAddress).catch(() => null);
+  if (pair) {
+    const evm = pair.evmAddress ? pair.evmAddress.toLowerCase() : '';
+    const svm = pair.svmAddress || '';
+    const owner = evm || svm || userAddress;
+    const addresses = [evm, svm].filter(Boolean);
+    if (!addresses.includes(userAddress)) addresses.push(userAddress);
+    return { owner, userAddress, addresses };
+  }
+  const owner = userAddress.startsWith('0x') ? userAddress.toLowerCase() : userAddress;
+  return { owner, userAddress, addresses: [owner] };
 }
 
 export async function authenticate(request: FastifyRequest): Promise<CreditIdentity> {
