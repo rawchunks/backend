@@ -892,9 +892,13 @@ spec:
   triggers:
     - type: redis
       metadata:
-        connectionFromEnv: VALKEY_REQUESTS_SERVICE_URI
+        address: requests-rawchunks.b.aivencloud.com:24348
+        passwordFromEnv: VALKEY_REQUESTS_PASSWORD
+        username: default
+        enableTLS: "true"
+        unsafeSsl: "true"
         listName: rawchunks:worker:turbo:pending
-        listLength: "4"
+        listLength: "2"
 ---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -911,9 +915,13 @@ spec:
   triggers:
     - type: redis
       metadata:
-        connectionFromEnv: VALKEY_REQUESTS_SERVICE_URI
+        address: requests-rawchunks.b.aivencloud.com:24348
+        passwordFromEnv: VALKEY_REQUESTS_PASSWORD
+        username: default
+        enableTLS: "true"
+        unsafeSsl: "true"
         listName: rawchunks:worker:sft:pending
-        listLength: "3"
+        listLength: "2"
 ---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -930,9 +938,13 @@ spec:
   triggers:
     - type: redis
       metadata:
-        connectionFromEnv: VALKEY_REQUESTS_SERVICE_URI
+        address: requests-rawchunks.b.aivencloud.com:24348
+        passwordFromEnv: VALKEY_REQUESTS_PASSWORD
+        username: default
+        enableTLS: "true"
+        unsafeSsl: "true"
         listName: rawchunks:worker:base:pending
-        listLength: "3"
+        listLength: "2"
 ---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -949,6 +961,10 @@ spec:
   triggers:
     - type: redis
       metadata:
-        connectionFromEnv: VALKEY_REQUESTS_SERVICE_URI
+        address: requests-rawchunks.b.aivencloud.com:24348
+        passwordFromEnv: VALKEY_REQUESTS_PASSWORD
+        username: default
+        enableTLS: "true"
+        unsafeSsl: "true"
         listName: rawchunks:training:pending
         listLength: "1"
