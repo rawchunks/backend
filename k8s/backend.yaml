@@ -32,6 +32,12 @@ spec:
                 secretKeyRef:
                   name: backend-secrets
                   key: ACESTEP_API_URL
+            - name: ACESTEP_TURBO_API_URL
+              value: "http://acestep-service:8001"
+            - name: ACESTEP_SFT_API_URL
+              value: "http://acestep-sft-service:8001"
+            - name: ACESTEP_BASE_API_URL
+              value: "http://acestep-base-service:8001"
             - name: ACESTEP_TRAINING_URL
               valueFrom:
                 secretKeyRef:
