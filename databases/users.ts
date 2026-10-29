@@ -430,7 +430,7 @@ export async function putWalletPair(input: {
 export async function getWalletPair(rawAddress: string): Promise<WalletPair | null> {
   const parsed = parseAddress(rawAddress);
   const key = pairCacheKey(parsed.value);
-  const hit = await cacheGet<WalletPair>(key, PAIR_L1_TTL_MS);
+  const hit = await cacheGet<WalletPair | null>(key, PAIR_L1_TTL_MS);
   if (hit !== undefined) return hit;
 
   return singleFlight(`sf:${key}`, async () => {
@@ -440,6 +440,8 @@ export async function getWalletPair(rawAddress: string): Promise<WalletPair | nu
     const pair = pairFromRow(rows[0]);
     if (pair) {
       await cachePair(pair);
+    } else {
+      await cacheSet(key, null, 30, 15_000);
     }
     return pair;
   });
