@@ -409,6 +409,214 @@ async function streamNebiusStrudelTurn(
  * 2. Traverses the Composer Directed Graph in <1ms to pre-mount ONLY the required library slices (~60% token savings).
  * 3. Runs a streaming ReAct loop on nvidia/Nemotron-3-Ultra-550b-a55b with on-demand library tools and AST validation inside `set_strudel_pattern`.
  */
+export async function runStrudelAgentStream(params: {
+  request: ComposeStrudelParams;
+  emit: (event: StrudelStreamEvent) => void;
+  signal?: AbortSignal;
+}): Promise<{ code: string; reasoning: string; graph: ComposerGraphResolution }> {
+  const { request, emit, signal } = params;
+
+  const windowStart = request.selection?.start ?? request.playhead ?? 0;
+  const windowEnd =
+    request.selection?.end && request.selection.end > windowStart
+      ? request.selection.end
+      : windowStart + 8;
+
+  const songMeta = await resolveSongStrudelMetadata(request.songId, windowStart, windowEnd);
+  const graph = resolveComposerGraph(request, songMeta);
+
+  emit({
+    type: 'graph',
+    intent: graph.intent,
+    targetLayers: graph.targetLayers,
+    mountedLibraries: graph.mountedLibraries,
+    archetypeId: graph.archetypeId,
+    archetypeLabel: graph.archetypeLabel,
+    refRole: graph.refRole,
+    sectionNode: graph.sectionNode,
+    estimatedTokens: graph.estimatedTokens,
+  });
+
+  emit({
+    type: 'status',
+    step: `Graph routed [${graph.targetLayers.join('+').toUpperCase()}] • ${graph.archetypeLabel} (${graph.estimatedTokens} tok)`,
+  });
+
+  let committedCode = '';
+  let committedReasoning = '';
+  let lastValidationError = '';
+
+  const handleReActTool = (call: StreamToolCall): string => {
+    let args: Record<string, any> = {};
+    try {
+      args = call.arguments ? JSON.parse(call.arguments) : {};
+    } catch {
+      args = {};
+    }
+
+    switch (call.name) {
+      case 'read_drums_library': {
+        emit({ type: 'status', step: 'Reading Drums & Euclidean Library...' });
+        return getDrumsLibraryContext();
+      }
+      case 'read_harmony_library': {
+        emit({ type: 'status', step: 'Reading Harmony & Voicings Library...' });
+        const customTheory = args.keyScale
+          ? computeStrudelTheoryReference(String(args.keyScale))
+          : graph.theory;
+        const mode: HarmonyTargetMode =
+          args.mode === 'bass' || args.mode === 'chords' || args.mode === 'arp'
+            ? args.mode
+            : 'full';
+        return getHarmonyLibraryContext(customTheory, mode);
+      }
+      case 'read_synths_library': {
+        emit({ type: 'status', step: 'Reading Synth & Filter Library...' });
+        const role: SynthTargetRole =
+          args.role === 'bass' ||
+          args.role === 'chords' ||
+          args.role === 'arp' ||
+          args.role === 'transform'
+            ? args.role
+            : 'full';
+        return getSynthsLibraryContext(role);
+      }
+      case 'read_archetypes_library': {
+        emit({ type: 'status', step: 'Reading Genre Archetypes Library...' });
+        const matched = matchStrudelArchetype({
+          prompt: typeof args.genre === 'string' ? args.genre : request.prompt,
+          bpm: request.bpm ?? songMeta.bpm,
+        });
+        return getArchetypeContext(matched, graph.theory, new Set(graph.targetLayers));
+      }
+      case 'set_strudel_pattern': {
+        const reasoning = typeof args.reasoning === 'string' ? args.reasoning.trim() : '';
+        const rawCode = typeof args.code === 'string' ? args.code : '';
+        if (reasoning) {
+          committedReasoning = reasoning;
+          emit({ type: 'reasoning', text: reasoning });
+        }
+
+        const cleaned = cleanGeneratedStrudelCode(rawCode);
+        const validation = validateGeneratedStrudelPattern(cleaned);
+        if (!validation.valid) {
+          lastValidationError = validation.error || 'Invalid Strudel syntax';
+          emit({ type: 'status', step: `Repairing pattern syntax: ${lastValidationError}` });
+          return `validation_error: ${lastValidationError}. Fix the syntax immediately and call set_strudel_pattern with valid Rawchunks Strudel code using only supported methods (.s(), .scale(), .fast(), .slow(), .rev(), .gain(), .lpf(), .hpf(), .pan(), .room(), .delay()).`;
+        }
+
+        committedCode = cleaned;
+        lastValidationError = '';
+        emit({ type: 'code', code: cleaned });
+        return 'ok';
+      }
+      default:
+        return 'unknown_tool';
+    }
+  };
+
+  const messages: any[] = [...graph.messages];
+  const activeMountedLibraries = new Set<'drums' | 'harmony' | 'synths' | 'archetypes'>(
+    graph.mountedLibraries
+  );
+
+  // Up to 3 ReAct turns:
+  // Turn 1 typically calls set_strudel_pattern directly (since the Directed Graph pre-mounted the required slices).
+  // If Turn 1 calls an unmounted read_*_library tool or hits an AST validation error inside set_strudel_pattern, Turn 2/3 completes it.
+  for (let turn = 0; turn < 3; turn++) {
+    const toolOutputs: { call: StreamToolCall; output: string }[] = [];
+    const activeTools = getActiveToolsForGraph(Array.from(activeMountedLibraries));
+    const { calls, textContent } = await streamNebiusStrudelTurn(
+      messages,
+      activeTools,
+      'required',
+      async (call) => {
+        if (call.name === 'read_drums_library') activeMountedLibraries.add('drums');
+        if (call.name === 'read_harmony_library') activeMountedLibraries.add('harmony');
+        if (call.name === 'read_synths_library') activeMountedLibraries.add('synths');
+        if (call.name === 'read_archetypes_library') activeMountedLibraries.add('archetypes');
+        const output = handleReActTool(call);
+        toolOutputs.push({ call, output });
+      },
+      signal
+    );
+
+    if (committedCode) {
+      break;
+    }
+
+    if (!calls.length && textContent) {
+      const cleaned = cleanGeneratedStrudelCode(textContent);
+      const validation = validateGeneratedStrudelPattern(cleaned);
+      if (validation.valid) {
+        committedCode = cleaned;
+        emit({ type: 'code', code: cleaned });
+        break;
+      }
+      lastValidationError = validation.error || 'Invalid Strudel syntax';
+      messages.push({ role: 'assistant', content: cleaned || textContent });
+      messages.push({
+        role: 'user',
+        content: `Your Strudel pattern failed validation: ${lastValidationError}. Call set_strudel_pattern with the corrected, valid Strudel code.`,
+      });
+      continue;
+    }
+
+    if (!calls.length) break;
+
+    messages.push({
+      role: 'assistant',
+      content: null,
+      tool_calls: calls.map((c) => ({
+        id: c.id,
+        type: 'function',
+        function: { name: c.name, arguments: c.arguments || '{}' },
+      })),
+    });
+
+    for (const { call, output } of toolOutputs) {
+      messages.push({
+        role: 'tool',
+        tool_call_id: call.id,
+        name: call.name,
+        content: output,
+      });
+    }
+  }
+
+  if (!committedCode) {
+    throw Object.assign(
+      new Error(
+        `Invalid Strudel pattern returned from model${lastValidationError ? `: ${lastValidationError}` : ''}`
+      ),
+      { statusCode: 502 }
+    );
+  }
+
+  emit({
+    type: 'done',
+    code: committedCode,
+    reasoning: committedReasoning || undefined,
+  });
+
+  return {
+    code: committedCode,
+    reasoning: committedReasoning,
+    graph,
+  };
+}
+
+/**
+ * Generates a validated Strudel pattern using the Directed-Graph + ReAct Algorithmic Composer.
+ */
+export async function generateStrudelPattern(params: ComposeStrudelParams): Promise<string> {
+  const result = await runStrudelAgentStream({
+    request: params,
+    emit: () => {},
+  });
+  return result.code;
+}
+
 export {
   DRUMS_LIBRARY,
   DRUM_TOKEN_CATEGORIES,
