@@ -1,4 +1,4 @@
-import { generateCoverArt } from '../generation/router.js';
+import { generateCoverArt } from '../../generation/router.js';
 import { analyzeAudioVibe, type AudioVibeAnalysis } from './audio.js';
 import { LYRICS_CANVAS_TAGS, LYRICS_SYSTEM_PROMPT, getLyricsLibraryContext } from './lyrics.js';
 import { STYLE_TAGS_LIBRARY, getStylesLibraryContext, normalizeStyleTags } from './styles.js';
@@ -34,6 +34,7 @@ export type VibeStreamEvent =
   }
   | { type: 'lyrics_start' }
   | { type: 'lyrics_delta'; delta: string }
+  | { type: 'songwriter_ready' }
   | { type: 'cover_start' }
   | { type: 'cover'; imageUrl: string }
   | { type: 'done' }
@@ -677,6 +678,8 @@ export async function runVibeAgentStream(params: {
       signal,
     });
   }
+
+  emit({ type: 'songwriter_ready' });
 
   if (coverPromise) {
     emit({ type: 'status', step: 'Finalizing cover art...' });

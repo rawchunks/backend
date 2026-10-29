@@ -8,7 +8,7 @@ import { resolve } from 'path';
 import { databaseRouter } from './databases/router.js';
 import { generationRouter } from './generation/router.js';
 import { editingRouter } from './editing/router.js';
-import { vibeRouter } from './vibe/router.js';
+import { vibeRouter } from './agents/vibe/router.js';
 import voiceRoutes from './voice/index.js';
 import { voiceService } from './voice/service.js';
 import { runMigrations } from './databases/migrate.js';

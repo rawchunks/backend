@@ -1,4 +1,4 @@
-import { PROMPT_TAGS } from '../options.js';
+import { PROMPT_TAGS } from '../../options.js';
 
 export const STYLE_TAGS_LIBRARY = PROMPT_TAGS.map((tag) => ({
   id: tag.toUpperCase(),

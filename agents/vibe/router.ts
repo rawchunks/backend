@@ -1,8 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import { PassThrough } from 'node:stream';
-import { requireSessionPayment, PRICING } from '../broker/payment.js';
-import { readUser } from '../databases/users.js';
-import { generateCoverArt } from '../generation/router.js';
+import { requireSessionPayment, PRICING } from '../../broker/payment.js';
+import { readUser } from '../../databases/users.js';
+import { generateCoverArt } from '../../generation/router.js';
 import { LYRICS_CANVAS_TAGS, LYRICS_SYSTEM_PROMPT } from './lyrics.js';
 import { STYLE_TAGS_LIBRARY, normalizeStyleTags } from './styles.js';
 import {
