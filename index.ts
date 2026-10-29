@@ -9,6 +9,7 @@ import { databaseRouter } from './databases/router.js';
 import { generationRouter } from './generation/router.js';
 import { editingRouter } from './editing/router.js';
 import { vibeRouter } from './agents/vibe/router.js';
+import { strudelRouter } from './agents/strudel/router.js';
 import voiceRoutes from './voice/index.js';
 import { voiceService } from './voice/service.js';
 import { runMigrations } from './databases/migrate.js';
@@ -131,6 +132,8 @@ async function main() {
   await app.register(editingRouter, { prefix: '/api/editing' });
   await app.register(vibeRouter, { prefix: '/api/vibe' });
   await app.register(vibeRouter, { prefix: '/vibe' });
+  await app.register(strudelRouter, { prefix: '/api/strudel' });
+  await app.register(strudelRouter, { prefix: '/strudel' });
   await app.register(voiceRoutes, { prefix: '/api/voices' });
   await app.register(voiceRoutes, { prefix: '/voices' });
 
