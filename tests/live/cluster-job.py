@@ -24,7 +24,7 @@ elif operation=='stats':print(json.dumps(call('/v1/stats')))
 elif operation=='separate':
     path=sys.argv[2]
     assert path in ['/tmp/rawchunks-preprod-audit/vocal.wav','/tmp/rawchunks-preprod-audit/mixed.wav']
-    print(json.dumps(call('/separate',{'src_audio_path':path,'stem_type':sys.argv[3]})))
+    print(json.dumps(call('/isolate',{'src_audio_path':path,'stem_type':sys.argv[3]})))
 elif operation=='release':
     data=json.loads(sys.stdin.read())
     assert data.get('audio_duration',0)<=60 and data.get('batch_size',1)==1

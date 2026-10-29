@@ -43,6 +43,7 @@ def test_sample_completion_preserves_supplied_inputs():
     prepared = prepare_llm_generation_inputs(app_state=types.SimpleNamespace(), llm_handler=None, req=req, selected_handler_device="cuda", parse_description_hints=lambda _: ("zh", False), create_sample_fn=sample, format_sample_fn=Mock(), ensure_llm_ready_fn=Mock())
     assert (prepared.caption, prepared.lyrics, prepared.bpm, prepared.key_scale, prepared.time_signature, prepared.audio_duration) == (req.prompt, "Generated lyrics", 100, "C major", "4", 30)
     assert sample.call_args.kwargs["vocal_language"] == "en"
+    assert prepared.use_cot_caption is False and prepared.use_cot_language is False
 
 
 def test_sample_completion_fills_only_missing_metadata():
@@ -337,19 +338,19 @@ def test_separation_stem_type_and_retry_receipt(separation, mode):
     f = separation
     headers = {**f.headers, "Idempotency-Key": "sep-job"}
     first = f.client.post(
-        "/separate",
+        "/isolate",
         json={"src_audio_path": str(f.source), "stem_type": mode},
         headers=headers,
     )
     assert first.status_code == 200
     stems = first.json()["data"]["stems"]
     assert list(stems) == (
-        ["vocals", "drums", "bass", "other", "instrumental"]
+        ["vocals", "drums", "bass", "other"]
         if mode == "all"
         else [mode]
     )
     retry = f.client.post(
-        "/separate",
+        "/isolate",
         json={"src_audio_path": str(f.source), "stem_type": mode},
         headers=headers,
     )
@@ -364,7 +365,7 @@ def test_separation_sandbox_query_parse_and_symlink(separation):
     for src in [str(private), "/v1/audio?path=" + str(private)]:
         assert (
             f.client.post(
-                "/separate", json={"src_audio_path": src}, headers=f.headers
+                "/isolate", json={"src_audio_path": src}, headers=f.headers
             ).status_code
             == 403
         )
@@ -372,7 +373,7 @@ def test_separation_sandbox_query_parse_and_symlink(separation):
     link.symlink_to(private)
     assert (
         f.client.post(
-            "/separate", json={"src_audio_path": str(link)}, headers=f.headers
+            "/isolate", json={"src_audio_path": str(link)}, headers=f.headers
         ).status_code
         == 403
     )
@@ -381,7 +382,7 @@ def test_separation_sandbox_query_parse_and_symlink(separation):
     )
     assert (
         f.client.post(
-            "/separate", json={"src_audio_path": query}, headers=f.headers
+            "/isolate", json={"src_audio_path": query}, headers=f.headers
         ).status_code
         == 200
     )
@@ -393,7 +394,7 @@ def test_metadata_and_redirect_urls_fail_closed(separation, monkeypatch):
     monkeypatch.setattr(f.module, "resolve_host", resolver)
     assert (
         f.client.post(
-            "/separate",
+            "/isolate",
             json={"src_audio_path": "http://169.254.169.254/audio"},
             headers=f.headers,
         ).status_code
@@ -424,7 +425,7 @@ def test_download_bound_and_failure_terminal(separation, monkeypatch):
         f.module.urllib.request, "build_opener", Mock(return_value=opener)
     )
     r = f.client.post(
-        "/separate",
+        "/isolate",
         json={"src_audio_path": "https://example.com/audio"},
         headers={**f.headers, "Idempotency-Key": "sep-remote"},
     )
@@ -458,7 +459,7 @@ def test_gpu_generation_and_separation_share_one_gate(separation):
 
     def separate(_):
         return f.client.post(
-            "/separate", json={"src_audio_path": str(f.source)}, headers=f.headers
+            "/isolate", json={"src_audio_path": str(f.source)}, headers=f.headers
         ).status_code
 
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -954,11 +955,11 @@ def test_separation_invalid_request_and_auth_precede_admission(
 ):
     f = separation
     assert (
-        f.client.post("/separate", json=payload, headers=f.headers).status_code
+        f.client.post("/isolate", json=payload, headers=f.headers).status_code
         == status
     )
     assert (
-        f.client.post("/separate", json={"src_audio_path": str(f.source)}).status_code
+        f.client.post("/isolate", json={"src_audio_path": str(f.source)}).status_code
         == 401
     )
     assert f.store.get_stats()["total"] == 0
@@ -968,7 +969,7 @@ def test_missing_input_and_inference_error_terminalize(separation):
     f = separation
     assert (
         f.client.post(
-            "/separate",
+            "/isolate",
             json={"src_audio_path": str(f.source.parent / "missing")},
             headers=f.headers,
         ).status_code
@@ -976,7 +977,7 @@ def test_missing_input_and_inference_error_terminalize(separation):
     )
     f.separator.separate_audio_file.side_effect = RuntimeError("inference failed")
     r = f.client.post(
-        "/separate",
+        "/isolate",
         json={"src_audio_path": str(f.source)},
         headers={**f.headers, "Idempotency-Key": "sep-error"},
     )
@@ -997,11 +998,11 @@ def test_missing_stems_all_skips_and_explicit_mode_fails(separation):
     f = separation
     f.separator.separate_audio_file.return_value = (0, {"vocals": 1})
     all_result = f.client.post(
-        "/separate", json={"src_audio_path": str(f.source)}, headers=f.headers
+        "/isolate", json={"src_audio_path": str(f.source)}, headers=f.headers
     )
     assert list(all_result.json()["data"]["stems"]) == ["vocals"]
     explicit = f.client.post(
-        "/separate",
+        "/isolate",
         json={"src_audio_path": str(f.source), "stem_type": "instrumental"},
         headers=f.headers,
     )
@@ -1025,7 +1026,7 @@ def test_remote_success_streams_then_cleans_input(separation, monkeypatch):
         f.module.urllib.request, "build_opener", Mock(return_value=opener)
     )
     result = f.client.post(
-        "/separate",
+        "/isolate",
         json={"src_audio_path": "https://audio.example/file"},
         headers={**f.headers, "Idempotency-Key": "remote-success"},
     )
