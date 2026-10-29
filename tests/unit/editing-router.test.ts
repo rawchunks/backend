@@ -3,7 +3,7 @@ import multipart from '@fastify/multipart';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const m = vi.hoisted(() => ({ dispatchEditTask: vi.fn(), separateStems: vi.fn(), createCommitSnapshot: vi.fn(), finalizeEditResult: vi.fn(), switchActiveTake: vi.fn(), deleteTake: vi.fn(), updateTrackMixer: vi.fn(), getTimelineHistory: vi.fn(), uploadToR2: vi.fn() }));
 vi.mock('../../editing/service.js', () => ({ service: m }));
-vi.mock('../../databases/users.js', () => ({ readSong: async () => ({ userAddress: '0x1234567890' }), readTake: async () => ({}), readUser: () => '0x1234567890', checkUser: () => {} }));
+vi.mock('../../databases/users.js', () => ({ readSong: async () => ({ userAddress: '0x1234567890' }), readTake: async () => ({}), readUser: () => '0x1234567890', checkUser: () => { } }));
 vi.mock('../../databases/client.js', () => ({ songSql: async () => [{ song_id: 's' }] }));
 vi.mock('../../storage/r2.js', () => ({ uploadToR2: m.uploadToR2 }));
 import { editingRouter } from '../../editing/router.js';
@@ -64,9 +64,14 @@ describe('editing Fastify task routes and payload contracts', () => {
     expect(result.statusCode).toBe(201);
     expect(m.createCommitSnapshot).toHaveBeenCalledWith({ ...base, message: 'checkpoint', timelineSnapshot: snapshot });
   });
-  it('separates stems synchronously and defaults stemType to all', async () => {
-    const result = await app.inject({ method: 'POST', url: '/api/edit/separate', payload: base });
-    expect(result.statusCode).toBe(200); expect(m.separateStems).toHaveBeenCalledWith(expect.objectContaining({ ...base, stemType: 'all' }));
+  it('isolates stems synchronously via /isolate and defaults stemType to all', async () => {
+    const resIsolate = await app.inject({ method: 'POST', url: '/api/edit/isolate', payload: base });
+    expect(resIsolate.statusCode).toBe(200); expect(m.separateStems).toHaveBeenCalledWith(expect.objectContaining({ ...base, stemType: 'all' }));
+  });
+  it('dispatches ACE-Step base instrument extraction on POST /extract when trackName is provided', async () => {
+    const result = await app.inject({ method: 'POST', url: '/api/edit/extract', payload: { ...base, trackName: 'guitar' } });
+    expect(result.statusCode).toBe(202);
+    expect(m.dispatchEditTask).toHaveBeenCalledWith(expect.objectContaining({ ...base, task: 'extract', trackName: 'guitar', modelQuality: 'base' }));
   });
   it.each([
     ['repaint', { start: -1, end: 5 }], ['repaint', { start: 0 }], ['repaint', { start: '0', end: 5 }],
@@ -81,7 +86,7 @@ describe('editing Fastify task routes and payload contracts', () => {
     const result = await app.inject({ method: 'POST', url: `/api/edit/${route}`, payload: { ...base, ...controls } });
     expect(result.statusCode).toBe(400); expect(m.dispatchEditTask).not.toHaveBeenCalled(); expect(m.createCommitSnapshot).not.toHaveBeenCalled();
   });
-  it.each(['repaint', 'layer', 'extend', 'remix', 'separate', 'commits', 'apply'])('%s rejects empty bodies with a client error', async route => {
+  it.each(['repaint', 'layer', 'extend', 'remix', 'isolate', 'commits', 'apply'])('%s rejects empty bodies with a client error', async route => {
     const result = await app.inject({ method: 'POST', url: `/api/edit/${route}`, payload: {} });
     expect(result.statusCode).toBe(400); expect(result.json()).toHaveProperty('error');
   });
@@ -92,7 +97,7 @@ describe('editing Fastify task routes and payload contracts', () => {
     const result = await app.inject({ method: 'POST', url: `/api/edit/${route}`, payload: { ...base, ...controls } });
     expect(result.statusCode).toBe(500); expect(result.json()).toEqual({ error: 'worker failed' });
   });
-  it.each([['separate', 'separateStems', {}], ['commits', 'createCommitSnapshot', { message: 'checkpoint' }]])('%s returns caught service failures', async (route, method, controls) => {
+  it.each([['isolate', 'separateStems', {}], ['commits', 'createCommitSnapshot', { message: 'checkpoint' }]])('%s returns caught service failures', async (route, method, controls) => {
     m[method as 'separateStems'].mockRejectedValue(new Error('database failed'));
     const result = await app.inject({ method: 'POST', url: `/api/edit/${route}`, payload: { ...base, ...controls } });
     expect(result.statusCode).toBe(500); expect(result.json()).toEqual({ error: 'database failed' });
@@ -103,7 +108,7 @@ describe('editing Fastify task routes and payload contracts', () => {
     ['extend', 'dispatchEditTask', { audioDuration: 120 }, 'Extend failed to initiate'],
     ['remix', 'dispatchEditTask', { prompt: 'style' }, 'Remix failed to initiate'],
     ['apply', 'dispatchEditTask', { task: 'cover' }, 'Failed to dispatch edit task'],
-    ['separate', 'separateStems', {}, 'Separate failed to initiate'],
+    ['isolate', 'separateStems', {}, 'Isolate failed to initiate'],
     ['commits', 'createCommitSnapshot', { message: 'checkpoint' }, 'Failed to create commit'],
   ])('%s uses a stable fallback for message-less dependency failures', async (route, method, controls, error) => {
     m[method as 'dispatchEditTask'].mockRejectedValue({});

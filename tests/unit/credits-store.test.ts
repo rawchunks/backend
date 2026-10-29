@@ -26,7 +26,7 @@ async function buy(amount = 10000000n, id = 'purchase-a', capture = 'capture-a')
   await store.creditCapture(owner, id, capture, amount);
 }
 
-describe('Persistent purchased Credits', () => {
+describe('Direct spendable Credits (Card & Campaign)', () => {
   it('credits a verified capture once under concurrent retries', async () => {
     await buy();
     await Promise.all([store.creditCapture(owner, 'purchase-a', 'capture-a', 10000000n), store.creditCapture(owner, 'purchase-a', 'capture-a', 10000000n)]);
@@ -37,90 +37,80 @@ describe('Persistent purchased Credits', () => {
     await buy();
     await expect(store.creditCapture(other, 'purchase-a', 'capture-a', 10000000n)).rejects.toMatchObject({ statusCode: 404 });
   });
-  it('allocates once and returns paid unused credits after ending a session', async () => {
+  it('reserves directly from available balance and returns unused amount on release', async () => {
     await buy();
-    const session = await store.start(owner, 3000000n, 3600, 'session-request-a');
-    const retry = await store.start(owner, 3000000n, 3600, 'session-request-a');
-    expect(retry.id).toBe(session.id);
-    expect((await store.balance(owner)).availableAtomics).toBe('7000000');
-    await store.end(owner, session.id);
-    await store.end(owner, session.id);
-    expect(await store.balance(owner)).toMatchObject({ availableAtomics: '10000000', allocatedAtomics: '0' });
-  });
-  it('prevents concurrent sessions from overspending', async () => {
-    await buy();
-    const results = await Promise.allSettled([store.start(owner, 7000000n, 3600, 'a'), store.start(owner, 7000000n, 3600, 'b')]);
-    expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
-    expect((await store.balance(owner)).availableAtomics).toBe('3000000');
-  });
-  it('tops up the same session exactly once', async () => {
-    await buy();
-    const session = await store.start(owner, 3000000n, 3600, 'a');
-    await store.topup(owner, session.id, 2000000n, 'topup-a');
-    await store.topup(owner, session.id, 2000000n, 'topup-a');
-    const topped = await store.session(owner, session.id);
-    expect(String(topped.remaining)).toBe('5000000');
-    expect(String(topped.budget)).toBe('5000000');
-    expect((await store.balance(owner)).availableAtomics).toBe('5000000');
-  });
-  it('applies a durable card topup intent to the same session exactly once', async () => {
-    await buy();
-    const session = await store.start(owner, 3000000n, 3600, 'a');
-    await db.query("INSERT INTO credit_operations(environment,id,owner,kind,amount,context) VALUES('sandbox','purchase-b',$1,'purchase',10000000,$2)", [owner, JSON.stringify({ checkout: { kind: 'topup', sessionId: session.id } })]);
-    await store.creditCapture(owner, 'purchase-b', 'capture-b', 10000000n);
-    await store.creditCapture(owner, 'purchase-b', 'capture-b', 10000000n);
-    expect(String((await store.session(owner, session.id)).budget)).toBe('13000000');
-    expect(await store.balance(owner)).toMatchObject({ availableAtomics: '7000000', allocatedAtomics: '13000000' });
-    expect((await db.query('SELECT count(*)::integer count FROM credit_sessions')).rows).toEqual([{ count: 1 }]);
-  });
-  it('keeps a completed card payment available if its topup target was ended', async () => {
-    await buy();
-    const session = await store.start(owner, 3000000n, 3600, 'a');
-    await store.end(owner, session.id);
-    await db.query("INSERT INTO credit_operations(environment,id,owner,kind,amount,context) VALUES('sandbox','purchase-b',$1,'purchase',10000000,$2)", [owner, JSON.stringify({ checkout: { kind: 'topup', sessionId: session.id } })]);
-    await store.creditCapture(owner, 'purchase-b', 'capture-b', 10000000n);
-    expect((await store.balance(owner)).availableAtomics).toBe('20000000');
-    expect((await db.query('SELECT count(*)::integer count FROM credit_sessions')).rows).toEqual([{ count: 1 }]);
-  });
-  it('keeps pending holds when ending a session, then returns only their unused amount', async () => {
-    await buy();
-    const session = await store.start(owner, 3000000n, 3600, 'a');
-    await store.reserve(owner, session.id, 'generation-a', 50000n, 'generate');
-    await store.end(owner, session.id);
+    await store.reserve(owner, 'card', 'generation-a', 50000n, 'generate');
+    await store.reserve(owner, 'card', 'generation-a', 50000n, 'generate');
     expect(await store.balance(owner)).toMatchObject({ availableAtomics: '9950000', reservedAtomics: '50000' });
     await store.commit(owner, 'generation-a', 30000n);
     await store.release(owner, 'generation-a');
     await store.release(owner, 'generation-a');
     expect(await store.balance(owner)).toMatchObject({ availableAtomics: '9970000', reservedAtomics: '0', spentAtomics: '30000' });
   });
-  it('expires session allocations once while preserving operation holds', async () => {
+  it('prevents concurrent reservations from overspending available balance', async () => {
     await buy();
-    const session = await store.start(owner, 3000000n, 3600, 'a');
-    await store.reserve(owner, session.id, 'generation-a', 50000n, 'generate');
-    await db.query("UPDATE credit_sessions SET expires_at=now()-interval '1 second' WHERE id=$1", [session.id]);
-    expect(await store.balance(owner)).toMatchObject({ availableAtomics: '9950000', reservedAtomics: '50000' });
-    await expect(store.reserve(owner, session.id, 'generation-b', 50000n, 'generate')).rejects.toMatchObject({ statusCode: 409 });
-    await store.release(owner, 'generation-a');
-    expect((await store.balance(owner)).availableAtomics).toBe('10000000');
+    const results = await Promise.allSettled([
+      store.reserve(owner, 'card', 'op-a', 7000000n, 'generate'),
+      store.reserve(owner, 'card', 'op-b', 7000000n, 'generate'),
+    ]);
+    expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
+    expect((await store.balance(owner)).availableAtomics).toBe('3000000');
+    expect((await store.balance(owner)).reservedAtomics).toBe('7000000');
   });
   it('charges only new cumulative metered usage and carries creator precision', async () => {
     await buy();
-    const session = await store.start(owner, 3000000n, 3600, 'a');
-    await store.reserve(owner, session.id, 'stream-a', 1000n, 'stream:song-a', other);
+    await store.reserve(owner, 'card', 'stream-a', 1000n, 'stream:song-a', other);
     await store.commit(owner, 'stream-a', 1n);
     await store.commit(owner, 'stream-a', 1n);
     await store.commit(owner, 'stream-a', 6n);
     expect((await store.balance(owner)).spentAtomics).toBe('6');
     expect((await db.query('SELECT payable::text FROM credit_creators WHERE owner=$1', [other])).rows).toEqual([{ payable: '5' }]);
   });
-  it('does not expose or top up another users session', async () => {
-    await buy();
-    const session = await store.start(owner, 3000000n, 3600, 'a');
-    await expect(store.session(other, session.id)).rejects.toMatchObject({ statusCode: 404 });
-    await expect(store.topup(other, session.id, 1n, 'x')).rejects.toMatchObject({ statusCode: 404 });
-  });
   it('isolates sandbox balances from live', async () => {
     await buy();
     expect((await new CreditStore(store.pool, 'live').balance(owner)).availableAtomics).toBe('0');
+  });
+  it('strictly isolates Campaign (promo) credits from Card credits and rejects promo for streaming', async () => {
+    const balAfterClaim = await store.claimPromo(owner, 'identity-hash-1', 'claim-1');
+    expect(balAfterClaim.availableAtomics).toBe('0');
+    expect(balAfterClaim.promo).toMatchObject({
+      claimed: true,
+      availableAtomics: '1000000',
+      reservedAtomics: '0',
+      spentAtomics: '0',
+    });
+
+    // Spend 25 CR (250,000 atomics) from Campaign pool directly
+    await store.reserve(owner, 'promo', 'gen-promo-1', 250000n, 'generate');
+    await store.commit(owner, 'gen-promo-1', 250000n);
+    await store.release(owner, 'gen-promo-1');
+
+    const balAfterSpend = await store.balance(owner, 'identity-hash-1');
+    expect(balAfterSpend.availableAtomics).toBe('0');
+    expect(balAfterSpend.promo).toMatchObject({
+      claimed: true,
+      availableAtomics: '750000',
+      reservedAtomics: '0',
+      spentAtomics: '250000',
+    });
+
+    // Attempting to spend from Card pool without Card credits fails even though Campaign credits exist
+    await expect(store.reserve(owner, 'card', 'card-attempt', 50000n, 'generate')).rejects.toMatchObject({ statusCode: 402 });
+
+    // Attempting to spend Campaign credits on a creator-paid resource (streaming/licenses) fails with 402
+    await expect(store.reserve(owner, 'promo', 'stream-attempt', 30000n, 'stream:song-a', other)).rejects.toMatchObject({ statusCode: 402 });
+
+    // Buying Card credits keeps Card and Campaign balances completely separate
+    await buy(10000000n, 'purchase-card-1', 'capture-card-1');
+    const balWithBoth = await store.balance(owner, 'identity-hash-1');
+    expect(balWithBoth.availableAtomics).toBe('10000000');
+    expect(balWithBoth.promo.availableAtomics).toBe('750000');
+  });
+  it('reclaims legacy allocated credit_lots back into available during migrate()', async () => {
+    await buy(10000000n, 'purchase-legacy', 'capture-legacy');
+    await db.query("UPDATE credit_lots SET available = 3000000, allocated = 7000000 WHERE owner = $1", [owner]);
+    await store.migrate();
+    const bal = await store.balance(owner);
+    expect(bal.availableAtomics).toBe('10000000');
   });
 });

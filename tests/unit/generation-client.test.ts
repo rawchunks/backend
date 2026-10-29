@@ -97,8 +97,10 @@ describe('generation Client: query envelopes, states and media metadata', () => 
   ])('reads %s query response', async (_label, envelope) => {
     fetchMock.mockResolvedValue(reply(envelope));
     const result = await api.queryResult(['task-1', 'task-2']);
-    expect(result.results['task-1']).toMatchObject({ task_id: 'task-1', status: 'ready', progress: 100,
-      audio_urls: ['/api/audio?path=output%2Fsong.wav'], metas: [{ duration: 10, bpm: 120 }] });
+    expect(result.results['task-1']).toMatchObject({
+      task_id: 'task-1', status: 'ready', progress: 100,
+      audio_urls: ['/api/audio?path=output%2Fsong.wav'], metas: [{ duration: 10, bpm: 120 }]
+    });
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ task_id_list: ['task-1', 'task-2'], task_ids: ['task-1', 'task-2'] });
   });
   it.each([[1, 'ready'], ['succeeded', 'ready'], ['ready', 'ready'], [2, 'error'], ['failed', 'error'], ['error', 'error'], [0, 'pending'], ['pending', 'pending']])(
@@ -107,11 +109,15 @@ describe('generation Client: query envelopes, states and media metadata', () => 
       expect((await api.queryResult(['task-1'])).results['task-1']).toMatchObject({ status: expected, error: 'failure' });
     });
   it('reads serialized JSON result lists and uses the last fractional progress entry', async () => {
-    fetchMock.mockResolvedValue(reply({ data: [{ task_id: 'task-1', status: 0, result: JSON.stringify([
-      { file: '/v1/audio?path=%2Fv1%2Faudio%3Fpath%3Doutput%252Fa.wav', progress: .124 },
-      { file: 'https://media.test/b.wav', metas: { duration: 10 }, progress: .567, error: 'partial warning' },
-      null,
-    ]) }] }));
+    fetchMock.mockResolvedValue(reply({
+      data: [{
+        task_id: 'task-1', status: 0, result: JSON.stringify([
+          { file: '/v1/audio?path=%2Fv1%2Faudio%3Fpath%3Doutput%252Fa.wav', progress: .124 },
+          { file: 'https://media.test/b.wav', metas: { duration: 10 }, progress: .567, error: 'partial warning' },
+          null,
+        ])
+      }]
+    }));
     expect((await api.queryResult(['task-1'])).results['task-1']).toEqual({
       task_id: 'task-1', status: 'pending', progress: 57,
       audio_urls: ['/api/audio?path=output%2Fa.wav', 'https://media.test/b.wav'], metas: [{ duration: 10 }], error: 'partial warning',
@@ -144,7 +150,7 @@ describe('generation Client: separation, format and sample endpoints', () => {
     const data = { task_id: 'sep-1', status: 'ready', stems: { vocals: 'v.wav', drums: 'd.wav' }, audio_paths: ['v.wav', 'd.wav'] };
     fetchMock.mockResolvedValue(reply(wrapped ? { data } : data));
     expect(await api.separate({ src_audio_path: 's.wav', stem_type: 'vocals', wait: false })).toEqual(data);
-    expect(fetchMock.mock.calls[0][0]).toBe('http://worker.test:8001/separate');
+    expect(fetchMock.mock.calls[0][0]).toBe('http://worker.test:8001/isolate');
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ src_audio_path: 's.wav', stem_type: 'vocals', wait: false });
   });
   it('sends a stable separation admission key', async () => {

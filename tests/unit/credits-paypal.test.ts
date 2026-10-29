@@ -60,17 +60,14 @@ describe('PayPal capture authority', () => {
     expect((await paypal.capture(owner, op.operationId, op.orderId)).status).toBe('credited');
     expect((await store.balance(owner)).availableAtomics).toBe('10000000');
   });
-  it('creates the requested session during reconciliation without a browser callback', async () => {
-    const op = await paypal.create(owner, 'usd-10', 'request-a', { kind: 'start', durationSeconds: 3600 });
+  it('credits balance directly during reconciliation without a browser callback', async () => {
+    const op = await paypal.create(owner, 'usd-10', 'request-a', { kind: 'balance' });
     order.status = 'APPROVED';
     await paypal.reconcile(op.operationId);
     await paypal.reconcile(op.operationId);
     const completed = await paypal.operation(op.operationId, owner);
-    expect(completed.context.sessionId).toBeTruthy();
-    expect(await store.balance(owner)).toMatchObject({ availableAtomics: '0', allocatedAtomics: '10000000' });
-    expect((await db.query('SELECT count(*)::integer count FROM credit_sessions')).rows).toEqual([{ count: 1 }]);
-    await store.end(owner, completed.context.sessionId);
-    expect((await store.balance(owner)).availableAtomics).toBe('10000000');
+    expect(completed.status).toBe('credited');
+    expect(await store.balance(owner)).toMatchObject({ availableAtomics: '10000000', reservedAtomics: '0' });
   });
   it('does not capture another owners order', async () => {
     const op = await paypal.create(owner, 'usd-10', 'request-a');
@@ -159,4 +156,3 @@ describe('PayPal capture authority', () => {
     });
   });
 });
-

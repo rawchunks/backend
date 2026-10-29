@@ -107,11 +107,23 @@ describe('editing Service: dispatch and model routing', () => {
     contexts.delete('task-1'); await api.dispatchEditTask({ ...base, coverStrength, coverNoiseStrength: 0 });
     expect(m.releaseTask.mock.calls[0][0]).toMatchObject({ audio_cover_strength: coverStrength, cover_noise_strength: 0 });
   });
-  it('delegates extract to actual separation instead of release_task', async () => {
+  it('delegates extract to actual separation instead of release_task when no ACE-Step instrument is requested', async () => {
     contexts.delete('task-1');
     expect(await api.dispatchEditTask({ ...base, task: 'extract' })).toMatchObject({ task: 'extract', taskId: 'sep-1' });
     expect(m.separate.mock.calls[0][0]).toEqual({ src_audio_path: 'original.wav', stem_type: 'all' });
     expect(m.releaseTask).not.toHaveBeenCalled();
+  });
+  it('routes extract with an ACE-Step instrument (e.g. guitar or vocals) to acestep-v15-xl-base release_task', async () => {
+    contexts.delete('task-1');
+    const result = await api.dispatchEditTask({ ...base, task: 'extract', trackName: 'guitar', modelQuality: 'base' });
+    expect(result).toMatchObject({ task: 'extract', taskId: 'task-1', status: 'pending' });
+    expect(m.separate).not.toHaveBeenCalled();
+    expect(m.releaseTask).toHaveBeenCalledWith(expect.objectContaining({
+      task: 'extract',
+      task_type: 'extract',
+      track_name: 'guitar',
+      model: 'acestep-v15-xl-base',
+    }), expect.anything());
   });
   it('propagates failed worker dispatch', async () => {
     m.releaseTask.mockRejectedValue(new Error('GPU unavailable'));
