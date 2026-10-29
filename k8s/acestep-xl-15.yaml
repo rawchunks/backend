@@ -37,7 +37,7 @@ spec:
             sizeLimit: 16Gi
       containers:
         - name: worker
-          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/acestep-xl-15@sha256:001fbf44014b7376f99510eddda2110501ad93c8cebaebda7ffe3f6d64537e53
+          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/acestep-xl-15@sha256:a8c6b26a465f2f2d8c78359248a2ab1bf2531deb19cace5955b478d01f7da2c5
           imagePullPolicy: IfNotPresent
           command:
             - uv
@@ -242,7 +242,7 @@ spec:
             sizeLimit: 16Gi
       containers:
         - name: worker
-          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/acestep-xl-15@sha256:001fbf44014b7376f99510eddda2110501ad93c8cebaebda7ffe3f6d64537e53
+          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/acestep-xl-15@sha256:a8c6b26a465f2f2d8c78359248a2ab1bf2531deb19cace5955b478d01f7da2c5
           imagePullPolicy: IfNotPresent
           command:
             - uv
@@ -445,7 +445,7 @@ spec:
             sizeLimit: 16Gi
       containers:
         - name: worker
-          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/acestep-xl-15@sha256:001fbf44014b7376f99510eddda2110501ad93c8cebaebda7ffe3f6d64537e53
+          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/acestep-xl-15@sha256:a8c6b26a465f2f2d8c78359248a2ab1bf2531deb19cace5955b478d01f7da2c5
           imagePullPolicy: IfNotPresent
           command:
             - uv
@@ -714,7 +714,7 @@ spec:
             sizeLimit: 16Gi
       containers:
         - name: worker
-          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/acestep-xl-15@sha256:001fbf44014b7376f99510eddda2110501ad93c8cebaebda7ffe3f6d64537e53
+          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/acestep-xl-15@sha256:a8c6b26a465f2f2d8c78359248a2ab1bf2531deb19cace5955b478d01f7da2c5
           imagePullPolicy: IfNotPresent
           command:
             - uv

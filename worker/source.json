@@ -35,6 +35,8 @@
     "acestep/core/generation/handler/generate_music_request.py": "281e481be2a0a1ab0b5dbc3cf471aef8611096305fc46cee5bcc22eaeb297c8c",
     "acestep/core/generation/handler/conditioning_batch.py": "5bc46879830c5e35a48e7ef4a18ca41b4c3f30f7887928b31cea3cf259e82958",
     "acestep/core/generation/handler/conditioning_embed.py": "45e80702219496edcef5712fa8403583c61f0df128833b9657d0d129d035a3f2",
+    "acestep/core/generation/handler/conditioning_target.py": "472b302837800f54972b5b5a3d6374b7855ee3eac9e05762757fcb41d5455068",
+    "acestep/core/generation/handler/io_audio.py": "98798d2678e6e46fd437508864245f032eedf736249af3183b3dcc856642e449",
     "acestep/core/generation/handler/service_generate.py": "b44f85dca2320ed11ed26d3395108e0fdc9be82bf9435c5b75fb88910926874c",
     "acestep/core/generation/handler/lora/lifecycle.py": "653d77beac88006f2d2f2f74621d72872623b805cf4fd9d4f64356ca47b80462"
   },
