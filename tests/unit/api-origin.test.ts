@@ -12,8 +12,9 @@ describe('frontend API routing', () => {
       requests.push({ url, headers: new Headers(init.headers) });
       return new Response('{}', { status: 200 });
     });
-    const { sdk, attachWallet } = await import('../../../app/src/lib/sdk');
-    attachWallet(`0x${'a'.repeat(40)}`, 'eip155:8453');
+    const { sdk } = await import('../../../app/src/lib/sdk');
+    const { store } = await import('../../../app/src/lib/store');
+    store.setUserAddress(`0x${'a'.repeat(40)}`);
     await sdk.fetch('/api/user/consent', { method: 'POST' });
     expect(requests[0].url).toBe('https://api.rawchunks.space/api/user/consent');
     expect(requests[0].headers.get('x-session-user-address')).toBe(`0x${'a'.repeat(40)}`);

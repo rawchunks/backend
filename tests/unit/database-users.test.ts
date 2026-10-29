@@ -45,9 +45,11 @@ describe('wallet address and pair persistence', () => {
     sql.mockResolvedValueOnce([{ evm_address: normalized, svm_address: svm }]);
     expect(await getWalletPair(evm)).toMatchObject({ consentedAt: null, consentSignature: null, consentMetadata: null });
   });
-  it('reads existing pending counterpart records without creating new placeholders', async () => {
-    sql.mockResolvedValueOnce([row({ svm_address: 'svm_pending_aaaaaaaa' })]);
-    expect(await getWalletPair(evm)).toMatchObject({ svmAddress: 'svm_pending_aaaaaaaa' });
+  it('supports EVM-only and SVM-only wallet records symmetrically', async () => {
+    sql.mockResolvedValueOnce([row({ svm_address: null })]);
+    expect(await getWalletPair(evm)).toMatchObject({ evmAddress: normalized, svmAddress: '' });
+    sql.mockResolvedValueOnce([row({ evm_address: null })]);
+    expect(await getWalletPair(svm)).toMatchObject({ evmAddress: '', svmAddress: svm });
   });
 });
 
@@ -60,9 +62,9 @@ describe('consent persistence', () => {
     await expect(putUserConsent(consent({ message }))).rejects.toThrow('signature and signed message');
     expect(sql).not.toHaveBeenCalled();
   });
-  it('requires an EVM counterpart for an unknown Solana account', async () => {
-    await expect(putUserConsent(consent({ address: svm, svmAddress: undefined }))).rejects.toThrow('Wallet pair not found');
-    expect(sql).toHaveBeenCalledTimes(1);
+  it('registers a Solana-only account without requiring an EVM counterpart', async () => {
+    sql.mockResolvedValueOnce([]).mockResolvedValueOnce([row({ evm_address: null })]).mockResolvedValueOnce([row({ evm_address: null })]);
+    expect(await putUserConsent(consent({ address: svm, svmAddress: undefined }))).toMatchObject({ evmAddress: '', svmAddress: svm });
   });
   it('registers the supplied pair before recording first consent', async () => {
     sql.mockResolvedValueOnce([]).mockResolvedValueOnce([row()]).mockResolvedValueOnce([row()]);
@@ -121,7 +123,7 @@ describe('consent lookup', () => {
     expect(await getUserConsent(evm)).toBeNull();
   });
   it('retains signed consent from the original client that omitted the message', async () => {
-    sql.mockResolvedValueOnce([row({ consent_message: null, consent_metadata: null, svm_address: 'svm_pending_aaaaaaaa' })]);
+    sql.mockResolvedValueOnce([row({ consent_message: null, consent_metadata: null, svm_address: null })]);
     expect(await getUserConsent({ address: evm, disclaimerType: 'generation', policyVersion: '1.0.0' })).toMatchObject({ signature: proof });
   });
   it('returns null without querying the legacy users table when a pair is missing', async () => {

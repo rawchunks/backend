@@ -29,11 +29,15 @@ beforeEach(async () => {
 afterEach(async () => app.close());
 
 describe('wallet and consent HTTP routes', () => {
-  it('registers a wallet pair and strips undeclared fields', async () => {
+  it('registers a wallet pair or single wallet and strips undeclared fields', async () => {
     const response = await app.inject({ method: 'PUT', url: '/api/user', payload: { evmAddress: evm, svmAddress: svm, admin: true } });
     expect(response.statusCode).toBe(200); expect(mocks.putWalletPair).toHaveBeenCalledWith({ evmAddress: evm, svmAddress: svm });
+    const evmOnly = await app.inject({ method: 'PUT', url: '/api/user', payload: { evmAddress: evm } });
+    expect(evmOnly.statusCode).toBe(200); expect(mocks.putWalletPair).toHaveBeenCalledWith({ evmAddress: evm });
+    const svmOnly = await app.inject({ method: 'PUT', url: '/api/user', headers: { 'x-session-user-address': svm }, payload: { svmAddress: svm } });
+    expect(svmOnly.statusCode).toBe(200); expect(mocks.putWalletPair).toHaveBeenCalledWith({ svmAddress: svm });
   });
-  it.each([{}, { evmAddress: evm }, { evmAddress: '', svmAddress: svm }, { evmAddress: 1, svmAddress: svm }, null, []])('rejects malformed wallet-pair body %j before DB writes', async (payload) => {
+  it.each([{}, { evmAddress: '' }, { svmAddress: '' }, { evmAddress: '', svmAddress: svm }, { evmAddress: 1, svmAddress: svm }, null, []])('rejects malformed wallet-pair body %j before DB writes', async (payload) => {
     const response = await app.inject({ method: 'PUT', url: '/api/user', payload: payload as any });
     expect(response.statusCode).toBe(400); expect(mocks.putWalletPair).not.toHaveBeenCalled();
   });

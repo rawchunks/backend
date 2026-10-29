@@ -30,7 +30,7 @@ describe('database client bootstrap without network or real credentials', () => 
   });
   it('registers the expected user and song relational schemas', async () => {
     await import('../../databases/client.js');
-    expect(Object.keys(mocks.drizzle.mock.calls[0][1].schema)).toEqual(expect.arrayContaining(['walletPairs', 'users']));
+    expect(Object.keys(mocks.drizzle.mock.calls[0][1].schema)).toEqual(['walletPairs']);
     expect(Object.keys(mocks.drizzle.mock.calls[1][1].schema)).toEqual(expect.arrayContaining(['songs', 'stems', 'takes', 'commits']));
   });
   it('propagates malformed driver bootstrap errors', async () => {

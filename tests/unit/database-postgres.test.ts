@@ -21,7 +21,7 @@ describe('production DDL and queries on disposable PostgreSQL engines', () => {
     await runMigrations();
     const userTables = (await postgres.user.query<{ table_name: string }>("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")).rows.map((row) => row.table_name);
     const songTables = (await postgres.song.query<{ table_name: string }>("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")).rows.map((row) => row.table_name);
-    expect(userTables.sort()).toEqual(['users', 'wallet_pairs']); expect(songTables.sort()).toEqual(['albums', 'commits', 'songs', 'stems', 'takes', 'voice_adapters', 'voices']);
+    expect(userTables.sort()).toEqual(['wallet_pairs']); expect(songTables.sort()).toEqual(['albums', 'commits', 'songs', 'stems', 'takes', 'voice_adapters', 'voices']);
   });
   it('repairs stale active flags by matching the persisted lane URL without changing any audio', async () => {
     await createSong(f.song); await createStem(f.stem); await createTake({ ...f.take, url: f.stem.url });
@@ -142,9 +142,8 @@ describe('production DDL and queries on disposable PostgreSQL engines', () => {
     expect(await getUserConsent(f.evm)).toMatchObject({ evmAddress: f.evm, signature: 'isolated-fixture' });
     expect((await getWalletPair(f.evm))?.nickname).toBe('Existing profile');
   });
-  it.each([null, 'svm_pending_aaaaaaaa'])('retains EVM consent when completing an initial pair from %s', async counterpart => {
+  it('retains EVM consent when completing an initial pair from null', async () => {
     await updateProfile({ address: f.evm });
-    if (counterpart) await postgres.user.query('UPDATE wallet_pairs SET svm_address=$1 WHERE evm_address=$2', [counterpart, f.evm]);
     const signed = await putUserConsent({ address: f.evm, signature: 'isolated-fixture', message: 'Original signed policy', policyVersion: '1.0.0', disclaimerType: 'ai_passthrough', metadata: { signedAt: '2026-10-11T10:00:00.000Z' } });
     await putWalletPair({ evmAddress: f.evm, svmAddress: f.svm });
     await putWalletPair({ evmAddress: f.evm, svmAddress: f.svm });
@@ -153,6 +152,12 @@ describe('production DDL and queries on disposable PostgreSQL engines', () => {
     }
     expect(await getUserConsent(`0x${'b'.repeat(40)}`)).toBeNull();
     expect(await getUserConsent({ address: f.svm, policyVersion: '2.0.0' })).toBeNull();
+  });
+  it('records first consent for a Solana account without an EVM counterpart', async () => {
+    const input = { address: f.svm, signature: 'svm-fixture', message: 'Solana signed policy', disclaimerType: 'generation' };
+    await putUserConsent(input);
+    expect(await getUserConsent(f.svm)).toMatchObject({ evmAddress: '', svmAddress: f.svm, signature: input.signature, message: input.message });
+    expect((await postgres.user.query('SELECT evm_address, svm_address FROM wallet_pairs')).rows).toEqual([{ evm_address: null, svm_address: f.svm }]);
   });
   it('clears consent when replacing an established Solana counterpart', async () => {
     await putWalletPair({ evmAddress: f.evm, svmAddress: f.svm });

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { getTableColumns, getTableName } from 'drizzle-orm';
 import { getTableConfig } from 'drizzle-orm/pg-core';
-import { walletPairs, users, songs, stems, takes, commits, voices, voiceAdapters } from '../../databases/schema/index.js';
+import { walletPairs, songs, stems, takes, commits, voices, voiceAdapters } from '../../databases/schema/index.js';
 const mocks = vi.hoisted(() => ({ userSql: vi.fn(), songSql: vi.fn() }));
 vi.mock('../../databases/client.js', () => mocks);
 import { runMigrations } from '../../databases/migrate.js';
@@ -12,14 +12,16 @@ describe('all Drizzle table contracts', () => {
     const api = await import('../../databases/index.js');
     expect(Object.keys(api)).toEqual(expect.arrayContaining(['createSong', 'getFullSongProject', 'putUserConsent', 'createTake', 'activateTake', 'createStem', 'createCommit', 'walletPairs', 'voices']));
   });
-  it.each([walletPairs, users, songs, stems, takes, commits, voices])('has a primary key and timezone creation timestamp', (table) => {
+  it.each([songs, stems, takes, commits, voices])('has a primary key and timezone creation timestamp', (table) => {
     const columns = getTableColumns(table);
     expect(Object.values(columns).filter((column) => column.primary)).toHaveLength(1);
     expect(columns.created_at).toMatchObject({ notNull: true, hasDefault: true, withTimezone: true });
   });
-  it('makes wallet pairs one-to-one across both chain addresses', () => {
-    expect(getTableColumns(walletPairs).evm_address.primary).toBe(true);
-    expect(getTableColumns(walletPairs).svm_address).toMatchObject({ notNull: false, isUnique: true });
+  it('makes wallet pairs symmetric and one-to-one across both chain addresses', () => {
+    const columns = getTableColumns(walletPairs);
+    expect(columns.evm_address).toMatchObject({ notNull: false, isUnique: true });
+    expect(columns.svm_address).toMatchObject({ notNull: false, isUnique: true });
+    expect(columns.created_at).toMatchObject({ notNull: true, hasDefault: true, withTimezone: true });
   });
   it.each([[stems, 1], [takes, 3], [commits, 2]])('declares parent foreign keys for %s', (table, count) => {
     expect(getTableConfig(table).foreignKeys).toHaveLength(count);
@@ -55,7 +57,8 @@ describe('actual migration SQL emitted to isolated transports', () => {
     const userDdl = mocks.userSql.mock.calls.map(([chunks]) => chunks.join('')).join('\n');
     const songDdl = mocks.songSql.mock.calls.map(([chunks]) => chunks.join('')).join('\n');
     expect(mocks.userSql).toHaveBeenCalledTimes(5); expect(mocks.songSql.mock.calls.length).toBeGreaterThan(6);
-    for (const table of ['wallet_pairs', 'users']) expect(userDdl).toContain(`CREATE TABLE IF NOT EXISTS public.${table}`);
+    expect(userDdl).toContain('CREATE TABLE IF NOT EXISTS public.wallet_pairs');
+    expect(userDdl).toContain('DROP TABLE IF EXISTS public.users');
     for (const table of ['songs', 'stems', 'takes', 'commits', 'voices']) expect(songDdl).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
     expect(songDdl).toContain('ALTER TABLE songs ADD COLUMN IF NOT EXISTS metadata_cid TEXT');
     expect(userDdl).not.toContain('CREATE TABLE IF NOT EXISTS songs');

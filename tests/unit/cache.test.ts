@@ -9,9 +9,10 @@ describe('cached wallet display', () => {
   it.each(['unknown', 'connecting'])('retains the address while the wallet is %s', status => {
     expect(cachedAddress(account, 'ethereum', true, status)).toBe('0x123');
   });
-  it('does not restore a disconnected wallet or an address from another network', () => {
+  it('does not restore a disconnected wallet and symmetrically resolves EVM/SVM across networks', () => {
     expect(cachedAddress(account, 'ethereum', true, 'disconnected')).toBeNull();
-    expect(cachedAddress(account, 'polygon', true, 'connecting')).toBeNull();
+    expect(cachedAddress(account, 'polygon', true, 'connecting')).toBe('0x123');
+    expect(cachedAddress({ address: '', svmAddress: 'swig123', network: 'solana', updatedAt: 1 }, 'ethereum', true, 'connecting')).toBe('swig123');
   });
   it('keeps the Solana address separate from the EVM address', () => {
     expect(cachedAddress({ ...account, network: 'solana' }, 'solana', false, 'connecting')).toBe('swig123');

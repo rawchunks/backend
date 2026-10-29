@@ -17,7 +17,7 @@ describe('actual API entrypoint with isolated provider plugins', () => {
     expect(res.json()).toMatchObject({ status: 'healthy', timestamp: expect.any(String) });
     expect(Number.isNaN(Date.parse(res.json().timestamp))).toBe(false);
   });
-  it.each(['generate','sample','format','repaint','layer','extend','remix','separate'])('forwards /%s JSON bodies unchanged', async route => {
+  it.each(['generate','sample','format','repaint','layer','extend','remix','isolate'])('forwards /%s JSON bodies unchanged', async route => {
     const body = { songId: 'song', nested: { value: 'café' } };
     const res = await app.inject({ method: 'POST', url: `/${route}`, payload: body });
     expect(res.statusCode).toBe(200);
