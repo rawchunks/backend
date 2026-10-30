@@ -5,10 +5,26 @@ import { stems, type Stem, type NewStem } from './schema/stems.js';
 import { takes, type Take, type NewTake } from './schema/takes.js';
 import { commits } from './schema/commits.js';
 import { resolveIdentityAddresses, RequestError } from './users.js';
+import { cacheGet, cacheSet, cacheDel } from './cache.js';
 import { randomUUID } from 'node:crypto';
+
+const MARKET_FOLDS_CACHE_PREFIX = 'songs:market:folds:';
+const MARKET_FOLDS_TTL = 60;
+const PLAY_DEDUP_PREFIX = 'songs:play-dedup:';
+const PLAY_DEDUP_TTL = 45;
+
+export async function invalidateMarketSongCache(): Promise<void> {
+  await Promise.all([
+    cacheDel('songs:all'),
+    cacheDel(`${MARKET_FOLDS_CACHE_PREFIX}12`),
+    cacheDel(`${MARKET_FOLDS_CACHE_PREFIX}20`),
+    cacheDel(`${MARKET_FOLDS_CACHE_PREFIX}50`),
+  ]);
+}
 
 export async function createSong(songData: NewSong): Promise<Song> {
   const result = await songDb.insert(songs).values({ ...songData, ...(songData.source ? { licenses: 0, license_price: 0 } : {}), creator: /^0x/i.test(songData.creator) ? songData.creator.toLowerCase() : songData.creator }).returning();
+  await invalidateMarketSongCache();
   return result[0];
 }
 
@@ -111,12 +127,57 @@ export async function updateSong(id: string, updates: Partial<NewSong>): Promise
     .set(updates)
     .where(eq(songs.id, id))
     .returning();
+  await invalidateMarketSongCache();
   return result[0] || null;
 }
 
 export async function deleteSong(id: string): Promise<boolean> {
   const result = await songDb.delete(songs).where(eq(songs.id, id)).returning({ id: songs.id });
+  if (result.length > 0) {
+    await invalidateMarketSongCache();
+  }
   return result.length > 0;
+}
+
+export interface MarketQueryParams {
+  sort?: 'new' | 'popular';
+  limit?: number;
+  offset?: number;
+  creator?: string;
+  genre?: string;
+  search?: string;
+  sinceMinutes?: number;
+}
+
+export interface MarketQueryResult {
+  items: Song[];
+  total: number;
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+}
+
+export interface MarketFoldGroup {
+  key: string;
+  label: string;
+  total: number;
+  songs: Song[];
+}
+
+export interface MarketFoldsResponse {
+  generatedAt: string;
+  foldLimit: number;
+  newReleases: {
+    total: number;
+    lastHourCount: number;
+    songs: Song[];
+  };
+  popular: {
+    total: number;
+    songs: Song[];
+  };
+  genres: MarketFoldGroup[];
+  creators: MarketFoldGroup[];
 }
 
 export async function getFullSongProject(id: string): Promise<{
