@@ -99,6 +99,23 @@ export async function runMigrations() {
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS image TEXT;`;
   await songSql`UPDATE songs SET image = '' WHERE image = '/hero.png';`;
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS album_id TEXT REFERENCES albums(id) ON DELETE SET NULL;`;
+  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS plays INTEGER DEFAULT 0 NOT NULL, ADD COLUMN IF NOT EXISTS last_played_at TIMESTAMPTZ;`;
+
+  await songSql`
+    CREATE TABLE IF NOT EXISTS playlists (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      creator TEXT NOT NULL,
+      description TEXT,
+      cover TEXT,
+      song_ids JSONB DEFAULT '[]'::jsonb NOT NULL,
+      public BOOLEAN DEFAULT FALSE NOT NULL,
+      plays INTEGER DEFAULT 0 NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+    );
+  `;
+  await songSql`ALTER TABLE playlists ALTER COLUMN public SET DEFAULT FALSE;`;
 
   await songSql`
     CREATE TABLE IF NOT EXISTS stems (
@@ -237,6 +254,10 @@ export async function runMigrations() {
   await songSql`CREATE INDEX IF NOT EXISTS songs_creator_created_idx ON songs (creator, created_at DESC);`;
   await songSql`CREATE INDEX IF NOT EXISTS songs_created_idx ON songs (created_at DESC);`;
   await songSql`CREATE INDEX IF NOT EXISTS songs_public_created_idx ON songs (created_at DESC) WHERE public = true;`;
+  await songSql`CREATE INDEX IF NOT EXISTS songs_public_plays_idx ON songs (plays DESC, created_at DESC) WHERE public = true;`;
+  await songSql`CREATE INDEX IF NOT EXISTS playlists_creator_created_idx ON playlists (creator, created_at DESC);`;
+  await songSql`CREATE INDEX IF NOT EXISTS playlists_public_created_idx ON playlists (created_at DESC) WHERE public = true;`;
+  await songSql`CREATE INDEX IF NOT EXISTS playlists_public_plays_idx ON playlists (plays DESC, created_at DESC) WHERE public = true;`;
   await songSql`CREATE INDEX IF NOT EXISTS songs_family_idx ON songs (family, version);`;
   await songSql`CREATE INDEX IF NOT EXISTS songs_basis_idx ON songs (basis);`;
   await songSql`CREATE INDEX IF NOT EXISTS voices_creator_created_idx ON voices (creator, created_at DESC);`;

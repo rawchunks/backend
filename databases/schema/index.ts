@@ -5,3 +5,4 @@ export * from './takes.js';
 export * from './commits.js';
 export * from './voices.js';
 export * from './albums.js';
+export * from './playlists.js';
