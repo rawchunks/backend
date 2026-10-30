@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: api
-          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/backend@sha256:c767bd5f55915e33acf75a43a2d04d199503631e8045c675290dbb38512b53a2
+          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/backend@sha256:46f8cfd45458532b82ae2eaa20dc2781a1c8d8add458995fdebc132ece4edc83
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 3005
