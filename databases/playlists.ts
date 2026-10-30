@@ -137,6 +137,25 @@ export async function removeSongFromPlaylist(id: string, songId: string): Promis
   return await updatePlaylist(id, { song_ids: current.filter((item) => item !== songId) });
 }
 
+export async function incrementPlaylistPlay(id: string): Promise<Playlist | null> {
+  const [updated] = await songDb
+    .update(playlists)
+    .set({
+      plays: sql`coalesce(${playlists.plays}, 0) + 1`,
+      updated_at: new Date(),
+    })
+    .where(eq(playlists.id, id))
+    .returning();
+
+  if (updated) {
+    await Promise.all([
+      cacheSet(`playlists:id:${id}`, updated, PLAYLIST_CACHE_TTL),
+      cacheDel('playlists:public'),
+    ]);
+  }
+  return updated || null;
+}
+
 export async function deletePlaylist(id: string): Promise<boolean> {
   const existing = await getPlaylistById(id);
   const result = await songDb.delete(playlists).where(eq(playlists.id, id)).returning({ id: playlists.id });

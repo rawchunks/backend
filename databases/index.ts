@@ -5,3 +5,5 @@ export * from './songs.js';
 export * from './stems.js';
 export * from './takes.js';
 export * from './commits.js';
+export * from './albums.js';
+export * from './playlists.js';
