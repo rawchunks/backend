@@ -422,7 +422,7 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
           const computed = extractWavBipolarPeaks(buf, targetBins);
           setInMemoryPeaks(cacheKey, computed);
           if (targetBins === 512) setInMemoryPeaks(url, computed);
-          void setCachedPeaks(cacheKey, computed).catch(() => {});
+          void setCachedPeaks(cacheKey, computed).catch(() => { });
           return computed;
         })().finally(() => {
           inFlightPeaks.delete(cacheKey);
