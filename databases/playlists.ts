@@ -122,4 +122,31 @@ export async function updatePlaylist(
   return updated || null;
 }
 
+export async function addSongToPlaylist(id: string, songId: string): Promise<Playlist | null> {
+  const existing = await getPlaylistById(id);
+  if (!existing) throw new RequestError('Playlist not found', 404);
+  const current = Array.isArray(existing.song_ids) ? existing.song_ids : [];
+  if (current.includes(songId)) return existing;
+  return await updatePlaylist(id, { song_ids: [...current, songId] });
+}
 
+export async function removeSongFromPlaylist(id: string, songId: string): Promise<Playlist | null> {
+  const existing = await getPlaylistById(id);
+  if (!existing) throw new RequestError('Playlist not found', 404);
+  const current = Array.isArray(existing.song_ids) ? existing.song_ids : [];
+  return await updatePlaylist(id, { song_ids: current.filter((item) => item !== songId) });
+}
+
+export async function deletePlaylist(id: string): Promise<boolean> {
+  const existing = await getPlaylistById(id);
+  const result = await songDb.delete(playlists).where(eq(playlists.id, id)).returning({ id: playlists.id });
+  if (result.length > 0) {
+    await Promise.all([
+      cacheDel(`playlists:id:${id}`),
+      cacheDel('playlists:public'),
+      existing ? cacheDel(`playlists:creator:${existing.creator}`) : Promise.resolve(),
+    ]);
+    return true;
+  }
+  return false;
+}
