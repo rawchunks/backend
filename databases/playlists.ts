@@ -7,6 +7,31 @@ import { cacheGet, cacheSet, cacheDel } from './cache.js';
 
 const PLAYLIST_CACHE_TTL = 90;
 
+export async function createPlaylist(data: NewPlaylist): Promise<Playlist> {
+  const creator = /^0x/i.test(data.creator) ? data.creator.toLowerCase() : data.creator;
+  const cleanIds = Array.isArray(data.song_ids)
+    ? Array.from(new Set(data.song_ids.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)))
+    : [];
+
+  const [created] = await songDb
+    .insert(playlists)
+    .values({
+      ...data,
+      creator,
+      song_ids: cleanIds,
+      public: data.public ?? false,
+      plays: data.plays ?? 0,
+      updated_at: new Date(),
+    })
+    .returning();
+
+  await Promise.all([
+    cacheDel('playlists:public'),
+    cacheDel(`playlists:creator:${creator}`),
+  ]);
+  return created;
+}
+
 export async function getPlaylistById(id: string): Promise<Playlist | null> {
   const cached = await cacheGet<Playlist>(`playlists:id:${id}`);
   if (cached) return cached;
@@ -64,6 +89,37 @@ export async function getPlaylistsByCreator(creator: string): Promise<Playlist[]
     .from(playlists)
     .where(inArray(playlists.creator, addresses))
     .orderBy(desc(playlists.updated_at));
+}
+
+export async function updatePlaylist(
+  id: string,
+  updates: Partial<Pick<NewPlaylist, 'title' | 'description' | 'cover' | 'song_ids' | 'public'>>,
+): Promise<Playlist | null> {
+  const patch: Record<string, any> = { updated_at: new Date() };
+  if (typeof updates.title === 'string') patch.title = updates.title.trim();
+  if (updates.description !== undefined) patch.description = updates.description;
+  if (updates.cover !== undefined) patch.cover = updates.cover;
+  if (typeof updates.public === 'boolean') patch.public = updates.public;
+  if (Array.isArray(updates.song_ids)) {
+    patch.song_ids = Array.from(
+      new Set(updates.song_ids.filter((sid): sid is string => typeof sid === 'string' && sid.trim().length > 0)),
+    );
+  }
+
+  const [updated] = await songDb
+    .update(playlists)
+    .set(patch)
+    .where(eq(playlists.id, id))
+    .returning();
+
+  if (updated) {
+    await Promise.all([
+      cacheSet(`playlists:id:${id}`, updated, PLAYLIST_CACHE_TTL),
+      cacheDel('playlists:public'),
+      cacheDel(`playlists:creator:${updated.creator}`),
+    ]);
+  }
+  return updated || null;
 }
 
 
