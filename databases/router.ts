@@ -19,6 +19,18 @@ import {
   removeSongFromAlbum,
   getSongsByAlbum,
 } from './albums.js';
+import {
+  createPlaylist,
+  getPlaylistById,
+  getPlaylistWithSongs,
+  getPublicPlaylists,
+  getPlaylistsByCreator,
+  updatePlaylist,
+  addSongToPlaylist,
+  removeSongFromPlaylist,
+  incrementPlaylistPlay,
+  deletePlaylist,
+} from './playlists.js';
 
 const text = z.string().refine(value => value.trim().length > 0, 'Value must not be empty');
 const address = text.refine(value => { try { parseAddress(value); return true; } catch { return false; } }, 'Invalid wallet address');
@@ -79,6 +91,22 @@ const albumPatch = z.object({
   cover: z.string().nullable().optional(),
   public: z.boolean().optional(),
 }).strict().refine(data => Object.keys(data).length > 0, 'At least one album field is required');
+
+const playlistCreate = z.object({
+  title: text,
+  creator: text,
+  description: z.string().nullable().optional(),
+  cover: z.string().nullable().optional(),
+  song_ids: z.array(z.string()).optional(),
+  public: z.boolean().optional(),
+});
+const playlistPatch = z.object({
+  title: text.optional(),
+  description: z.string().nullable().optional(),
+  cover: z.string().nullable().optional(),
+  song_ids: z.array(z.string()).optional(),
+  public: z.boolean().optional(),
+}).strict().refine(data => Object.keys(data).length > 0, 'At least one playlist field is required');
 
 function failure(request: FastifyRequest, reply: FastifyReply, error: unknown, message: string) {
   if (error instanceof RequestError) return reply.status(error.statusCode).send({ error: error.message });
@@ -605,6 +633,161 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       return reply.send({ success: true, songId });
     } catch (error) {
       return failure(request, reply, error, 'Failed to remove song from album');
+    }
+  });
+
+  // Playlist routes
+  app.get('/playlists', async (request, reply) => {
+    try {
+      const { creator, limit, offset } = request.query as { creator?: string; limit?: string; offset?: string };
+      if (creator) {
+        return reply.send(await getPlaylistsByCreator(creator));
+      }
+      return reply.send(await getPublicPlaylists(limit ? Number(limit) : 50, offset ? Number(offset) : 0));
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to list playlists');
+    }
+  });
+
+  app.get('/playlists/:id', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string };
+      const result = await getPlaylistWithSongs(id);
+      if (!result.playlist) return reply.status(404).send({ error: 'Playlist not found' });
+      return reply.send({ ...result.playlist, songs: result.songs });
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to retrieve playlist');
+    }
+  });
+
+  app.post('/playlists', async (request, reply) => {
+    try {
+      const body = playlistCreate.parse(request.body);
+      const hasAuthHeader = Boolean(
+        request.headers['x-user-address'] ||
+        request.headers['x-session-user-address'] ||
+        request.headers['x-account-address'] ||
+        request.headers.authorization
+      );
+      if (hasAuthHeader) {
+        await checkUserOrPair(readUser(request), body.creator);
+      }
+      const id = `pl_${randomUUID()}`;
+      const playlist = await createPlaylist({
+        id,
+        title: body.title.trim(),
+        creator: body.creator,
+        description: body.description || null,
+        cover: body.cover || null,
+        song_ids: body.song_ids ?? [],
+        public: body.public ?? false,
+      });
+      return reply.status(201).send(playlist);
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to create playlist');
+    }
+  });
+
+  const handleUpdatePlaylist = async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const { id } = request.params as { id: string };
+      const existing = await getPlaylistById(id);
+      if (!existing) return reply.status(404).send({ error: 'Playlist not found' });
+      const hasAuthHeader = Boolean(
+        request.headers['x-user-address'] ||
+        request.headers['x-session-user-address'] ||
+        request.headers['x-account-address'] ||
+        request.headers.authorization
+      );
+      if (hasAuthHeader) {
+        await checkUserOrPair(readUser(request), existing.creator);
+      }
+      const updates = playlistPatch.parse(request.body);
+      const updated = await updatePlaylist(id, updates);
+      if (!updated) return reply.status(404).send({ error: 'Playlist not found' });
+      return reply.send(updated);
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to update playlist');
+    }
+  };
+  app.put('/playlists/:id', handleUpdatePlaylist);
+  app.patch('/playlists/:id', handleUpdatePlaylist);
+
+  app.post('/playlists/:id/songs', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string };
+      const existing = await getPlaylistById(id);
+      if (!existing) return reply.status(404).send({ error: 'Playlist not found' });
+      const hasAuthHeader = Boolean(
+        request.headers['x-user-address'] ||
+        request.headers['x-session-user-address'] ||
+        request.headers['x-account-address'] ||
+        request.headers.authorization
+      );
+      if (hasAuthHeader) {
+        await checkUserOrPair(readUser(request), existing.creator);
+      }
+      const { songId } = z.object({ songId: text }).parse(request.body);
+      const updated = await addSongToPlaylist(id, songId);
+      if (!updated) return reply.status(404).send({ error: 'Playlist not found' });
+      return reply.send(updated);
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to add song to playlist');
+    }
+  });
+
+  app.delete('/playlists/:id/songs/:songId', async (request, reply) => {
+    try {
+      const { id, songId } = request.params as { id: string; songId: string };
+      const existing = await getPlaylistById(id);
+      if (!existing) return reply.status(404).send({ error: 'Playlist not found' });
+      const hasAuthHeader = Boolean(
+        request.headers['x-user-address'] ||
+        request.headers['x-session-user-address'] ||
+        request.headers['x-account-address'] ||
+        request.headers.authorization
+      );
+      if (hasAuthHeader) {
+        await checkUserOrPair(readUser(request), existing.creator);
+      }
+      const updated = await removeSongFromPlaylist(id, songId);
+      if (!updated) return reply.status(404).send({ error: 'Playlist not found' });
+      return reply.send(updated);
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to remove song from playlist');
+    }
+  });
+
+  app.post('/playlists/:id/play', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string };
+      const updated = await incrementPlaylistPlay(id);
+      if (!updated) return reply.status(404).send({ error: 'Playlist not found' });
+      return reply.send(updated);
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to record playlist play');
+    }
+  });
+
+  app.delete('/playlists/:id', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string };
+      const existing = await getPlaylistById(id);
+      if (!existing) return reply.status(404).send({ error: 'Playlist not found' });
+      const hasAuthHeader = Boolean(
+        request.headers['x-user-address'] ||
+        request.headers['x-session-user-address'] ||
+        request.headers['x-account-address'] ||
+        request.headers.authorization
+      );
+      if (hasAuthHeader) {
+        await checkUserOrPair(readUser(request), existing.creator);
+      }
+      const deleted = await deletePlaylist(id);
+      if (!deleted) return reply.status(404).send({ error: 'Playlist not found' });
+      return reply.send({ success: true, id });
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to delete playlist');
     }
   });
 };
