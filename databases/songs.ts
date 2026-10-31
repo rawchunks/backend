@@ -246,6 +246,113 @@ export interface MarketFoldsResponse {
   creators: MarketFoldGroup[];
 }
 
+function extractPrimaryGenre(tags: string[] | null | undefined): string {
+  if (!Array.isArray(tags)) return 'Uncategorized';
+  const genreTag = tags.find((t) => typeof t === 'string' && t.toLowerCase().startsWith('genre:'));
+  if (genreTag) {
+    const val = genreTag.slice(6).trim();
+    return val || 'Uncategorized';
+  }
+  const fallback = tags.find((t) => typeof t === 'string' && !t.includes(':') && t.trim().length > 0);
+  return fallback ? fallback.trim() : 'Uncategorized';
+}
+
+export async function getMarketFolds(foldLimit = 20): Promise<MarketFoldsResponse> {
+  const safeLimit = Math.min(Math.max(Number(foldLimit) || 20, 4), 50);
+  const cacheKey = `${MARKET_FOLDS_CACHE_PREFIX}${safeLimit}`;
+  const cached = await cacheGet<MarketFoldsResponse>(cacheKey);
+  if (cached) return cached;
+
+  const [newReleases, popular, recentPool, statsRows] = await Promise.all([
+    songDb
+      .select()
+      .from(songs)
+      .where(eq(songs.public, true))
+      .orderBy(desc(songs.created_at))
+      .limit(safeLimit),
+    songDb
+      .select()
+      .from(songs)
+      .where(eq(songs.public, true))
+      .orderBy(desc(songs.plays), desc(songs.created_at))
+      .limit(safeLimit),
+    songDb
+      .select()
+      .from(songs)
+      .where(eq(songs.public, true))
+      .orderBy(desc(songs.created_at))
+      .limit(250),
+    songDb
+      .select({
+        total: sql<number>`count(*)::int`,
+        lastHour: sql<number>`count(*) filter (where ${songs.created_at} >= now() - interval '60 minutes')::int`,
+      })
+      .from(songs)
+      .where(eq(songs.public, true)),
+  ]);
+
+  const totalPublic = statsRows[0]?.total ?? recentPool.length;
+  const lastHourCount = statsRows[0]?.lastHour ?? 0;
+
+  const genreMap = new Map<string, Song[]>();
+  const creatorMap = new Map<string, Song[]>();
+
+  for (const song of recentPool) {
+    const genre = extractPrimaryGenre(song.tags);
+    const gList = genreMap.get(genre) || [];
+    gList.push(song);
+    genreMap.set(genre, gList);
+
+    const creator = song.creator;
+    const cList = creatorMap.get(creator) || [];
+    cList.push(song);
+    creatorMap.set(creator, cList);
+  }
+
+  const genres: MarketFoldGroup[] = Array.from(genreMap.entries())
+    .sort((a, b) => {
+      if (a[0] === 'Uncategorized') return 1;
+      if (b[0] === 'Uncategorized') return -1;
+      return b[1].length - a[1].length;
+    })
+    .slice(0, 8)
+    .map(([genre, list]) => ({
+      key: genre,
+      label: genre,
+      total: list.length,
+      songs: list.slice(0, safeLimit),
+    }));
+
+  const creators: MarketFoldGroup[] = Array.from(creatorMap.entries())
+    .sort((a, b) => b[1].length - a[1].length)
+    .slice(0, 8)
+    .map(([creator, list]) => ({
+      key: creator,
+      label: creator,
+      total: list.length,
+      songs: list.slice(0, safeLimit),
+    }));
+
+  const payload: MarketFoldsResponse = {
+    generatedAt: new Date().toISOString(),
+    foldLimit: safeLimit,
+    newReleases: {
+      total: totalPublic,
+      lastHourCount,
+      songs: newReleases,
+    },
+    popular: {
+      total: totalPublic,
+      songs: popular,
+    },
+    genres,
+    creators,
+  };
+
+  await cacheSet(cacheKey, payload, MARKET_FOLDS_TTL);
+  return payload;
+}
+
 export async function getFullSongProject(id: string): Promise<{
   song: Song | null;
   stems: Stem[];
