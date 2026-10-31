@@ -377,12 +377,21 @@ export const databaseRouter: FastifyPluginAsync = async app => {
 
   const streamCheckpointHandler = async (request: FastifyRequest, reply: FastifyReply) => {
     try {
+      const { id } = request.params as { id: string };
+      const listenedSeconds = Number((request.body as any)?.listenedSeconds || 0);
+      const viewer =
+        (request.headers['x-user-address'] as string | undefined) ||
+        (request.headers['x-session-user-address'] as string | undefined) ||
+        request.ip;
+
       const intentId = String((request.body as any)?.paymentIntentId || '');
       if (request.headers['x-credit-source'] || intentId.startsWith('crd:')) {
+        if (listenedSeconds >= 10 && id) {
+          await incrementSongPlay(id, viewer || intentId).catch(() => {});
+        }
         const { checkpointCredits } = await import('../credits/billing.js');
         return reply.send(await checkpointCredits(request));
       }
-      const { id } = request.params as { id: string };
       const song = await getSongById(id);
       if (!song) return reply.status(404).send({ error: 'Song not found' });
 
@@ -392,7 +401,6 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       } | undefined;
 
       const paymentIntentId = body?.paymentIntentId;
-      const listenedSeconds = Number(body?.listenedSeconds || 0);
 
       if (!paymentIntentId) {
         return reply.status(400).send({ error: 'paymentIntentId is required for stream checkpoint' });
@@ -407,6 +415,10 @@ export const databaseRouter: FastifyPluginAsync = async app => {
         streamPriceUsd: song.stream_price,
         creatorAddress: song.creator,
       });
+
+      if (listenedSeconds >= 10) {
+        await incrementSongPlay(id, viewer || paymentIntentId).catch(() => {});
+      }
 
       return reply.send({
         success: Boolean(result),
