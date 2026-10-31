@@ -44,6 +44,7 @@ export interface Edit {
 
 export interface Merge {
   takeIds: string[];
+  layerNames?: string[];
   placements?: { takeId: string; shift: number }[];
   region: { start: number; end: number };
   original: boolean;
@@ -699,14 +700,15 @@ export class Service {
     const song = await getSongById(songId);
     if (!song?.url) throw failure('Song audio not found', 404);
     const takes = await listTakesBySong(songId), commits = await listCommitsBySong(songId), stems = await listStemsBySong(songId);
-    const id = `take-merge-${identity(songId, JSON.stringify({ ...merge, takeIds: [...merge.takeIds].sort(), srcAudioUrl: undefined }))}`;
+    const hasLayerNames = Boolean(merge.layerNames && merge.layerNames.length > 0);
+    const id = `take-merge-${identity(songId, JSON.stringify({ ...merge, takeIds: [...merge.takeIds].sort(), ...(hasLayerNames ? { layerNames: [...merge.layerNames!].sort() } : {}), srcAudioUrl: merge.takeIds.length === 0 ? merge.srcAudioUrl : undefined }))}`;
     const previous = takes.find(take => take.id === id);
     if (previous) return { success: true, take: previous, activeTakeId: id, versionState: 'merged' };
     const masterCommits = commits.filter(c => (c.timeline_snapshot as any)?.action);
     if ((commits[0]?.id ?? null) !== merge.commitId && (masterCommits[0]?.id ?? null) !== merge.commitId) throw failure('The master changed. Reload its current version before merging.', 409);
-    if (!merge.takeIds.length || new Set(merge.takeIds).size !== merge.takeIds.length) throw failure('Select distinct candidates to merge');
+    if ((!merge.takeIds.length && !hasLayerNames) || new Set(merge.takeIds).size !== merge.takeIds.length) throw failure('Select distinct candidates to merge');
     const candidates = merge.takeIds.map(id => takes.find(take => take.id === id));
-    if (candidates.some(take => !take || take.is_active || take.provenance?.mergedInto || take.provenance?.target === 'stem')) throw failure('Selected candidates are not pending master sections', 409);
+    if (candidates.some(take => !take || take.is_active || take.provenance?.mergedInto || (take.provenance?.target === 'stem' && !hasLayerNames))) throw failure('Selected candidates are not pending master sections', 409);
     const { start, end } = merge.region;
     if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start || start > (song.duration ?? Infinity)) throw failure('Invalid merge interval');
     const placements = merge.placements ?? merge.takeIds.map(takeId => ({takeId,shift:0}));
@@ -735,8 +737,8 @@ export class Service {
     const audio = await composeEdit(source.buffer, rendered.buffer, spliceRegion, offset, true);
     const url = await guarded(assertLease, () => uploadToR2('versions', `edits/${id}.wav`, audio, 'audio/wav'));
     const master = stems.find(stem => stem.name.toLowerCase() === 'master' || stem.id.startsWith('stem-master') || stem.id.startsWith('stm-master'));
-    const provenance: TakeProvenance = { taskId: id, sourceUrl: song.url, sourceTakeId: takes.find(take => take.is_active && take.provenance?.target === 'master')?.id ?? null, sourceDuration: readWave(await decodeWave(source.buffer)).duration, target: 'master', targetStemId: master?.id ?? null, region: merge.region, outputDuration: readWave(audio).duration, audioOffset: start, candidates: merge.takeIds, original: merge.original, parameters: { commitId: merge.commitId, placements } };
-    const take = { id, song_id: songId, stem_id: master?.id ?? null, take_number: nextTake(takes), task: 'merge', model: candidates[0]!.model, prompt: null, lyrics: null, url, is_active: true, provenance };
+    const provenance: TakeProvenance = { taskId: id, sourceUrl: song.url, sourceTakeId: takes.find(take => take.is_active && take.provenance?.target === 'master')?.id ?? null, sourceDuration: readWave(await decodeWave(source.buffer)).duration, target: 'master', targetStemId: master?.id ?? null, region: merge.region, outputDuration: readWave(audio).duration, audioOffset: start, candidates: merge.takeIds, original: merge.original, parameters: { commitId: merge.commitId, placements, ...(hasLayerNames ? { layerNames: merge.layerNames } : {}) } };
+    const take = { id, song_id: songId, stem_id: master?.id ?? null, take_number: nextTake(takes), task: 'merge', model: candidates[0]?.model ?? 'daw-mixdown', prompt: null, lyrics: null, url, is_active: true, provenance };
     const commit = { id: `commit-${id}`, song_id: songId, user_address: address(userAddress ?? song.creator), parent_commit_id: commits[0]?.id ?? merge.commitId, message: 'Merged section', timeline_snapshot: { action: 'merge', activeTakeId: id, takes: candidates, provenance, timestamp: new Date().toISOString() } };
     await guarded(assertLease, () => activateTake(songId, master?.id ?? null, id, { take, consume, remaining, master: true, url, duration: provenance.outputDuration!, commit }));
     return { success: true, activeTakeId: id, take, commit, versionState: 'merged' };

@@ -275,6 +275,44 @@ describe('editing Service: finalize, activation, mixer and history', () => {
       }),
     );
   });
+  it('merges a direct CODE/KEYS/DRUMS lane into Master via layerNames when takeIds is empty', async () => {
+    m.listStemsBySong.mockResolvedValue([{ id: 'stm-master-song-1', name: 'Master Track', url: 'original.wav' }]);
+    m.listTakesBySong.mockResolvedValue([
+      { id: 'take-1', song_id: 'song-1', stem_id: 'stm-master-song-1', task: 'text2music', model: 'acestep-v15-xl-base', is_active: true, url: 'original.wav', provenance: { target: 'master', outputDuration: 60 } },
+    ]);
+    m.listCommitsBySong.mockResolvedValue([
+      { id: 'commit-master-1', timeline_snapshot: { action: 'init', activeTakeId: 'take-1' } },
+    ]);
+    const res = await api.switchActiveTake('song-1', null, 'synth-strudel', '0xABCDEF0123', 'merge', {
+      takeIds: [],
+      layerNames: ['code'],
+      placements: [],
+      region: { start: 0, end: 60 },
+      original: true,
+      commitId: 'commit-master-1',
+      srcAudioUrl: 'rendered-with-code.wav',
+    });
+    expect(res).toMatchObject({ success: true, versionState: 'merged' });
+    expect(m.activateTake).toHaveBeenCalledWith(
+      'song-1',
+      'stm-master-song-1',
+      expect.stringMatching(/^take-merge-/),
+      expect.objectContaining({
+        consume: [],
+        remaining: [],
+        master: true,
+        take: expect.objectContaining({
+          model: 'daw-mixdown',
+          provenance: expect.objectContaining({
+            target: 'master',
+            parameters: expect.objectContaining({
+              layerNames: ['code'],
+            }),
+          }),
+        }),
+      }),
+    );
+  });
   it('returns existing history without initializing a master track', async () => {
     m.listStemsBySong.mockResolvedValue([{ id: 's' }]); m.listTakesBySong.mockResolvedValue([{ id: 't' }]); m.listCommitsBySong.mockResolvedValue([{ id: 'c' }]);
     expect(await api.getTimelineHistory('song-1')).toEqual({ stems: [{ id: 's' }], takes: [{ id: 't' }], commits: [{ id: 'c' }] });

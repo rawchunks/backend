@@ -642,7 +642,7 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
 
   const handleActivate = async (request: any, reply: any) => {
     try {
-      const { songId, stemId, takeId, userAddress, action, composition } = z.object({ songId: z.string().min(1), stemId: z.string().optional(), takeId: z.string().min(1), userAddress: z.string().min(10).optional(), action: z.enum(['base', 'merge']).optional(), composition: z.object({ placements: z.array(z.object({ takeId: z.string().min(1), shift: z.number().finite() })).optional(), takeIds: z.array(z.string().min(1)).min(1), region: z.object({ start: z.number().finite().min(0), end: z.number().finite().positive() }), original: z.boolean(), commitId: z.string().nullable(), srcAudioUrl: z.url() }).optional() }).parse(request.body);
+      const { songId, stemId, takeId, userAddress, action, composition } = z.object({ songId: z.string().min(1), stemId: z.string().optional(), takeId: z.string().min(1), userAddress: z.string().min(10).optional(), action: z.enum(['base', 'merge']).optional(), composition: z.object({ placements: z.array(z.object({ takeId: z.string().min(1), shift: z.number().finite() })).optional(), takeIds: z.array(z.string().min(1)).default([]), layerNames: z.array(z.string().min(1)).optional(), region: z.object({ start: z.number().finite().min(0), end: z.number().finite().positive() }), original: z.boolean(), commitId: z.string().nullable(), srcAudioUrl: z.url() }).optional() }).parse(request.body);
       const result = action ? await service.switchActiveTake(songId, stemId || null, takeId, userAddress, action, composition) : await service.switchActiveTake(songId, stemId || null, takeId, userAddress);
       return reply.send(result);
     } catch (err: any) {
