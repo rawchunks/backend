@@ -157,6 +157,72 @@ export interface MarketQueryResult {
   hasMore: boolean;
 }
 
+export async function queryPublicSongs(params: MarketQueryParams = {}): Promise<MarketQueryResult> {
+  const limit = Math.min(Math.max(Number(params.limit) || 24, 1), 100);
+  const offset = Math.max(Number(params.offset) || 0, 0);
+  validatePagination(limit, offset);
+
+  const conditions: any[] = [eq(songs.public, true)];
+
+  if (params.creator && params.creator !== 'all') {
+    const addresses = await resolveIdentityAddresses(params.creator);
+    conditions.push(inArray(songs.creator, addresses));
+  }
+
+  if (params.genre && params.genre !== 'all') {
+    const g = params.genre.trim();
+    conditions.push(sql`EXISTS (
+      SELECT 1 FROM jsonb_array_elements_text(${songs.tags}) AS tag
+      WHERE lower(tag) = lower(${g}) OR lower(tag) = lower(${`genre:${g}`})
+    )`);
+  }
+
+  if (params.search && params.search.trim()) {
+    const pattern = `%${params.search.trim()}%`;
+    conditions.push(sql`(
+      ${songs.title} ILIKE ${pattern}
+      OR ${songs.creator} ILIKE ${pattern}
+      OR EXISTS (
+        SELECT 1 FROM jsonb_array_elements_text(${songs.tags}) AS tag
+        WHERE tag ILIKE ${pattern}
+      )
+    )`);
+  }
+
+  if (params.sinceMinutes && Number.isFinite(params.sinceMinutes) && params.sinceMinutes > 0) {
+    const mins = Math.floor(params.sinceMinutes);
+    conditions.push(sql`${songs.created_at} >= NOW() - (${mins} * INTERVAL '1 minute')`);
+  }
+
+  const whereClause = conditions.length === 1 ? conditions[0] : and(...conditions);
+  const orderByClause = params.sort === 'popular'
+    ? [desc(songs.plays), desc(songs.created_at)]
+    : [desc(songs.created_at)];
+
+  const [items, countRows] = await Promise.all([
+    songDb
+      .select()
+      .from(songs)
+      .where(whereClause)
+      .orderBy(...orderByClause)
+      .limit(limit)
+      .offset(offset),
+    songDb
+      .select({ count: sql<number>`count(*)::int` })
+      .from(songs)
+      .where(whereClause),
+  ]);
+
+  const total = countRows[0]?.count ?? 0;
+  return {
+    items,
+    total,
+    limit,
+    offset,
+    hasMore: offset + items.length < total,
+  };
+}
+
 export interface MarketFoldGroup {
   key: string;
   label: string;
