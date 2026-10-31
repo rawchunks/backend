@@ -353,6 +353,35 @@ export async function getMarketFolds(foldLimit = 20): Promise<MarketFoldsRespons
   return payload;
 }
 
+export async function incrementSongPlay(id: string, viewerKey?: string): Promise<Song | null> {
+  if (viewerKey) {
+    const dedupKey = `${PLAY_DEDUP_PREFIX}${id}:${viewerKey}`;
+    const alreadyCounted = await cacheGet<number>(dedupKey);
+    if (alreadyCounted) {
+      return await getSongById(id);
+    }
+    await cacheSet(dedupKey, 1, PLAY_DEDUP_TTL);
+  }
+
+  const result = await songDb
+    .update(songs)
+    .set({
+      plays: sql`coalesce(${songs.plays}, 0) + 1`,
+      last_played_at: new Date(),
+    })
+    .where(eq(songs.id, id))
+    .returning();
+
+  const updated = result[0] || null;
+  if (updated) {
+    await Promise.all([
+      cacheSet(`songs:id:${id}`, updated, 120),
+      invalidateMarketSongCache(),
+    ]);
+  }
+  return updated;
+}
+
 export async function getFullSongProject(id: string): Promise<{
   song: Song | null;
   stems: Stem[];
