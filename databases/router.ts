@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { getWalletPair, getWalletPairsByAddresses, putWalletPair, getUserConsent, putUserConsent, getUserGuides, putUserGuides, parseAddress, updateProfile } from './users.js';
-import { listSongsByCreator, listAllSongs, getFullSongProject, updateSong, deleteSong, getSongById, createSong, copySong } from './songs.js';
+import { listSongsByCreator, listAllSongs, getFullSongProject, updateSong, deleteSong, getSongById, createSong, copySong, queryPublicSongs, getMarketFolds, incrementSongPlay } from './songs.js';
 import { randomUUID } from 'node:crypto';
 import { listStemsBySong } from './stems.js';
 import { listTakesBySong, deleteTake } from './takes.js';
@@ -44,7 +44,16 @@ const guidesBody = z.object({
   guides: z.array(text).max(32),
 });
 const integerQuery = (minimum: number) => z.string().regex(/^\d+$/).transform(Number).refine(value => Number.isSafeInteger(value) && value >= minimum);
-const listQuery = z.object({ creator: z.string().optional(), limit: integerQuery(1).optional(), offset: integerQuery(0).optional() });
+const listQuery = z.object({
+  creator: z.string().optional(),
+  limit: integerQuery(1).optional(),
+  offset: integerQuery(0).optional(),
+  sort: z.enum(['new', 'popular']).optional(),
+  genre: z.string().optional(),
+  search: z.string().optional(),
+  sinceMinutes: integerQuery(1).optional(),
+  paginated: z.string().optional(),
+});
 const consentQuery = z.object({ version: text.optional(), type: text.optional() });
 const songPatch = z.object({
   title: text.optional(), version: z.number().int().positive().optional(), source: text.nullable().optional(),
@@ -250,7 +259,7 @@ export const databaseRouter: FastifyPluginAsync = async app => {
   app.get('/songs', async (request, reply) => {
     try {
       const query = listQuery.parse(request.query);
-      if (query.creator) {
+      if (query.creator && !query.paginated && !query.sort && !query.genre && !query.search) {
         address.parse(query.creator);
         await checkUserOrPair(readUser(request), query.creator);
         const rows = query.limit === undefined && query.offset === undefined
@@ -258,9 +267,72 @@ export const databaseRouter: FastifyPluginAsync = async app => {
           : await listSongsByCreator(query.creator, query.limit, query.offset);
         return reply.send(rows);
       }
+      if (query.paginated === 'true' || query.sort || query.genre || query.search || query.sinceMinutes) {
+        const result = await queryPublicSongs({
+          sort: query.sort,
+          limit: query.limit,
+          offset: query.offset,
+          creator: query.creator,
+          genre: query.genre,
+          search: query.search,
+          sinceMinutes: query.sinceMinutes,
+        });
+        return reply.send(query.paginated === 'true' ? result : result.items);
+      }
       const rows = query.limit === undefined && query.offset === undefined ? await listAllSongs() : await listAllSongs(query.limit, query.offset);
       return reply.send(rows);
     } catch (error) { return failure(request, reply, error, 'Failed to list songs'); }
+  });
+  app.get('/songs/new', async (request, reply) => {
+    try {
+      const query = listQuery.parse(request.query);
+      const result = await queryPublicSongs({
+        sort: 'new',
+        limit: query.limit ?? 20,
+        offset: query.offset ?? 0,
+        creator: query.creator,
+        genre: query.genre,
+        search: query.search,
+        sinceMinutes: query.sinceMinutes,
+      });
+      return reply.send(result);
+    } catch (error) { return failure(request, reply, error, 'Failed to list new songs'); }
+  });
+  app.get('/songs/popular', async (request, reply) => {
+    try {
+      const query = listQuery.parse(request.query);
+      const result = await queryPublicSongs({
+        sort: 'popular',
+        limit: query.limit ?? 20,
+        offset: query.offset ?? 0,
+        creator: query.creator,
+        genre: query.genre,
+        search: query.search,
+      });
+      return reply.send(result);
+    } catch (error) { return failure(request, reply, error, 'Failed to list popular songs'); }
+  });
+  app.get('/market/folds', async (request, reply) => {
+    try {
+      const { limit } = request.query as { limit?: string };
+      const foldLimit = limit ? Math.min(Math.max(Number(limit) || 20, 4), 50) : 20;
+      const folds = await getMarketFolds(foldLimit);
+      return reply.send(folds);
+    } catch (error) { return failure(request, reply, error, 'Failed to load market folds'); }
+  });
+  app.post('/songs/:id/play', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string };
+      const viewer =
+        (request.headers['x-user-address'] as string | undefined) ||
+        (request.headers['x-session-user-address'] as string | undefined) ||
+        (request.headers['cf-connecting-ip'] as string | undefined) ||
+        request.ip ||
+        undefined;
+      const updated = await incrementSongPlay(id, viewer);
+      if (!updated) return reply.status(404).send({ error: 'Song not found' });
+      return reply.send({ id: updated.id, plays: updated.plays ?? 0, last_played_at: updated.last_played_at });
+    } catch (error) { return failure(request, reply, error, 'Failed to record song play'); }
   });
   app.get('/songs/:id', async (request, reply) => {
     try {
