@@ -4,13 +4,25 @@ import { requireSessionPayment, PRICING } from '../../broker/payment.js';
 import { readUser } from '../../databases/users.js';
 import { generateCoverArt } from '../../generation/router.js';
 import { LYRICS_CANVAS_TAGS, LYRICS_SYSTEM_PROMPT } from './lyrics.js';
-import { STYLE_TAGS_LIBRARY, normalizeStyleTags } from './styles.js';
+import {
+  GENRE_TAGS_LIBRARY,
+  PRODUCTION_TAGS_LIBRARY,
+  MOOD_TAGS_LIBRARY,
+  VOCAL_TAGS_LIBRARY,
+  STYLE_TAGS_LIBRARY,
+  normalizeGenres,
+  normalizeProduction,
+  normalizeMood,
+  normalizeVocal,
+  normalizeStyleTags,
+} from './styles.js';
 import {
   PARAMETERS_LIBRARY,
   normalizeBpm,
   normalizeDuration,
   normalizeKeyScale,
   normalizeLanguage,
+  normalizeTimeSignature,
 } from './parameters.js';
 import {
   analyzeAudioVibe,
@@ -205,6 +217,7 @@ export async function vibeRouter(fastify: FastifyInstance) {
   fastify.post<{
     Body: {
       bpm?: number;
+      timeSignature?: string;
       keyScale?: string;
       audioDuration?: number;
       vocalLanguage?: string;
