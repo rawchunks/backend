@@ -1,7 +1,19 @@
 import { generateCoverArt } from '../../generation/router.js';
 import { analyzeAudioVibe, type AudioVibeAnalysis } from './audio.js';
 import { LYRICS_CANVAS_TAGS, LYRICS_SYSTEM_PROMPT, getLyricsLibraryContext } from './lyrics.js';
-import { STYLE_TAGS_LIBRARY, getStylesLibraryContext, normalizeStyleTags } from './styles.js';
+import {
+  GENRE_TAGS_LIBRARY,
+  PRODUCTION_TAGS_LIBRARY,
+  MOOD_TAGS_LIBRARY,
+  VOCAL_TAGS_LIBRARY,
+  STYLE_TAGS_LIBRARY,
+  getStylesLibraryContext,
+  normalizeGenres,
+  normalizeProduction,
+  normalizeMood,
+  normalizeVocal,
+  normalizeStyleTags,
+} from './styles.js';
 import {
   PARAMETERS_LIBRARY,
   getParametersLibraryContext,
@@ -9,6 +21,7 @@ import {
   normalizeDuration,
   normalizeKeyScale,
   normalizeLanguage,
+  normalizeTimeSignature,
 } from './parameters.js';
 
 export const SONGWRITER_MODEL = 'nvidia/Nemotron-3-Ultra-550b-a55b';
@@ -26,8 +39,13 @@ export type VibeStreamEvent =
     | 'prompt'
     | 'instrumental'
     | 'vocalLanguage'
+    | 'genres'
+    | 'production'
+    | 'mood'
+    | 'vocal'
     | 'tags'
     | 'bpm'
+    | 'timeSignature'
     | 'keyScale'
     | 'audioDuration';
     value: any;
@@ -108,7 +126,7 @@ const AGENT_TOOLS = [
     type: 'function',
     function: {
       name: 'set_vocal_config',
-      description: 'Configure whether the song is instrumental and its vocal language.',
+      description: 'Configure whether the song is instrumental, its vocal language, and segmented vocal characteristics (1 per section across Voice Type, Register & Range, Vocal Timbre, Vocal Delivery).',
       parameters: {
         type: 'object',
         properties: {
@@ -120,6 +138,11 @@ const AGENT_TOOLS = [
             type: 'string',
             description: '2-letter ISO language code. Default to "en" (or the language the user wrote the prompt in) unless the user explicitly asks for lyrics in another language.',
           },
+          vocal: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'When instrumental=false, select up to 1 tag per vocal section (Voice Type, Register & Range, Vocal Timbre, Vocal Delivery) from the styles library.',
+          },
         },
         required: ['instrumental', 'vocalLanguage'],
       },
@@ -129,17 +152,31 @@ const AGENT_TOOLS = [
     type: 'function',
     function: {
       name: 'set_style_tags',
-      description: 'Populate 1 to 5 Studio style tags from the styles library.',
+      description: 'Populate the segmented Studio conditioning tags: Genres & Sub-Genres (1-3 tags), Production & Sound (1 per section across Timbre, Production, Mix & Space, Era), and Mood & Atmosphere (1-3 tags).',
       parameters: {
         type: 'object',
         properties: {
+          genres: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '1 to 3 Genre / Sub-Genre tags from the GENRES library.',
+          },
+          production: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Up to 4 Production & Sound tags (at most 1 per section: Timbre, Production, Mix & Space, Era) from the PRODUCTION library.',
+          },
+          mood: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '1 to 3 Mood & Atmosphere tags from the MOOD library.',
+          },
           tags: {
             type: 'array',
             items: { type: 'string' },
-            description: '1 to 5 style tags from the Studio style library.',
+            description: 'Optional combined array of style tags.',
           },
         },
-        required: ['tags'],
       },
     },
   },
@@ -147,11 +184,16 @@ const AGENT_TOOLS = [
     type: 'function',
     function: {
       name: 'set_global_parameters',
-      description: 'Populate the global musical parameters (BPM, key & scale, and duration in seconds).',
+      description: 'Populate the global musical parameters (BPM, time signature, key & scale, and duration in seconds).',
       parameters: {
         type: 'object',
         properties: {
           bpm: { type: 'integer', description: 'Tempo in BPM (40-220).' },
+          timeSignature: {
+            type: 'string',
+            enum: ['2', '3', '4', '6'],
+            description: 'Meter numerator: "4" (4/4 Common), "3" (3/4 Waltz), "6" (6/8 Compound), or "2" (2/4 March).',
+          },
           keyScale: { type: 'string', description: 'Musical key and scale, e.g. "A minor", "C major", "F# minor".' },
           audioDuration: { type: 'integer', description: 'Song duration in seconds (e.g. 90, 120, 180).' },
         },
@@ -489,8 +531,13 @@ export async function runVibeAgentStream(params: {
       audioAnalysis?.stt?.isLexical && audioAnalysis?.stt?.language
         ? normalizeLanguage(audioAnalysis.stt.language)
         : 'en',
+    genres: [] as string[],
+    production: [] as string[],
+    mood: [] as string[],
+    vocal: [] as string[],
     tags: [] as string[],
     bpm: audioAnalysis?.features?.bpm || 120,
+    timeSignature: '4' as '2' | '3' | '4' | '6',
     keyScale: audioAnalysis?.features?.keyScale || 'A minor',
     audioDuration: 120,
     coverTriggered: false,
@@ -561,24 +608,64 @@ export async function runVibeAgentStream(params: {
         emit({ type: 'field', field: 'instrumental', value: isInst });
         if (!isInst) {
           emit({ type: 'field', field: 'vocalLanguage', value: lang });
+          const vocalTags = normalizeVocal(args.vocal);
+          if (vocalTags.length > 0) {
+            state.vocal = vocalTags;
+            emit({ type: 'field', field: 'vocal', value: vocalTags });
+          }
+        } else {
+          state.vocal = [];
+          emit({ type: 'field', field: 'vocal', value: [] });
         }
         return 'ok';
       }
       case 'set_style_tags': {
-        const normalized = normalizeStyleTags(args.tags);
-        if (normalized.length > 0) {
-          state.tags = normalized;
-          emit({ type: 'field', field: 'tags', value: normalized });
+        const rawPool = [
+          ...(Array.isArray(args.genres) ? args.genres : []),
+          ...(Array.isArray(args.production) ? args.production : []),
+          ...(Array.isArray(args.mood) ? args.mood : []),
+          ...(Array.isArray(args.tags) ? args.tags : []),
+        ];
+        const genres = normalizeGenres(
+          Array.isArray(args.genres) && args.genres.length > 0 ? args.genres : rawPool
+        );
+        const production = normalizeProduction(
+          Array.isArray(args.production) && args.production.length > 0 ? args.production : rawPool
+        );
+        const mood = normalizeMood(
+          Array.isArray(args.mood) && args.mood.length > 0 ? args.mood : rawPool
+        );
+        if (genres.length > 0) {
+          state.genres = genres;
+          emit({ type: 'field', field: 'genres', value: genres });
+        }
+        if (production.length > 0) {
+          state.production = production;
+          emit({ type: 'field', field: 'production', value: production });
+        }
+        if (mood.length > 0) {
+          state.mood = mood;
+          emit({ type: 'field', field: 'mood', value: mood });
+        }
+        const combined = Array.from(new Set([...state.genres, ...state.production, ...state.mood]));
+        if (combined.length > 0) {
+          state.tags = combined;
+          emit({ type: 'field', field: 'tags', value: combined });
         }
         return 'ok';
       }
       case 'set_global_parameters': {
         const bpm = normalizeBpm(args.bpm);
+        const timeSignature = normalizeTimeSignature(args.timeSignature);
         const keyScale = normalizeKeyScale(args.keyScale);
         const audioDuration = normalizeDuration(args.audioDuration);
         if (bpm) {
           state.bpm = bpm;
           emit({ type: 'field', field: 'bpm', value: bpm });
+        }
+        if (timeSignature) {
+          state.timeSignature = timeSignature;
+          emit({ type: 'field', field: 'timeSignature', value: timeSignature });
         }
         if (keyScale) {
           state.keyScale = keyScale;
@@ -691,6 +778,10 @@ export async function runVibeAgentStream(params: {
 
 export {
   LYRICS_CANVAS_TAGS,
+  GENRE_TAGS_LIBRARY,
+  PRODUCTION_TAGS_LIBRARY,
+  MOOD_TAGS_LIBRARY,
+  VOCAL_TAGS_LIBRARY,
   STYLE_TAGS_LIBRARY,
   PARAMETERS_LIBRARY,
   analyzeAudioVibe,

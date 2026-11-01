@@ -201,14 +201,32 @@ export async function vibeRouter(fastify: FastifyInstance) {
   });
 
   fastify.get('/styles', async () => ({
+    genres: GENRE_TAGS_LIBRARY,
+    production: PRODUCTION_TAGS_LIBRARY,
+    moods: MOOD_TAGS_LIBRARY,
+    vocals: VOCAL_TAGS_LIBRARY,
     styles: STYLE_TAGS_LIBRARY,
   }));
 
   fastify.post<{
-    Body: { tags?: string[] };
-  }>('/styles', async (request) => ({
-    tags: normalizeStyleTags(request.body?.tags || []),
-  }));
+    Body: {
+      genres?: string[];
+      production?: string[];
+      mood?: string[];
+      vocal?: string[];
+      tags?: string[];
+    };
+  }>('/styles', async (request) => {
+    const rawTags = request.body?.tags || [];
+    const genres = normalizeGenres(request.body?.genres?.length ? request.body.genres : rawTags);
+    const production = normalizeProduction(
+      request.body?.production?.length ? request.body.production : rawTags
+    );
+    const mood = normalizeMood(request.body?.mood?.length ? request.body.mood : rawTags);
+    const vocal = normalizeVocal(request.body?.vocal || []);
+    const tags = normalizeStyleTags([...genres, ...production, ...rawTags]);
+    return { genres, production, mood, vocal, tags };
+  });
 
   fastify.get('/parameters', async () => ({
     parameters: PARAMETERS_LIBRARY,
@@ -224,6 +242,7 @@ export async function vibeRouter(fastify: FastifyInstance) {
     };
   }>('/parameters', async (request) => ({
     bpm: normalizeBpm(request.body?.bpm),
+    timeSignature: normalizeTimeSignature(request.body?.timeSignature),
     keyScale: normalizeKeyScale(request.body?.keyScale),
     audioDuration: normalizeDuration(request.body?.audioDuration),
     vocalLanguage: normalizeLanguage(request.body?.vocalLanguage),
@@ -235,13 +254,18 @@ export async function vibeRouter(fastify: FastifyInstance) {
       prompt?: string;
       instrumental?: boolean;
       vocalLanguage?: string;
+      vocal?: string[];
     };
-  }>('/details', async (request) => ({
-    title: String(request.body?.title || '').trim(),
-    prompt: String(request.body?.prompt || '').trim(),
-    instrumental: Boolean(request.body?.instrumental),
-    vocalLanguage: normalizeLanguage(request.body?.vocalLanguage),
-  }));
+  }>('/details', async (request) => {
+    const instrumental = Boolean(request.body?.instrumental);
+    return {
+      title: String(request.body?.title || '').trim(),
+      prompt: String(request.body?.prompt || '').trim(),
+      instrumental,
+      vocalLanguage: normalizeLanguage(request.body?.vocalLanguage),
+      vocal: instrumental ? [] : normalizeVocal(request.body?.vocal || []),
+    };
+  });
 
   fastify.post<{
     Body: {
