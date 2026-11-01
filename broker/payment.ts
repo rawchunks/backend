@@ -330,6 +330,23 @@ async function admitPlayback(state: PlaybackPayment, lease: JobLease) {
   await valkey.set(playbackKey(state.intent), state.id);
 }
 
+function settlementBody(state: PlaybackPayment, intent: string, cumulative: bigint): PaymentBody {
+  const previous = BigInt(state.billedWei);
+  const delta = cumulative - previous;
+  const creator = state.creator ? cumulative * 80n / 100n - previous * 80n / 100n : 0n;
+  const treasury = delta - creator;
+  // Zero-valued explicit split fields are rejected by Compose. Tiny tails may have only one recipient.
+  if (!creator || !treasury) return {
+    paymentIntentId: intent, finalAmountWei: String(delta), executeImmediately: true,
+    royalties: creator ? { creator: state.creator, treasury: state.creator } : { treasury: state.treasury },
+  };
+  return {
+    paymentIntentId: intent, finalAmountWei: String(delta), executeImmediately: true,
+    providerAmountWei: String(creator), platformFeeWei: String(treasury),
+    royalties: { creator: state.creator, treasury: state.treasury },
+  };
+}
+
 async function resolveStreamCreator(creatorAddress: string, network: string): Promise<string> {
   if (!creatorAddress) return '';
   const { parseAddress, getWalletPair } = await import('../databases/users.js');
@@ -379,66 +396,75 @@ export async function prepareStreamPaymentIntent(params: {
   });
 }
 
-export async function settleStreamCheckpoint(params: {
-  paymentIntentId: string;
-  network: string;
-  listenedSeconds: number;
-  streamPriceUsd: number;
-  creatorAddress: string;
-  payTo?: string;
-}): Promise<{ status: string; txHash?: string; billedWei: string } | null> {
-  try {
-    const composeUrl = getComposeApiUrl();
-    const payTo = params.payTo || getPlatformTreasury(params.network);
-
-    const durationMinutes = Math.max(0, params.listenedSeconds) / 60;
-    const finalAmountWei = Math.round(durationMinutes * params.streamPriceUsd * 1_000_000);
-    if (finalAmountWei <= 0) {
-      return { status: 'skipped', billedWei: '0' };
+async function drainPayment(state: PlaybackPayment, lease: JobLease): Promise<PlaybackReceipt> {
+  await admitPlayback(state, lease);
+  const before = BigInt(state.billedWei);
+  while (state.pending || state.observedMs > state.acceptedMs) {
+    if (!state.pending) {
+      const cumulative = BigInt(state.observedMs) * BigInt(state.rate) / 60000n;
+      if (cumulative <= BigInt(state.billedWei)) { state.acceptedMs = state.observedMs; await lease.save(state.id, state); break; }
+      const identity = `${state.id}:${state.observedMs}`;
+      state.pending = {
+        millis: state.observedMs, cumulativeWei: String(cumulative),
+        prepare: { ...state.admission, maxAmountWei: String(cumulative - BigInt(state.billedWei)), runId: identity, idempotencyKey: identity },
+        ...(!state.usedAdmission ? { settle: settlementBody(state, state.intent!, cumulative) } : {}),
+      };
+      await lease.save(state.id, state);
     }
-
-    const totalWei = BigInt(finalAmountWei);
-    const creatorShareWei = ((totalWei * 8000n) / 10000n).toString();
-    const treasuryFeeWei = (totalWei - BigInt(creatorShareWei)).toString();
-
-    const settleBody: Record<string, unknown> = {
-      paymentIntentId: params.paymentIntentId,
-      finalAmountWei: totalWei.toString(),
-      executeImmediately: true,
-      providerAmountWei: creatorShareWei,
-      platformFeeWei: treasuryFeeWei,
-      royalties: {
-        creator: params.creatorAddress,
-        treasury: payTo,
-      },
-    };
-
-    const settleRes = await fetch(`${composeUrl}/api/payments/settle`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-network-id': params.network,
-      },
-      body: JSON.stringify(settleBody),
-    });
-
-    if (!settleRes.ok) {
-      const errText = await settleRes.text().catch(() => '');
-      console.warn(`[Stream Payment] Checkpoint settle failed (${settleRes.status}):`, errText);
-      return null;
+    const pending = state.pending;
+    if (!pending.settle) {
+      const { result } = await sendPayment(state, 'prepare', pending.prepare);
+      if (typeof result.paymentIntentId !== 'string' || !result.paymentIntentId) throw new PaymentError(502, { error: 'Missing checkpoint intent' });
+      pending.settle = settlementBody(state, result.paymentIntentId, BigInt(pending.cumulativeWei));
+      await lease.save(state.id, state);
     }
-
-    const settleData = (await settleRes.json()) as { status?: string; txHash?: string };
-    console.log(`[Stream Payment] Checkpoint settled intent ${params.paymentIntentId}: status=${settleData.status}, txHash=${settleData.txHash}, creator=${creatorShareWei}, treasury=${treasuryFeeWei}`);
-    return {
-      status: settleData.status || 'confirmed',
-      txHash: settleData.txHash,
-      billedWei: totalWei.toString(),
+    const { result, headers } = await sendPayment(state, 'settle', pending.settle);
+    const status = String(result.status || '');
+    if (!durableStatuses.has(status)) throw new PaymentError(502, { error: 'Payment was not durably accepted', status }, headers);
+    pending.receipt = {
+      status, acceptedListenedSeconds: pending.millis / 1000, billedWei: pending.cumulativeWei,
+      deltaWei: String(BigInt(pending.cumulativeWei) - BigInt(state.billedWei)), headers,
+      ...(typeof result.txHash === 'string' ? { txHash: result.txHash } : {}),
     };
-  } catch (err: any) {
-    console.warn('[Stream Payment] Checkpoint settle error:', err?.message || err);
-    return null;
+    state.billedWei = pending.cumulativeWei;
+    state.acceptedMs = pending.millis;
+    state.usedAdmission = true;
+    state.obligations.push(pending);
+    delete state.pending;
+    await lease.save(state.id, state);
   }
+  if (state.terminal && !state.closed) {
+    if (!state.usedAdmission) await sendPayment(state, 'abort', { paymentIntentId: state.intent, reason: 'Playback ended without billable audio' });
+    state.closed = true;
+    await lease.save(state.id, state);
+  }
+  const latest = state.obligations.at(-1)?.receipt;
+  const receipt = {
+    status: latest?.status || 'skipped', acceptedListenedSeconds: state.acceptedMs / 1000,
+    billedWei: state.billedWei, deltaWei: String(BigInt(state.billedWei) - before), txHash: latest?.txHash, headers: latest?.headers,
+  };
+  if (state.closed && state.obligations.every(item => item.receipt?.status === 'confirmed')) await valkey.srem(recoverySet, state.id);
+  return receipt;
+}
+
+export async function settleStreamCheckpoint(params: {
+  paymentIntentId: string; network: string; listenedSeconds: number; token?: string; songId?: string; terminal?: boolean;
+  streamPriceUsd?: number; creatorAddress?: string; payTo?: string;
+}): Promise<PlaybackReceipt> {
+  if (!Number.isFinite(params.listenedSeconds) || params.listenedSeconds < 0) throw new PaymentError(400, { error: 'Invalid playback checkpoint' });
+  const id = await valkey.get(playbackKey(params.paymentIntentId));
+  if (!id) throw new PaymentError(404, { error: 'Unknown playback identifier; restart playback' });
+  return withJobLock(id, async lease => {
+    const state = await getTaskContext<PlaybackPayment>(id);
+    if (!state) throw new PaymentError(404, { error: 'Unknown playback identifier; restart playback' });
+    if (params.token !== state.token || params.network !== state.network || params.songId !== state.songId) throw new PaymentError(403, { error: 'Playback credential, network or song does not match' });
+    const millis = Math.min(state.durationMs, Math.round(params.listenedSeconds * 1000));
+    if (state.closed && millis > state.acceptedMs) throw new PaymentError(409, { error: 'Playback has already closed' });
+    state.observedMs = Math.max(state.observedMs, millis);
+    state.terminal ||= params.terminal === true;
+    await lease.save(state.id, state);
+    return drainPayment(state, lease);
+  });
 }
 
 let recoveryCursor = '0';
