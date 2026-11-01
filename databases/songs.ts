@@ -16,12 +16,14 @@ const PLAY_DEDUP_PREFIX = 'songs:play-dedup:';
 const PLAY_DEDUP_TTL = 45;
 
 export async function invalidateMarketSongCache(): Promise<void> {
-  await Promise.all([
-    cacheDel('songs:all'),
-    cacheDel(`${MARKET_FOLDS_CACHE_PREFIX}12`),
-    cacheDel(`${MARKET_FOLDS_CACHE_PREFIX}20`),
-    cacheDel(`${MARKET_FOLDS_CACHE_PREFIX}50`),
-  ]);
+  const keys = ['songs:all'];
+  for (const limit of [12, 20, 50]) {
+    keys.push(`${MARKET_FOLDS_CACHE_PREFIX}${limit}`);
+    for (const win of [15, 30, 60]) {
+      keys.push(`${MARKET_FOLDS_CACHE_PREFIX}${limit}:${win}`);
+    }
+  }
+  await Promise.all(keys.map((k) => cacheDel(k)));
 }
 
 export async function createSong(songData: NewSong): Promise<Song> {
@@ -219,7 +221,7 @@ export async function queryPublicSongs(params: MarketQueryParams = {}): Promise<
   if (params.genre && params.genre !== 'all') {
     const g = params.genre.trim();
     conditions.push(sql`EXISTS (
-      SELECT 1 FROM jsonb_array_elements_text(${songs.tags}) AS tag
+      SELECT 1 FROM jsonb_array_elements_text(${songs.genres}) AS tag
       WHERE lower(tag) = lower(${g}) OR lower(tag) = lower(${`genre:${g}`})
     )`);
   }
@@ -230,7 +232,7 @@ export async function queryPublicSongs(params: MarketQueryParams = {}): Promise<
       ${songs.title} ILIKE ${pattern}
       OR ${songs.creator} ILIKE ${pattern}
       OR EXISTS (
-        SELECT 1 FROM jsonb_array_elements_text(${songs.tags}) AS tag
+        SELECT 1 FROM jsonb_array_elements_text(${songs.genres}) AS tag
         WHERE tag ILIKE ${pattern}
       )
     )`);
@@ -295,14 +297,17 @@ export interface MarketFoldsResponse {
   creators: MarketFoldGroup[];
 }
 
-function extractPrimaryGenre(tags: string[] | null | undefined): string {
-  if (!Array.isArray(tags)) return 'Uncategorized';
-  const genreTag = tags.find((t) => typeof t === 'string' && t.toLowerCase().startsWith('genre:'));
+function extractPrimaryGenre(song: Pick<Song, 'genres' | 'tags'>): string {
+  const candidates = Array.isArray(song.genres) && song.genres.length > 0 ? song.genres : song.tags;
+  if (!Array.isArray(candidates)) return 'Uncategorized';
+  const genreTag = candidates.find((t) => typeof t === 'string' && t.toLowerCase().startsWith('genre:'));
   if (genreTag) {
     const val = genreTag.slice(6).trim();
-    return val || 'Uncategorized';
+    return val && !isNonGenreTag(val) ? val : 'Uncategorized';
   }
-  const fallback = tags.find((t) => typeof t === 'string' && !t.includes(':') && t.trim().length > 0);
+  const fallback = candidates.find(
+    (t) => typeof t === 'string' && !t.includes(':') && t.trim().length > 0 && !isNonGenreTag(t),
+  );
   return fallback ? fallback.trim() : 'Uncategorized';
 }
 
