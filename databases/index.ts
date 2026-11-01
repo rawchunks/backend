@@ -7,3 +7,4 @@ export * from './takes.js';
 export * from './commits.js';
 export * from './albums.js';
 export * from './playlists.js';
+export * from './genres.js';
