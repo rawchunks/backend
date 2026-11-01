@@ -7,6 +7,7 @@ import { addSongToAlbum } from '../databases/albums.js';
 import { resolveVoice } from '../voice/service.js';
 import { persistAudioToR2 } from '../storage/r2.js';
 import { alignVocalStemLyrics, transcribeVocalStemOnce } from '../editing/scribe.js';
+import { partitionSongTags } from '../options.js';
 
 export interface Generate {
   creatorAddress: string;
@@ -27,9 +28,22 @@ export interface Generate {
   voiceReferenceUrl?: string;
   voiceCoverStrength?: number;
   tags?: string[];
+  genres?: string[];
+  production?: string[];
+  mood?: string[];
+  vocal?: string[];
+  timeSignature?: '2' | '3' | '4' | '6';
   licenses?: number;
   stream_price?: number;
   license_price?: number;
+}
+
+function buildConditioningPrompt(promptText: string, tags: string[]): string {
+  if (!tags.length) return promptText;
+  const lowerPrompt = promptText.toLowerCase();
+  const missing = tags.filter(tag => !lowerPrompt.includes(tag.toLowerCase()));
+  if (!missing.length) return promptText;
+  return promptText ? `${promptText}, ${missing.join(', ')}` : missing.join(', ');
 }
 
 interface Context {
@@ -74,15 +88,18 @@ export class Service {
     const model = sft ? 'acestep-v15-xl-sft' : 'acestep-v15-xl-turbo';
     const steps = sft ? 50 : 8;
     const promptText = params.prompt?.trim() || '';
+    const partitioned = partitionSongTags(params);
+    const conditioningPrompt = buildConditioningPrompt(promptText, partitioned.allConditioningTags);
     const lyrics = params.instrumental ? '[Instrumental]' : params.lyrics?.trim() ? params.lyrics : '';
     const sampleMode = !params.instrumental && !lyrics;
     const payload: Release = {
-      model, task: 'text2music', task_type: 'text2music', prompt: promptText, lyrics,
-      instrumental: !!params.instrumental, sample_mode: sampleMode, sample_query: sampleMode ? promptText : undefined,
+      model, task: 'text2music', task_type: 'text2music', prompt: conditioningPrompt, lyrics,
+      instrumental: !!params.instrumental, sample_mode: sampleMode, sample_query: sampleMode ? conditioningPrompt : undefined,
       vocal_language: params.vocalLanguage, bpm: params.bpm, key_scale: params.keyScale, seed: params.seed,
       use_format: false, use_cot_caption: false, use_cot_language: false, use_random_seed: params.seed === undefined,
       batch_size: 1, inference_steps: steps, guidance_scale: sft ? 7.0 : 1.0, shift: refinementShift(model), audio_format: 'wav',
       ...(params.audioDuration === undefined ? {} : { audio_duration: params.audioDuration }),
+      ...(params.timeSignature === undefined ? {} : { time_signature: params.timeSignature }),
     };
     let voiceProvenance: Record<string, unknown> | undefined;
     if (params.voiceId) {
@@ -113,7 +130,12 @@ export class Service {
     const song = await createSong({
       id: songId, title: songTitle,
       version: 1, source: null, creator, url: '', licenses: params.licenses ?? 0, stream_price: params.stream_price ?? 0.02, license_price: params.license_price ?? 25,
-      duration: params.audioDuration, tags: params.tags || [],
+      duration: params.audioDuration,
+      tags: partitioned.genres,
+      genres: partitioned.genres,
+      production: partitioned.production,
+      mood: partitioned.mood,
+      vocal: partitioned.vocal,
       image: params.image || '',
       album_id: params.albumId || null,
     });
