@@ -296,6 +296,7 @@ interface PlaybackPayment {
   obligations: PaymentObligation[];
 }
 const recoverySet = 'rawchunks:payments';
+const playbackKey = (intent: string) => `rawchunks:payment:${intent}`;
 const durableStatuses = new Set(['queued', 'submitted', 'confirmed']);
 
 async function sendPayment(state: PlaybackPayment, operation: string, body: PaymentBody) {
@@ -468,6 +469,28 @@ export async function settleStreamCheckpoint(params: {
 }
 
 let recoveryCursor = '0';
+export async function recoverPayments() {
+  const [cursor, ids] = await valkey.sscan(recoverySet, recoveryCursor, 'COUNT', 30);
+  recoveryCursor = cursor;
+  for (const id of ids) {
+    try {
+      await withJobLock(id, async lease => {
+        const state = await getTaskContext<PlaybackPayment>(id);
+        if (!state) { await valkey.srem(recoverySet, id); return; }
+        await drainPayment(state, lease);
+        for (const item of state.obligations) {
+          if (item.receipt?.status === 'confirmed' || !item.settle) continue;
+          const { result, headers } = await sendPayment(state, 'settle', item.settle);
+          const status = String(result.status || '');
+          if (durableStatuses.has(status)) item.receipt = { ...item.receipt!, status, headers, txHash: typeof result.txHash === 'string' ? result.txHash : item.receipt?.txHash };
+        }
+        await lease.save(id, state);
+        if (state.closed && state.obligations.every(item => item.receipt?.status === 'confirmed')) await valkey.srem(recoverySet, id);
+      });
+    } catch (error) { console.warn('[Payment] Recovery will retry:', error instanceof PaymentError ? error.statusCode : 'unavailable'); }
+  }
+}
+
 export function requireSessionPayment(
   configOrResolver: SessionPaymentConfig | SessionPaymentResolver,
   options?: SessionPaymentOptions

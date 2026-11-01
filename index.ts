@@ -1,3 +1,4 @@
+import { recoverPayments } from './broker/payment.js';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
@@ -127,6 +128,14 @@ async function main() {
     timer.unref();
     app.addHook('onClose', async () => { clearInterval(timer); await credits.pool.end?.(); });
   }
+  let paymentRecoveryRunning = false;
+  const paymentRecovery = setInterval(() => {
+    if (paymentRecoveryRunning) return;
+    paymentRecoveryRunning = true;
+    void recoverPayments().catch(() => app.log.warn('Payment recovery will retry')).finally(() => { paymentRecoveryRunning = false; });
+  }, 30000);
+  paymentRecovery.unref();
+  app.addHook('onClose', async () => { clearInterval(paymentRecovery); });
   await app.register(databaseRouter, { prefix: '/api' });
   await app.register(generationRouter, { prefix: '/api/generation' });
   await app.register(editingRouter, { prefix: '/api/editing' });
