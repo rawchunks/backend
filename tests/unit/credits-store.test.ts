@@ -64,7 +64,26 @@ describe('Direct spendable Credits (Card & Campaign)', () => {
     await store.commit(owner, 'stream-a', 1n);
     await store.commit(owner, 'stream-a', 6n);
     expect((await store.balance(owner)).spentAtomics).toBe('6');
-    expect((await db.query('SELECT payable::text FROM credit_creators WHERE owner=$1', [other])).rows).toEqual([{ payable: '5' }]);
+    expect((await db.query('SELECT payable::text FROM credit_creators WHERE owner=$1', [other])).rows).toEqual([{ payable: '4' }]);
+  });
+  it('keeps millisecond acknowledgments, cumulative creator shares and releases unused authorization', async () => {
+    await buy();
+    await store.reserve(owner, 'card', 'stream-ms', 90000n, 'stream:song-ms', other);
+    await db.query("UPDATE credit_holds SET context=$2::jsonb WHERE id=$1", ['stream-ms', JSON.stringify({ kind: 'stream', acceptedMs: 0 })]);
+    for (const [millis, total] of [[20000, 10000n], [40000, 20000n], [60000, 30000n], [60125, 30062n]] as const) expect(await store.commit(owner, 'stream-ms', total, millis)).toMatchObject({ billedWei: String(total), acceptedMs: millis });
+    expect(await store.commit(owner, 'stream-ms', 10000n, 20000)).toMatchObject({ billedWei: '30062', deltaWei: '0', acceptedMs: 60125 });
+    await store.release(owner, 'stream-ms');
+    expect(await store.balance(owner)).toMatchObject({ spentAtomics: '30062', reservedAtomics: '0', availableAtomics: '9969938' });
+    expect((await db.query('SELECT payable::text FROM credit_creators WHERE owner=$1', [other])).rows).toEqual([{ payable: '24049' }]);
+  });
+  it('migrates the old session foreign key before reserving Direct Card Credits', async () => {
+    await buy();
+    await db.query('CREATE TABLE credit_sessions (environment text,id text,owner text,remaining bigint NOT NULL DEFAULT 0,closed boolean NOT NULL DEFAULT false,PRIMARY KEY(environment,id))');
+    await db.query('ALTER TABLE credit_holds ADD CONSTRAINT credit_holds_environment_session_id_fkey FOREIGN KEY(environment,session_id) REFERENCES credit_sessions(environment,id)');
+    await store.migrate();
+    await store.reserve(owner, 'card', 'direct-card', 1000n, 'stream:song', other);
+    await store.commit(owner, 'direct-card', 1000n);
+    expect(await store.balance(owner)).toMatchObject({ spentAtomics: '1000' });
   });
   it('isolates sandbox balances from live', async () => {
     await buy();

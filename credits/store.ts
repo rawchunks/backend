@@ -324,15 +324,21 @@ export class CreditStore {
     return hold;
   }
 
-  async commit(owner: string, id: string, amount: bigint) {
+  async commit(owner: string, id: string, amount: bigint, usageMillis?: number) {
     if (amount < 0n) throw fail('Invalid charge', 400);
-    await this.tx(async c => {
+    const result = await this.tx(async c => {
       const hold = await this.hold(c, owner, id);
       const previous = BigInt(hold.charged);
-      if (amount <= previous) return;
+      if (hold.closed && usageMillis !== undefined && usageMillis > (hold.context?.acceptedMs || 0)) throw fail('Playback has already closed');
+      const acceptedMs = Math.max(hold.context?.acceptedMs || 0, usageMillis || 0);
+      if (usageMillis !== undefined && !hold.closed) await c.query(
+        "UPDATE credit_holds SET context=jsonb_set(context,'{acceptedMs}',to_jsonb($3::bigint)) WHERE environment=$1 AND id=$2",
+        [this.environment, id, acceptedMs],
+      );
+      if (amount <= previous) return { billedWei: String(previous), deltaWei: '0', acceptedMs };
       if (hold.closed || amount > BigInt(hold.maximum)) throw fail('Charge exceeds reservation');
       const delta = amount - previous;
-      if (!(await this.posting(c, owner, `charge:${id}:${amount}`, delta, 'service-charge'))) return;
+      if (!(await this.posting(c, owner, `charge:${id}:${amount}`, delta, 'service-charge'))) throw fail('Charge posting mismatch');
       const lots = (await c.query('SELECT * FROM credit_hold_lots WHERE environment=$1 AND hold_id=$2 AND remaining>0 ORDER BY lot_id FOR UPDATE', [this.environment, id])).rows;
       let remaining = delta;
       for (const lot of lots) {
@@ -346,14 +352,16 @@ export class CreditStore {
       await c.query('UPDATE credit_accounts SET spent=spent+$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(delta)]);
       await c.query('UPDATE credit_holds SET charged=$3 WHERE environment=$1 AND id=$2', [this.environment, id, String(amount)]);
       if (hold.creator) {
-        const share = (amount - (amount * 20n) / 100n) - (previous - (previous * 20n) / 100n);
+        const share = amount * 80n / 100n - previous * 80n / 100n;
         await c.query(
           'INSERT INTO credit_creators(environment,owner,payable) VALUES($1,$2,$3) ON CONFLICT(environment,owner) DO UPDATE SET payable=credit_creators.payable+excluded.payable',
           [this.environment, hold.creator, String(share)],
         );
       }
+      return { billedWei: String(amount), deltaWei: String(delta), acceptedMs };
     });
     await this.invalidateOwner(owner);
+    return result;
   }
 
   async release(owner: string, id: string) {
