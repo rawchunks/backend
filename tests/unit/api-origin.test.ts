@@ -12,10 +12,10 @@ describe('frontend API routing', () => {
       requests.push({ url, headers: new Headers(init.headers) });
       return new Response('{}', { status: 200 });
     });
-    const { sdk } = await import('../../../app/src/lib/sdk');
+    const { api } = await import('../../../app/src/lib/api');
     const { store } = await import('../../../app/src/lib/store');
     store.setUserAddress(`0x${'a'.repeat(40)}`);
-    await sdk.fetch('/api/user/consent', { method: 'POST' });
+    await api.fetch('/api/user/consent', { method: 'POST' });
     expect(requests[0].url).toBe('https://api.rawchunks.space/api/user/consent');
     expect(requests[0].headers.get('x-session-user-address')).toBe(`0x${'a'.repeat(40)}`);
   });
@@ -24,8 +24,8 @@ describe('frontend API routing', () => {
     vi.stubGlobal('window', { location: { origin: 'https://another-host.invalid' } });
     const urls: string[] = [];
     vi.stubGlobal('fetch', async (url: string) => { urls.push(url); return new Response('{}'); });
-    const { sdk } = await import('../../../app/src/lib/sdk');
-    await sdk.fetch('/api/user/consent/account');
+    const { api } = await import('../../../app/src/lib/api');
+    await api.fetch('/api/user/consent/account');
     expect(urls).toEqual(['https://api.rawchunks.space/api/user/consent/account']);
   });
 });
