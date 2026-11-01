@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
-import { resolveCreditOwner } from './auth.js';
+import { authenticate } from './auth.js';
 import { creditStore, type CreditLotSource } from './store.js';
 import type { SessionPaymentConfig, SessionPaymentOptions, SessionPaymentResolver } from '../broker/payment.js';
 
@@ -29,7 +29,7 @@ export async function admitCredits(
   if (process.env.CREDITS_ENABLED !== 'true') {
     throw Object.assign(new Error('Prepaid Credits unavailable'), { statusCode: 503 });
   }
-  const identity = await resolveCreditOwner(req);
+  const identity = await authenticate(req);
   const store = creditStore();
   const rawSource = req.headers['x-credit-source'];
   if (rawSource !== 'promo' && rawSource !== 'card') {
@@ -94,6 +94,7 @@ export async function admitCredits(
           hold.id,
           JSON.stringify({
             kind: 'stream',
+            version: 1,
             songId: song.id,
             userAddress: identity.userAddress,
             rate: String(Math.round(song.stream_price * 1000000)),
@@ -108,7 +109,7 @@ export async function admitCredits(
 }
 
 export async function checkpointCredits(req: FastifyRequest) {
-  const identity = await resolveCreditOwner(req);
+  const identity = await authenticate(req);
   const store = creditStore();
   const input = req.body as { paymentIntentId?: string; listenedSeconds?: number; terminal?: boolean };
   if (!input?.paymentIntentId || !Number.isFinite(input.listenedSeconds) || input.listenedSeconds! < 0) {
@@ -117,14 +118,14 @@ export async function checkpointCredits(req: FastifyRequest) {
   const row = await store.tx(async c =>
     (await c.query('SELECT * FROM credit_holds WHERE environment=$1 AND id=$2 AND owner=$3', [store.environment, input.paymentIntentId, identity.owner])).rows[0],
   );
-  if (!row || row.context?.kind !== 'stream' || row.context.songId !== (req.params as any).id || !identity.addresses.includes(row.context.userAddress)) {
+  if (!row || row.context?.kind !== 'stream' || row.context.version !== 1 || row.context.songId !== (req.params as any).id || !identity.addresses.includes(row.context.userAddress)) {
     throw Object.assign(new Error('Unknown playback operation'), { statusCode: 404 });
   }
-  const millis = Math.min(row.context.durationMs, Math.floor(input.listenedSeconds! * 1000), Math.max(0, Date.now() - row.context.startedAt));
+  const millis = Math.min(row.context.durationMs, Math.round(input.listenedSeconds! * 1000));
   const cumulative = (BigInt(millis) * BigInt(row.context.rate)) / 60000n;
-  await store.commit(identity.owner, row.id, cumulative);
+  const result = await store.commit(identity.owner, row.id, cumulative, millis);
   if (input.terminal) await store.release(identity.owner, row.id);
-  return { success: true, result: { billedWei: String(cumulative), status: 'credited' } };
+  return { success: true, result: { billedWei: result.billedWei, deltaWei: result.deltaWei, acceptedListenedSeconds: result.acceptedMs / 1000, status: 'credited' } };
 }
 
 export function installCreditBilling(app: FastifyInstance) {
