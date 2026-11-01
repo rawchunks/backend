@@ -8,13 +8,21 @@ export const generateSchema = z.object({
   bpm: z.number().finite().min(30).max(300).optional(), keyScale: z.string().optional(),
   audioDuration: z.number().finite().min(5).max(300).optional(), seed: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(), voiceId: z.string().min(1).optional(),
   voiceReferenceUrl: z.string().url().optional(), voiceCoverStrength: z.number().finite().min(0).max(1).optional(), tags: z.array(z.string()).optional(),
+  genres: z.array(z.string()).optional(), production: z.array(z.string()).optional(), mood: z.array(z.string()).optional(), vocal: z.array(z.string()).optional(),
+  timeSignature: z.enum(['2', '3', '4', '6']).optional(),
   voiceMode: z.enum(['reference', 'trained']).optional(),
 }).superRefine((value, context) => {
-  const hasPrompt = (value.prompt ?? '').trim().length >= 3;
+  const promptTrimmed = (value.prompt ?? '').trim();
+  if (promptTrimmed.length > 0 && promptTrimmed.length < 3) {
+    context.addIssue({ code: 'custom', path: ['prompt'], message: 'Prompt must be at least 3 characters' });
+  }
+  const hasPrompt = promptTrimmed.length >= 3;
   const hasLyrics = (value.lyrics ?? '').trim().length >= 3;
-  if (value.instrumental && !hasPrompt) {
+  const hasTags = [value.tags, value.genres, value.production, value.mood, value.instrumental ? [] : value.vocal]
+    .some(list => Array.isArray(list) && list.some(tag => tag.trim().length > 0));
+  if (value.instrumental && !hasPrompt && !hasTags) {
     context.addIssue({ code: 'custom', path: ['prompt'], message: 'Prompt is required for instrumental songs (min 3 chars)' });
-  } else if (!value.instrumental && !hasPrompt && !hasLyrics) {
+  } else if (!value.instrumental && !hasPrompt && !hasLyrics && !hasTags) {
     context.addIssue({ code: 'custom', path: ['prompt'], message: 'Either prompt or lyrics is required for non-instrumental songs' });
   }
   if (value.voiceId && value.voiceReferenceUrl) context.addIssue({ code: 'custom', path: ['voiceReferenceUrl'], message: 'Choose a saved voice or direct reference audio' });
