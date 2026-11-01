@@ -6,6 +6,8 @@ import { takes, type Take, type NewTake } from './schema/takes.js';
 import { commits } from './schema/commits.js';
 import { resolveIdentityAddresses, RequestError } from './users.js';
 import { cacheGet, cacheSet, cacheDel } from './cache.js';
+import { ensureGenreCovers, normalizeGenreSlug } from './genres.js';
+import { isNonGenreTag, partitionSongTags } from '../options.js';
 import { randomUUID } from 'node:crypto';
 
 const MARKET_FOLDS_CACHE_PREFIX = 'songs:market:folds:';
@@ -23,7 +25,26 @@ export async function invalidateMarketSongCache(): Promise<void> {
 }
 
 export async function createSong(songData: NewSong): Promise<Song> {
-  const result = await songDb.insert(songs).values({ ...songData, ...(songData.source ? { licenses: 0, license_price: 0 } : {}), creator: /^0x/i.test(songData.creator) ? songData.creator.toLowerCase() : songData.creator }).returning();
+  const partitioned = partitionSongTags({
+    genres: songData.genres,
+    production: songData.production,
+    mood: songData.mood,
+    vocal: songData.vocal,
+    tags: songData.tags,
+  });
+  const result = await songDb.insert(songs).values({
+    ...songData,
+    tags: partitioned.genres,
+    genres: partitioned.genres,
+    production: partitioned.production,
+    mood: partitioned.mood,
+    vocal: partitioned.vocal,
+    ...(songData.source ? { licenses: 0, license_price: 0 } : {}),
+    creator: /^0x/i.test(songData.creator) ? songData.creator.toLowerCase() : songData.creator,
+  }).returning();
+  if (partitioned.genres.length > 0) {
+    void ensureGenreCovers(partitioned.genres).catch(() => {});
+  }
   await invalidateMarketSongCache();
   return result[0];
 }
@@ -50,10 +71,10 @@ export async function copySong(id: string): Promise<Song> {
   const statements: any[] = [
     songDb.execute(sql`select pg_advisory_xact_lock(hashtextextended(${family}, 0))`),
     songDb.execute(sql`
-    insert into songs (id, title, family, basis, creator, source, version, url, duration, tags, licenses, stream_price, license_price, network, image, album_id)
+    insert into songs (id, title, family, basis, creator, source, version, url, duration, tags, genres, production, mood, vocal, licenses, stream_price, license_price, network, image, album_id)
     select ${next}, title, ${family}, ${id}, creator, source,
       (select coalesce(max(version), 0) + 1 from songs where coalesce(family, id) = ${family}),
-      url, duration, tags, case when source is null then licenses else 0 end, stream_price, case when source is null then license_price else 0 end, network, image, album_id
+      url, duration, tags, genres, production, mood, vocal, case when source is null then licenses else 0 end, stream_price, case when source is null then license_price else 0 end, network, image, album_id
     from songs where id = ${id} and not exists (${draft})
     `),
   ];
@@ -122,11 +143,37 @@ export async function updateSong(id: string, updates: Partial<NewSong>): Promise
     if (song?.metadata_cid && ['url', 'duration', 'source', 'version', 'family', 'basis'].some(key => key in updates)) throw new RequestError('Open an editable version before changing this song', 409);
     if ((song?.source || updates.source) && (updates.licenses || updates.license_price)) throw new RequestError('Remixes cannot be licensed');
   }
+  const normalizedUpdates: Partial<NewSong> = { ...updates };
+  if (['tags', 'genres', 'production', 'mood', 'vocal'].some((key) => key in updates)) {
+    const partitioned = partitionSongTags({
+      genres: updates.genres,
+      production: updates.production,
+      mood: updates.mood,
+      vocal: updates.vocal,
+      tags: updates.tags,
+    });
+    if ('tags' in updates || 'genres' in updates) {
+      normalizedUpdates.genres = partitioned.genres;
+      normalizedUpdates.tags = partitioned.genres;
+    }
+    if ('production' in updates || partitioned.production.length > 0) {
+      normalizedUpdates.production = partitioned.production;
+    }
+    if ('mood' in updates || partitioned.mood.length > 0) {
+      normalizedUpdates.mood = partitioned.mood;
+    }
+    if ('vocal' in updates || partitioned.vocal.length > 0) {
+      normalizedUpdates.vocal = partitioned.vocal;
+    }
+  }
   const result = await songDb
     .update(songs)
-    .set(updates)
+    .set(normalizedUpdates)
     .where(eq(songs.id, id))
     .returning();
+  if (Array.isArray(normalizedUpdates.genres) && normalizedUpdates.genres.length > 0) {
+    void ensureGenreCovers(normalizedUpdates.genres).catch(() => {});
+  }
   await invalidateMarketSongCache();
   return result[0] || null;
 }
@@ -227,6 +274,8 @@ export interface MarketFoldGroup {
   key: string;
   label: string;
   total: number;
+  image?: string | null;
+  imageStatus?: 'pending' | 'ready' | 'failed';
   songs: Song[];
 }
 
@@ -422,13 +471,28 @@ export async function finalizeSong(songId: string, outputs: NewSong[], master: N
     songDb.update(songs).set({ url: outputs[0].url, duration: outputs[0].duration })
       .where(and(eq(songs.id, songId), pending)),
   ];
-  for (const output of outputs.slice(1)) statements.push(songDb.execute(sql`
-    insert into songs (id, title, version, source, creator, url, licenses, stream_price, license_price, duration, tags, image, album_id)
-    select ${output.id}, ${output.title}, ${output.version ?? 1}, ${output.source ?? null}, ${output.creator}, ${output.url},
-      ${output.source ? 0 : output.licenses ?? 0}, ${output.stream_price ?? .02}, ${output.source ? 0 : output.license_price ?? 25},
-      ${output.duration ?? null}, ${JSON.stringify(output.tags ?? [])}::jsonb, ${output.image ?? null}, ${output.album_id ?? null}
-    where ${pending} on conflict (id) do nothing
-  `));
+  for (const output of outputs.slice(1)) {
+    const partitioned = partitionSongTags({
+      genres: output.genres,
+      production: output.production,
+      mood: output.mood,
+      vocal: output.vocal,
+      tags: output.tags,
+    });
+    statements.push(songDb.execute(sql`
+      insert into songs (id, title, version, source, creator, url, licenses, stream_price, license_price, duration, tags, genres, production, mood, vocal, image, album_id)
+      select ${output.id}, ${output.title}, ${output.version ?? 1}, ${output.source ?? null}, ${output.creator}, ${output.url},
+        ${output.source ? 0 : output.licenses ?? 0}, ${output.stream_price ?? .02}, ${output.source ? 0 : output.license_price ?? 25},
+        ${output.duration ?? null},
+        ${JSON.stringify(partitioned.genres)}::jsonb,
+        ${JSON.stringify(partitioned.genres)}::jsonb,
+        ${JSON.stringify(partitioned.production)}::jsonb,
+        ${JSON.stringify(partitioned.mood)}::jsonb,
+        ${JSON.stringify(partitioned.vocal)}::jsonb,
+        ${output.image ?? null}, ${output.album_id ?? null}
+      where ${pending} on conflict (id) do nothing
+    `));
+  }
   statements.push(songDb.execute(sql`
     insert into stems (id, song_id, name, url, waveform_peaks_url, volume, pan, is_muted, is_solo)
     select ${master.id}, ${songId}, ${master.name}, ${master.url}, ${master.waveform_peaks_url ?? null},
