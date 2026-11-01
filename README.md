@@ -8,7 +8,7 @@ The API behind the Rawchunks app and third-party music integrations. It provides
 
 | Module | Scope |
 | --- | --- |
-| [generation](generation/README.md) | Fast and Studio Master generation, lyrics controls, artwork and job status. |
+| [generation](generation/README.md) | Fast and Master generation, lyrics controls, artwork and job status. |
 | [editing](editing/README.md) | Section edits, layers, stems, takes, arrangement audio and history. |
 | [databases](databases/README.md) | Songs, users, albums, voices and saved project records. |
 | voice | Vocal references and trained voice preparation. |

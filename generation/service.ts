@@ -223,7 +223,12 @@ export class Service {
         title: index === 0 ? parent.title : `${parent.title} (Var ${index + 1})`,
         version: 1, source: index === 0 ? parent.source : songId, creator: parent.creator, url,
         licenses: index === 0 ? parent.licenses : 0, stream_price: parent.stream_price, license_price: index === 0 ? parent.license_price : 0,
-        duration: ctx.durations?.[index], tags: index === 0 ? parent.tags : [...parent.tags, 'ALT MIX'],
+        duration: ctx.durations?.[index],
+        tags: parent.genres?.length ? parent.genres : parent.tags,
+        genres: parent.genres ?? parent.tags,
+        production: parent.production ?? [],
+        mood: parent.mood ?? [],
+        vocal: parent.vocal ?? [],
         image: parent.image, album_id: parent.album_id,
       }));
       const versions = audioUrls.map((url, index) => ({

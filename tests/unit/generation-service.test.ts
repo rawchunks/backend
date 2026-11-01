@@ -157,7 +157,7 @@ describe('generation Service: status, persistence and non-destructive takes', ()
     mocks.queryResult.mockResolvedValue(ready(['raw-a.wav', 'raw-b.wav'], [{ duration: '41.6' }, { duration: 50.2 }]));
     const result = await api.checkStatusAndFinalize('task-1', 'song-1');
     const [, outputs, , versions] = mocks.finalizeSong.mock.calls[0];
-    expect(outputs[1]).toMatchObject({ id: 'song-1-var2', title: 'Song (Var 2)', creator: 'creator', source: 'song-1', duration: 50, tags: ['SOUL', 'ALT MIX'] });
+    expect(outputs[1]).toMatchObject({ id: 'song-1-var2', title: 'Song (Var 2)', creator: 'creator', source: 'song-1', duration: 50, tags: ['SOUL'] });
     expect(versions.map((take: any) => take.is_active)).toEqual([true, false]);
     expect(result).toMatchObject({ songAId: 'song-1', songBId: 'song-1-var2', durations: [42, 50], audioUrls: [expect.stringMatching(/\/1\.wav$/), expect.stringMatching(/\/2\.wav$/)] });
   });

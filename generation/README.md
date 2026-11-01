@@ -1,6 +1,6 @@
 # Generation
 
-Generate vocal or instrumental music with Fast or Studio Master. Requests support a sound description, lyrics, vocal language, duration, tempo, key and a vocal reference or prepared voice.
+Generate vocal or instrumental music with Fast or Master. Requests support a sound description, lyrics, vocal language, duration, tempo, key and a vocal reference or prepared voice.
 
 This module also handles prompt and lyrics formatting, artwork generation and upload, and generation status. A submitted music job returns identifiers you use to follow progress and retrieve the finished song.
 
