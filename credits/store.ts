@@ -93,6 +93,8 @@ export class CreditStore {
       await c.query('ALTER TABLE credit_holds ADD COLUMN IF NOT EXISTS owner text');
       await c.query("ALTER TABLE credit_holds ADD COLUMN IF NOT EXISTS credit_source text NOT NULL DEFAULT 'card'");
       await c.query("ALTER TABLE credit_holds ALTER COLUMN session_id SET DEFAULT 'pool'");
+      // Direct Credits use this column as a source marker; reservations no longer belong to credit_sessions.
+      await c.query('ALTER TABLE credit_holds DROP CONSTRAINT IF EXISTS credit_holds_environment_session_id_fkey');
 
       const hasSessions = (await c.query("SELECT to_regclass('public.credit_sessions') AS reg")).rows[0]?.reg;
       if (hasSessions) {
