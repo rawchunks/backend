@@ -532,6 +532,121 @@ export interface PartitionedSongTags {
   allConditioningTags: string[];
 }
 
+export function partitionSongTags(input: {
+  genres?: readonly string[] | null;
+  production?: readonly string[] | null;
+  mood?: readonly string[] | null;
+  vocal?: readonly string[] | null;
+  tags?: readonly string[] | null;
+  instrumental?: boolean;
+}): PartitionedSongTags {
+  const genres: string[] = [];
+  const production: string[] = [];
+  const mood: string[] = [];
+  const vocal: string[] = [];
+
+  const seenGenres = new Set<string>();
+  const seenProduction = new Set<string>();
+  const seenMood = new Set<string>();
+  const seenVocal = new Set<string>();
+
+  const addGenre = (raw: string) => {
+    const trimmed = raw.trim();
+    const slug = toTagSlug(trimmed);
+    if (!slug || seenGenres.has(slug)) return;
+    seenGenres.add(slug);
+    genres.push(GENRE_SLUG_MAP.get(slug) ?? trimmed);
+  };
+
+  const addProduction = (raw: string) => {
+    const trimmed = raw.trim();
+    const slug = toTagSlug(trimmed);
+    if (!slug || seenProduction.has(slug)) return;
+    seenProduction.add(slug);
+    production.push(PRODUCTION_SLUG_MAP.get(slug) ?? trimmed);
+  };
+
+  const addMood = (raw: string) => {
+    const trimmed = raw.trim();
+    const slug = toTagSlug(trimmed);
+    if (!slug || seenMood.has(slug)) return;
+    seenMood.add(slug);
+    mood.push(MOOD_SLUG_MAP.get(slug) ?? trimmed);
+  };
+
+  const addVocal = (raw: string) => {
+    if (input.instrumental) return;
+    const trimmed = raw.trim();
+    const slug = toTagSlug(trimmed);
+    if (!slug || seenVocal.has(slug)) return;
+    seenVocal.add(slug);
+    vocal.push(VOCAL_SLUG_MAP.get(slug) ?? trimmed);
+  };
+
+  const classifyAndAdd = (raw: unknown, preferredCategory?: 'genres' | 'production' | 'mood' | 'vocal') => {
+    if (typeof raw !== 'string') return;
+    const trimmed = raw.trim();
+    const slug = toTagSlug(trimmed);
+    if (!slug || slug === 'alt-mix' || slug === 'uncategorized' || slug === 'all') return;
+
+    if (PRODUCTION_SLUG_MAP.has(slug)) {
+      addProduction(trimmed);
+      return;
+    }
+    if (MOOD_SLUG_MAP.has(slug)) {
+      addMood(trimmed);
+      return;
+    }
+    if (VOCAL_SLUG_MAP.has(slug)) {
+      addVocal(trimmed);
+      return;
+    }
+    if (GENRE_SLUG_MAP.has(slug)) {
+      addGenre(trimmed);
+      return;
+    }
+
+    if (preferredCategory === 'production') {
+      addProduction(trimmed);
+    } else if (preferredCategory === 'mood') {
+      addMood(trimmed);
+    } else if (preferredCategory === 'vocal') {
+      addVocal(trimmed);
+    } else {
+      addGenre(trimmed);
+    }
+  };
+
+  if (Array.isArray(input.genres)) {
+    for (const item of input.genres) classifyAndAdd(item, 'genres');
+  }
+  if (Array.isArray(input.production)) {
+    for (const item of input.production) classifyAndAdd(item, 'production');
+  }
+  if (Array.isArray(input.mood)) {
+    for (const item of input.mood) classifyAndAdd(item, 'mood');
+  }
+  if (!input.instrumental && Array.isArray(input.vocal)) {
+    for (const item of input.vocal) classifyAndAdd(item, 'vocal');
+  }
+  if (Array.isArray(input.tags)) {
+    for (const item of input.tags) classifyAndAdd(item);
+  }
+
+  const allConditioningTags: string[] = [];
+  const seenAll = new Set<string>();
+  for (const list of [genres, production, mood, vocal]) {
+    for (const tag of list) {
+      const slug = toTagSlug(tag);
+      if (!slug || seenAll.has(slug)) continue;
+      seenAll.add(slug);
+      allConditioningTags.push(tag);
+    }
+  }
+
+  return { genres, production, mood, vocal, allConditioningTags };
+}
+
 export const ROOT_NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'] as const;
 
 export const SCALE_MODES = [
