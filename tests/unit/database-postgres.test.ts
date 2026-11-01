@@ -21,7 +21,7 @@ describe('production DDL and queries on disposable PostgreSQL engines', () => {
     await runMigrations();
     const userTables = (await postgres.user.query<{ table_name: string }>("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")).rows.map((row) => row.table_name);
     const songTables = (await postgres.song.query<{ table_name: string }>("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")).rows.map((row) => row.table_name);
-    expect(userTables.sort()).toEqual(['wallet_pairs']); expect(songTables.sort()).toEqual(['albums', 'commits', 'songs', 'stems', 'takes', 'voice_adapters', 'voices']);
+    expect(userTables.sort()).toEqual(['wallet_pairs']); expect(songTables.sort()).toEqual(['albums', 'commits', 'genre_covers', 'playlists', 'songs', 'stems', 'takes', 'voice_adapters', 'voices']);
   });
   it('repairs stale active flags by matching the persisted lane URL without changing any audio', async () => {
     await createSong(f.song); await createStem(f.stem); await createTake({ ...f.take, url: f.stem.url });
