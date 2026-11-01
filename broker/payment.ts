@@ -1,5 +1,6 @@
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual, randomUUID } from 'node:crypto';
 import type { FastifyRequest, FastifyReply } from 'fastify';
+import { valkey, getTaskContext, withJobLock, type JobLease } from './valkey.js';
 
 export interface KeyPayload {
   sub: string;
@@ -17,6 +18,7 @@ export interface SessionPaymentConfig {
   action: string;
   payTo?: string;
   creatorAddress?: string;
+  durationMs?: number;
 }
 
 export const PRICING = {
@@ -251,57 +253,130 @@ export async function settleSessionPaymentAsync(params: {
   }
 }
 
-export async function prepareStreamPaymentIntent(params: {
+type PaymentBody = Record<string, unknown>;
+export class PaymentError extends Error {
+  constructor(public statusCode: number, public body: PaymentBody, public headers: Record<string, string> = {}) {
+    super(typeof body.error === 'string' ? body.error : 'Payment request failed');
+  }
+}
+export interface PlaybackReceipt {
+  status: string;
+  acceptedListenedSeconds: number;
+  billedWei: string;
+  deltaWei: string;
+  txHash?: string;
+  headers?: Record<string, string>;
+}
+interface PaymentObligation {
+  millis: number;
+  cumulativeWei: string;
+  prepare: PaymentBody;
+  settle?: PaymentBody;
+  receipt?: PlaybackReceipt;
+}
+interface PlaybackPayment {
+  id: string;
   token: string;
   network: string;
-  userAddress: string;
-  maxAmountWei: string;
+  account: string;
   songId: string;
-  creatorAddress: string;
-  payTo?: string;
-}): Promise<string | null> {
+  creator: string;
+  treasury: string;
+  rate: string;
+  durationMs: number;
+  admission: PaymentBody;
+  intent?: string;
+  observedMs: number;
+  acceptedMs: number;
+  billedWei: string;
+  terminal: boolean;
+  closed: boolean;
+  usedAdmission: boolean;
+  pending?: PaymentObligation;
+  obligations: PaymentObligation[];
+}
+const recoverySet = 'rawchunks:payments';
+const durableStatuses = new Set(['queued', 'submitted', 'confirmed']);
+
+async function sendPayment(state: PlaybackPayment, operation: string, body: PaymentBody) {
+  let response: Response;
   try {
-    const composeUrl = getComposeApiUrl();
-    const payTo = params.payTo || getPlatformTreasury(params.network);
-
-    const headers: Record<string, string> = {
-      'Authorization': `Bearer ${params.token}`,
-      'Content-Type': 'application/json',
-      'x-network-id': params.network,
-      'x-session-user-address': params.userAddress,
-    };
-
-    const prepareBody: Record<string, unknown> = {
-      maxAmountWei: params.maxAmountWei,
-      service: 'rawchunks',
-      action: 'stream-playback',
-      resource: `/api/songs/${params.songId}/stream`,
-      method: 'GET',
-      payTo,
-      royalties: {
-        creator: params.creatorAddress,
-        treasury: payTo,
-      },
-    };
-
-    const prepareRes = await fetch(`${composeUrl}/api/payments/prepare`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(prepareBody),
+    response = await fetch(`${getComposeApiUrl()}/api/payments/${operation}`, {
+      method: 'POST', signal: AbortSignal.timeout(20000),
+      headers: { Authorization: `Bearer ${state.token}`, 'Content-Type': 'application/json', 'x-network-id': state.network, 'x-session-user-address': state.account },
+      body: JSON.stringify(body),
     });
+  } catch { throw new PaymentError(503, { error: 'Payment provider unavailable; obligation retained' }); }
+  const headers: Record<string, string> = {};
+  response.headers.forEach((value, name) => {
+    if (/^(payment-|x-payment-|x-session-|x-key-|x-settlement|x-transaction-|retry-after)/i.test(name)) headers[name] = value;
+  });
+  const result = await response.json().catch(() => null) as PaymentBody | null;
+  if (!response.ok) throw new PaymentError(response.status, result || { error: 'Payment provider rejected the request' }, headers);
+  if (!result || typeof result !== 'object') throw new PaymentError(502, { error: 'Invalid payment provider response' }, headers);
+  return { result, headers };
+}
 
-    if (!prepareRes.ok) {
-      const errText = await prepareRes.text().catch(() => '');
-      console.warn(`[Stream Payment] Prepare failed (${prepareRes.status}):`, errText);
-      return null;
-    }
-
-    const prepareData = (await prepareRes.json()) as { paymentIntentId?: string };
-    return prepareData.paymentIntentId || null;
-  } catch (err: any) {
-    console.warn('[Stream Payment] Prepare error:', err?.message || err);
-    return null;
+async function admitPlayback(state: PlaybackPayment, lease: JobLease) {
+  if (state.creator && state.creator.startsWith('0x') === state.network.startsWith('solana:')) {
+    throw new PaymentError(409, { error: 'Playback payout belongs to another payment network; restart playback' });
   }
+  if (!state.intent) {
+    const { result } = await sendPayment(state, 'prepare', state.admission);
+    if (typeof result.paymentIntentId !== 'string' || !result.paymentIntentId) throw new PaymentError(502, { error: 'Payment provider did not admit playback' });
+    state.intent = result.paymentIntentId;
+    await lease.save(state.id, state);
+  }
+  await valkey.set(playbackKey(state.intent), state.id);
+}
+
+async function resolveStreamCreator(creatorAddress: string, network: string): Promise<string> {
+  if (!creatorAddress) return '';
+  const { parseAddress, getWalletPair } = await import('../databases/users.js');
+  const creator = parseAddress(creatorAddress);
+  const kind = network.startsWith('solana:') ? 'svm' : 'evm';
+  if (creator.kind === kind) return creator.value;
+  const pair = await getWalletPair(creator.value);
+  const payout = kind === 'svm' ? pair?.svmAddress : pair?.evmAddress;
+  if (payout) {
+    try {
+      const parsed = parseAddress(payout);
+      if (parsed.kind === kind) return parsed.value;
+    } catch { /* An incomplete or invalid pair cannot receive this payment. */ }
+  }
+  throw new PaymentError(409, { error: 'Creator payout unavailable for the session payment network', network });
+}
+
+export async function prepareStreamPaymentIntent(params: {
+  token: string; network: string; userAddress: string; maxAmountWei: string; songId: string;
+  creatorAddress: string; payTo?: string; streamPriceUsd?: number; durationMs?: number; idempotencyKey?: string;
+}): Promise<string> {
+  const identity = params.idempotencyKey || randomUUID();
+  const id = `payment:${createHash('sha256').update(`${params.token}:${params.network}:${params.songId}:${identity}`).digest('hex')}`;
+  return withJobLock(id, async lease => {
+    let state = await getTaskContext<PlaybackPayment>(id);
+    if (!state) {
+      const rate = Math.round((params.streamPriceUsd ?? Number(params.maxAmountWei) / 1000000) * 1000000);
+      const durationMs = params.durationMs ?? 60000;
+      if (!Number.isSafeInteger(rate) || rate < 0 || !Number.isSafeInteger(durationMs) || durationMs <= 0) throw new PaymentError(400, { error: 'Invalid playback price or duration' });
+      const treasury = params.payTo || getPlatformTreasury(params.network);
+      const creator = await resolveStreamCreator(params.creatorAddress, params.network);
+      state = {
+        id, token: params.token, network: params.network, account: params.userAddress, songId: params.songId,
+        creator, treasury, rate: String(rate), durationMs,
+        admission: {
+          maxAmountWei: params.maxAmountWei, service: 'rawchunks', action: 'stream-playback',
+          resource: `/api/songs/${params.songId}/stream`, method: 'GET', payTo: treasury,
+          royalties: { creator: creator || undefined, treasury }, runId: id, idempotencyKey: `${id}:admission`,
+        },
+        observedMs: 0, acceptedMs: 0, billedWei: '0', terminal: false, closed: false, usedAdmission: false, obligations: [],
+      };
+      await valkey.sadd(recoverySet, id);
+      await lease.save(id, state);
+    }
+    await admitPlayback(state, lease);
+    return state.intent!;
+  });
 }
 
 export async function settleStreamCheckpoint(params: {
@@ -366,6 +441,7 @@ export async function settleStreamCheckpoint(params: {
   }
 }
 
+let recoveryCursor = '0';
 export function requireSessionPayment(
   configOrResolver: SessionPaymentConfig | SessionPaymentResolver,
   options?: SessionPaymentOptions
@@ -435,7 +511,7 @@ export function requireSessionPayment(
     const currentUsed = getTrackedBudgetUsed(payload.keyId, payload.budgetUsed || 0);
     const remaining = (payload.budgetLimit || 0) - currentUsed;
 
-    if (remaining < requiredAmount) {
+    if (!options?.metered && remaining < requiredAmount) {
       return reply.status(402)
         .header('x-session-budget-limit', String(payload.budgetLimit))
         .header('x-session-budget-used', String(currentUsed))
@@ -456,25 +532,22 @@ export function requireSessionPayment(
     }
 
     if (options?.metered) {
-      reply.header('x-session-budget-limit', String(payload.budgetLimit));
-      reply.header('x-session-budget-used', String(currentUsed));
-      reply.header('x-session-budget-remaining', String(remaining));
-      reply.header('access-control-expose-headers', 'PAYMENT-REQUIRED, x-session-budget-limit, x-session-budget-used, x-session-budget-remaining');
-
-      request.headers['x-session-user-address'] = payload.sub;
-      request.headers['x-network-id'] = resolvedNetwork;
-
-      const songId = (request.params as any)?.id || '';
-      const paymentIntentId = await prepareStreamPaymentIntent({
-        token,
-        network: resolvedNetwork,
-        userAddress: payload.sub,
-        maxAmountWei: config.amountWei,
-        songId,
-        creatorAddress: config.creatorAddress || '',
-        payTo: config.payTo,
-      });
-      (request as any).paymentIntentId = paymentIntentId;
+      try {
+        const intent = await prepareStreamPaymentIntent({
+          token, network: resolvedNetwork, userAddress: payload.sub, maxAmountWei: config.amountWei,
+          songId: (request.params as any)?.id || '', creatorAddress: config.creatorAddress || '', payTo: config.payTo,
+          streamPriceUsd: config.priceUsd, durationMs: config.durationMs,
+          idempotencyKey: typeof request.headers['x-idempotency-key'] === 'string' ? request.headers['x-idempotency-key'] : undefined,
+        });
+        request.headers['x-session-user-address'] = payload.sub;
+        request.headers['x-network-id'] = resolvedNetwork;
+        (request as any).paymentIntentId = intent;
+      } catch (error) {
+        if (!(error instanceof PaymentError)) throw error;
+        for (const [name, value] of Object.entries(error.headers)) reply.header(name, value);
+        reply.header('access-control-expose-headers', Object.keys(error.headers).join(', '));
+        return reply.status(error.statusCode).send(error.body);
+      }
       return;
     }
 
