@@ -31,6 +31,7 @@ import {
   incrementPlaylistPlay,
   deletePlaylist,
 } from './playlists.js';
+import { ensureGenreCovers } from './genres.js';
 
 const text = z.string().refine(value => value.trim().length > 0, 'Value must not be empty');
 const address = text.refine(value => { try { parseAddress(value); return true; } catch { return false; } }, 'Invalid wallet address');
@@ -71,7 +72,12 @@ const songPatch = z.object({
   title: text.optional(), version: z.number().int().positive().optional(), source: text.nullable().optional(),
   url: text.optional(), licenses: z.number().int().nonnegative().optional(),
   stream_price: z.number().finite().nonnegative().optional(), license_price: z.number().finite().nonnegative().optional(),
-  duration: z.number().finite().nonnegative().nullable().optional(), tags: z.array(z.string()).optional(),
+  duration: z.number().finite().nonnegative().nullable().optional(),
+  tags: z.array(z.string()).optional(),
+  genres: z.array(z.string()).optional(),
+  production: z.array(z.string()).optional(),
+  mood: z.array(z.string()).optional(),
+  vocal: z.array(z.string()).optional(),
   metadata_cid: z.string().nullable().optional(),
   image: z.string().nullable().optional(),
   album_id: z.string().nullable().optional(),
@@ -342,11 +348,24 @@ export const databaseRouter: FastifyPluginAsync = async app => {
   });
   app.get('/market/folds', async (request, reply) => {
     try {
-      const { limit } = request.query as { limit?: string };
-      const foldLimit = limit ? Math.min(Math.max(Number(limit) || 20, 4), 50) : 20;
-      const folds = await getMarketFolds(foldLimit);
+      const { limit, windowMinutes } = request.query as { limit?: string; windowMinutes?: string };
+      const foldLimit = limit ? Math.min(Math.max(Number(limit) || 50, 4), 100) : 50;
+      const winMin = windowMinutes ? Number(windowMinutes) || 60 : 60;
+      const folds = await getMarketFolds(foldLimit, winMin);
       return reply.send(folds);
     } catch (error) { return failure(request, reply, error, 'Failed to load market folds'); }
+  });
+  app.get('/genres/covers', async (request, reply) => {
+    try {
+      const { genres } = request.query as { genres?: string | string[] };
+      const rawList = Array.isArray(genres)
+        ? genres
+        : typeof genres === 'string'
+          ? genres.split(',')
+          : [];
+      const covers = await ensureGenreCovers(rawList);
+      return reply.send({ covers });
+    } catch (error) { return failure(request, reply, error, 'Failed to load genre covers'); }
   });
   app.post('/songs/:id/play', async (request, reply) => {
     try {
@@ -483,7 +502,13 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       if (!source.chain_song_id || !source.network || !source.url) throw new RequestError('The source song has not been minted', 409);
       const song = await createSong({
         id: `sng-${randomUUID()}`, title: source.title, source: source.id, creator, url: source.url,
-        duration: source.duration, tags: source.tags, licenses: 0, image: source.image,
+        duration: source.duration,
+        tags: source.genres?.length ? source.genres : source.tags,
+        genres: source.genres,
+        production: source.production,
+        mood: source.mood,
+        vocal: source.vocal,
+        licenses: 0, image: source.image,
         stream_price: source.stream_price, license_price: 0, network: source.network,
       });
       return reply.status(201).send(song);
