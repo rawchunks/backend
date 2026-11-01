@@ -124,6 +124,82 @@ export async function runMigrations() {
   await songSql`ALTER TABLE playlists ALTER COLUMN public SET DEFAULT FALSE;`;
 
   await songSql`
+    CREATE TABLE IF NOT EXISTS genre_covers (
+      slug TEXT PRIMARY KEY,
+      label TEXT NOT NULL,
+      image_url TEXT,
+      status TEXT DEFAULT 'pending' NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+    );
+  `;
+  await songSql`
+    INSERT INTO genre_covers (slug, label, image_url, status)
+    VALUES
+      ('acid-techno', 'acid-techno', '/genres/acid-techno.jpeg', 'ready'),
+      ('airy-lead-vocals', 'airy-lead-vocals', '/genres/airy-lead-vocals.jpeg', 'ready'),
+      ('cinematic-strings', 'cinematic-strings', '/genres/cinematic-strings.jpeg', 'ready'),
+      ('crisp-acoustic-drums', 'crisp-acoustic-drums', '/genres/crisp-acoustic-drums.jpeg', 'ready'),
+      ('electronic', 'electronic', '/genres/electronic.jpeg', 'ready'),
+      ('funky-electric-guitar', 'funky-electric-guitar', '/genres/funky-electric-guitar.jpeg', 'ready'),
+      ('lo-fi-tape-saturation', 'lo-fi-tape-saturation', '/genres/lo-fi-tape-saturation.jpeg', 'ready'),
+      ('lush-backing-harmonies', 'lush-backing-harmonies', '/genres/lush-backing-harmonies.jpeg', 'ready'),
+      ('neural-glitch', 'neural-glitch', '/genres/neural-glitch.jpeg', 'ready'),
+      ('punchy-808-bass', 'punchy-808-bass', '/genres/punchy-808-bass.jpeg', 'ready'),
+      ('rock', 'rock', '/genres/rock.jpeg', 'ready'),
+      ('warm-analog-synth', 'warm-analog-synth', '/genres/warm-analog-synth.jpeg', 'ready')
+    ON CONFLICT (slug) DO NOTHING;
+  `;
+
+  const existingSongs = await songSql`
+    SELECT id, tags, genres, production, mood, vocal FROM songs;
+  `;
+  for (const row of existingSongs) {
+    const rawTags = Array.isArray(row.tags) ? row.tags : [];
+    const rawGenres = Array.isArray(row.genres) ? row.genres : [];
+    const rawProduction = Array.isArray(row.production) ? row.production : [];
+    const rawMood = Array.isArray(row.mood) ? row.mood : [];
+    const rawVocal = Array.isArray(row.vocal) ? row.vocal : [];
+    const partitioned = partitionSongTags({
+      genres: rawGenres,
+      production: rawProduction,
+      mood: rawMood,
+      vocal: rawVocal,
+      tags: rawTags,
+    });
+    const nextTagsJson = JSON.stringify(partitioned.genres);
+    const nextGenresJson = JSON.stringify(partitioned.genres);
+    const nextProductionJson = JSON.stringify(partitioned.production);
+    const nextMoodJson = JSON.stringify(partitioned.mood);
+    const nextVocalJson = JSON.stringify(partitioned.vocal);
+    if (
+      JSON.stringify(rawTags) !== nextTagsJson ||
+      JSON.stringify(rawGenres) !== nextGenresJson ||
+      JSON.stringify(rawProduction) !== nextProductionJson ||
+      JSON.stringify(rawMood) !== nextMoodJson ||
+      JSON.stringify(rawVocal) !== nextVocalJson
+    ) {
+      await songSql`
+        UPDATE songs
+        SET
+          tags = ${nextTagsJson}::jsonb,
+          genres = ${nextGenresJson}::jsonb,
+          production = ${nextProductionJson}::jsonb,
+          mood = ${nextMoodJson}::jsonb,
+          vocal = ${nextVocalJson}::jsonb
+        WHERE id = ${row.id};
+      `;
+    }
+  }
+
+  const existingCovers = await songSql`SELECT slug FROM genre_covers;`;
+  for (const cover of existingCovers) {
+    if (typeof cover.slug === 'string' && NON_GENRE_SLUGS.has(cover.slug)) {
+      await songSql`DELETE FROM genre_covers WHERE slug = ${cover.slug};`;
+    }
+  }
+
+  await songSql`
     CREATE TABLE IF NOT EXISTS stems (
       id TEXT PRIMARY KEY,
       song_id TEXT NOT NULL REFERENCES songs(id) ON DELETE CASCADE,

@@ -9,6 +9,7 @@ import * as takeSchema from './schema/takes.js';
 import * as commitSchema from './schema/commits.js';
 import * as albumSchema from './schema/albums.js';
 import * as playlistSchema from './schema/playlists.js';
+import * as genreSchema from './schema/genres.js';
 
 // Load .env from backend directory
 dotenv.config({ path: resolve(process.cwd(), '.env') });
@@ -39,6 +40,7 @@ export const songDb = drizzle(songSql, {
     ...commitSchema,
     ...albumSchema,
     ...playlistSchema,
+    ...genreSchema,
   },
 });
 
