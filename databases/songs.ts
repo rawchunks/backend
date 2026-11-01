@@ -311,25 +311,51 @@ function extractPrimaryGenre(song: Pick<Song, 'genres' | 'tags'>): string {
   return fallback ? fallback.trim() : 'Uncategorized';
 }
 
-export async function getMarketFolds(foldLimit = 20): Promise<MarketFoldsResponse> {
-  const safeLimit = Math.min(Math.max(Number(foldLimit) || 20, 4), 50);
-  const cacheKey = `${MARKET_FOLDS_CACHE_PREFIX}${safeLimit}`;
+function groupSongsByFamilyLimit(rows: Song[], maxFamilies: number): Song[] {
+  const familyOrder: string[] = [];
+  const familyMap = new Map<string, Song[]>();
+  for (const song of rows) {
+    const fam = song.family || song.id;
+    let bucket = familyMap.get(fam);
+    if (!bucket) {
+      if (familyOrder.length >= maxFamilies) continue;
+      bucket = [];
+      familyMap.set(fam, bucket);
+      familyOrder.push(fam);
+    }
+    bucket.push(song);
+  }
+  const result: Song[] = [];
+  for (const fam of familyOrder) {
+    const bucket = familyMap.get(fam);
+    if (bucket) result.push(...bucket);
+  }
+  return result;
+}
+
+export async function getMarketFolds(foldLimit = 50, windowMinutes = 60): Promise<MarketFoldsResponse> {
+  const safeLimit = Math.min(Math.max(Number(foldLimit) || 50, 4), 100);
+  const safeWindow = [15, 30, 60].includes(Number(windowMinutes)) ? Number(windowMinutes) : 60;
+  const cacheKey = `${MARKET_FOLDS_CACHE_PREFIX}${safeLimit}:${safeWindow}`;
   const cached = await cacheGet<MarketFoldsResponse>(cacheKey);
   if (cached) return cached;
 
-  const [newReleases, popular, recentPool, statsRows] = await Promise.all([
+  const rawFetchLimit = Math.min(safeLimit * 3, 250);
+  const windowCutoff = new Date(Date.now() - safeWindow * 60 * 1000).toISOString();
+
+  const [newReleasesRaw, popularRaw, recentPool, statsRows] = await Promise.all([
     songDb
       .select()
       .from(songs)
       .where(eq(songs.public, true))
       .orderBy(desc(songs.created_at))
-      .limit(safeLimit),
+      .limit(rawFetchLimit),
     songDb
       .select()
       .from(songs)
       .where(eq(songs.public, true))
       .orderBy(desc(songs.plays), desc(songs.created_at))
-      .limit(safeLimit),
+      .limit(rawFetchLimit),
     songDb
       .select()
       .from(songs)
@@ -339,12 +365,14 @@ export async function getMarketFolds(foldLimit = 20): Promise<MarketFoldsRespons
     songDb
       .select({
         total: sql<number>`count(*)::int`,
-        lastHour: sql<number>`count(*) filter (where ${songs.created_at} >= now() - interval '60 minutes')::int`,
+        lastHour: sql<number>`count(*) filter (where ${songs.created_at} >= ${windowCutoff}::timestamptz)::int`,
       })
       .from(songs)
       .where(eq(songs.public, true)),
   ]);
 
+  const newReleases = groupSongsByFamilyLimit(newReleasesRaw, safeLimit);
+  const popular = groupSongsByFamilyLimit(popularRaw, safeLimit);
   const totalPublic = statsRows[0]?.total ?? recentPool.length;
   const lastHourCount = statsRows[0]?.lastHour ?? 0;
 
@@ -352,7 +380,7 @@ export async function getMarketFolds(foldLimit = 20): Promise<MarketFoldsRespons
   const creatorMap = new Map<string, Song[]>();
 
   for (const song of recentPool) {
-    const genre = extractPrimaryGenre(song.tags);
+    const genre = extractPrimaryGenre(song);
     const gList = genreMap.get(genre) || [];
     gList.push(song);
     genreMap.set(genre, gList);
@@ -363,29 +391,42 @@ export async function getMarketFolds(foldLimit = 20): Promise<MarketFoldsRespons
     creatorMap.set(creator, cList);
   }
 
-  const genres: MarketFoldGroup[] = Array.from(genreMap.entries())
+  const topGenreEntries = Array.from(genreMap.entries())
     .sort((a, b) => {
       if (a[0] === 'Uncategorized') return 1;
       if (b[0] === 'Uncategorized') return -1;
       return b[1].length - a[1].length;
     })
-    .slice(0, 8)
-    .map(([genre, list]) => ({
+    .slice(0, 16);
+
+  const genreCoversBySlug = await ensureGenreCovers(topGenreEntries.map(([g]) => g));
+
+  const genres: MarketFoldGroup[] = topGenreEntries.map(([genre, list]) => {
+    const grouped = groupSongsByFamilyLimit(list, safeLimit);
+    const slug = normalizeGenreSlug(genre);
+    const coverInfo = slug ? genreCoversBySlug[slug] : undefined;
+    return {
       key: genre,
       label: genre,
-      total: list.length,
-      songs: list.slice(0, safeLimit),
-    }));
+      total: new Set(list.map((s) => s.family || s.id)).size,
+      image: coverInfo?.imageUrl ?? null,
+      imageStatus: coverInfo?.status,
+      songs: grouped,
+    };
+  });
 
   const creators: MarketFoldGroup[] = Array.from(creatorMap.entries())
     .sort((a, b) => b[1].length - a[1].length)
-    .slice(0, 8)
-    .map(([creator, list]) => ({
-      key: creator,
-      label: creator,
-      total: list.length,
-      songs: list.slice(0, safeLimit),
-    }));
+    .slice(0, 16)
+    .map(([creator, list]) => {
+      const grouped = groupSongsByFamilyLimit(list, safeLimit);
+      return {
+        key: creator,
+        label: creator,
+        total: new Set(list.map((s) => s.family || s.id)).size,
+        songs: grouped,
+      };
+    });
 
   const payload: MarketFoldsResponse = {
     generatedAt: new Date().toISOString(),
