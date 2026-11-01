@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { listStemsBySong } from './stems.js';
 import { listTakesBySong, deleteTake } from './takes.js';
 import { RequestError, readUser, readSong, readTake, checkUser, checkUserOrPair } from './users.js';
-import { requireSessionPayment, extractSessionToken, parseComposeToken, settleStreamCheckpoint, type SessionPaymentConfig } from '../broker/payment.js';
+import { requireSessionPayment, extractSessionToken, PaymentError, settleStreamCheckpoint, type SessionPaymentConfig } from '../broker/payment.js';
 import { waitForInFlightAudio } from '../storage/r2.js';
 import {
   createAlbum,
@@ -115,6 +115,12 @@ const playlistPatch = z.object({
 }).strict().refine(data => Object.keys(data).length > 0, 'At least one playlist field is required');
 
 function failure(request: FastifyRequest, reply: FastifyReply, error: unknown, message: string) {
+  if (error instanceof PaymentError) {
+    for (const [name, value] of Object.entries(error.headers)) reply.header(name, value);
+    reply.header('access-control-expose-headers', Object.keys(error.headers).join(', '));
+    return reply.status(error.statusCode).send(error.body);
+  }
+  if (error && typeof error === 'object' && 'statusCode' in error && typeof error.statusCode === 'number') return reply.status(error.statusCode).send({ error: error instanceof Error ? error.message : 'Payment request failed' });
   if (error instanceof RequestError) return reply.status(error.statusCode).send({ error: error.message });
   request.log.error(error);
   let cause: any = error; while (cause?.cause) cause = cause.cause;
@@ -131,64 +137,19 @@ export async function resolveSongStreamPayment(request: FastifyRequest): Promise
   }
   (request as any).song = song;
 
-  const token = extractSessionToken(request);
-  const payload = token ? parseComposeToken(token) : null;
-  const userAddress = (request.headers['x-session-user-address'] as string | undefined)
-    || (request.headers['x-user-address'] as string | undefined)
-    || (request.headers['x-account-address'] as string | undefined)
-    || (request.query as Record<string, string>)?.userAddress
-    || payload?.sub;
-
-  let isCreator = false;
-  if (userAddress && song.creator) {
-    let parsedUser: string = userAddress.trim();
-    let parsedCreator: string = song.creator.trim();
-    try {
-      parsedUser = parseAddress(userAddress).value;
-    } catch {}
-    try {
-      parsedCreator = parseAddress(song.creator).value;
-    } catch {}
-
-    if (parsedUser.toLowerCase() === parsedCreator.toLowerCase() || parsedUser === parsedCreator) {
-      isCreator = true;
-    } else {
-      try {
-        const pair = await getWalletPair(parsedUser);
-        if (pair) {
-          isCreator = Boolean(
-            (pair.svmAddress && (song.creator === pair.svmAddress || parsedCreator === pair.svmAddress)) ||
-            (pair.evmAddress && (song.creator.toLowerCase() === pair.evmAddress.toLowerCase() || parsedCreator.toLowerCase() === pair.evmAddress.toLowerCase()))
-          );
-        }
-      } catch {}
-
-      if (!isCreator) {
-        try {
-          const creatorPair = await getWalletPair(parsedCreator);
-          if (creatorPair) {
-            isCreator = Boolean(
-              (creatorPair.svmAddress && (userAddress === creatorPair.svmAddress || parsedUser === creatorPair.svmAddress)) ||
-              (creatorPair.evmAddress && (userAddress.toLowerCase() === creatorPair.evmAddress.toLowerCase() || parsedUser.toLowerCase() === creatorPair.evmAddress.toLowerCase()))
-            );
-          }
-        } catch {}
-      }
-    }
+  if (typeof request.headers['x-wallet-auth-token'] === 'string') {
+    const { authenticate } = await import('../credits/auth.js');
+    const identity = await authenticate(request);
+    const creator = song.creator.startsWith('0x') ? song.creator.toLowerCase() : song.creator;
+    if (identity.addresses.includes(creator)) return null;
   }
-
-  if (isCreator) {
-    return null;
-  }
-
-  const priceUsd = song.stream_price;
-  const amountWei = Math.round(priceUsd * 1_000_000).toString();
-
+  const rate = Math.round(song.stream_price * 1000000);
+  const durationMs = Math.ceil((song.duration || 0) * 1000);
+  if (!Number.isSafeInteger(rate) || rate < 0 || !Number.isSafeInteger(durationMs) || durationMs <= 0) throw new RequestError('Streaming price or duration unavailable', 503);
+  if (!rate) return null;
   return {
-    amountWei,
-    priceUsd,
-    action: 'stream-playback',
-    creatorAddress: song.creator,
+    amountWei: String((BigInt(rate) * BigInt(durationMs) + 59999n) / 60000n),
+    priceUsd: song.stream_price, durationMs, action: 'stream-playback', creatorAddress: song.creator,
   };
 }
 
@@ -425,7 +386,8 @@ export const databaseRouter: FastifyPluginAsync = async app => {
   const streamCheckpointHandler = async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       const { id } = request.params as { id: string };
-      const listenedSeconds = Number((request.body as any)?.listenedSeconds || 0);
+      const listenedSeconds = (request.body as any)?.listenedSeconds;
+      if (typeof listenedSeconds !== 'number' || !Number.isFinite(listenedSeconds) || listenedSeconds < 0 || ((request.body as any)?.terminal !== undefined && typeof (request.body as any)?.terminal !== 'boolean')) throw new RequestError('Invalid playback checkpoint', 400);
       const viewer =
         (request.headers['x-user-address'] as string | undefined) ||
         (request.headers['x-session-user-address'] as string | undefined) ||
@@ -453,24 +415,23 @@ export const databaseRouter: FastifyPluginAsync = async app => {
         return reply.status(400).send({ error: 'paymentIntentId is required for stream checkpoint' });
       }
 
-      const network = (request.headers['x-network-id'] as string) || 'base-mainnet';
+      const network = request.headers['x-network-id'] as string;
+      if (!network) throw new RequestError('x-network-id is required', 400);
 
       const result = await settleStreamCheckpoint({
         paymentIntentId,
         network,
         listenedSeconds,
-        streamPriceUsd: song.stream_price,
-        creatorAddress: song.creator,
+        token: extractSessionToken(request) || undefined, songId: id, terminal: (request.body as any)?.terminal === true,
       });
 
       if (listenedSeconds >= 10) {
         await incrementSongPlay(id, viewer || paymentIntentId).catch(() => {});
       }
 
-      return reply.send({
-        success: Boolean(result),
-        result,
-      });
+      for (const [name, value] of Object.entries(result.headers || {})) reply.header(name, value);
+      reply.header('access-control-expose-headers', Object.keys(result.headers || {}).join(', '));
+      return reply.status(result.status === 'queued' || result.status === 'submitted' ? 202 : 200).send({ success: true, result });
     } catch (error) {
       return failure(request, reply, error, 'Failed to settle stream checkpoint');
     }
