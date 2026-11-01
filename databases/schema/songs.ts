@@ -15,6 +15,10 @@ export const songs = pgTable('songs', {
   license_price: real('license_price').default(25.0).notNull(), // $ per license
   duration: real('duration'), // Duration in seconds (dynamic, set on generation/playback)
   tags: jsonb('tags').$type<string[]>().default([]).notNull(),
+  genres: jsonb('genres').$type<string[]>().default([]).notNull(),
+  production: jsonb('production').$type<string[]>().default([]).notNull(),
+  mood: jsonb('mood').$type<string[]>().default([]).notNull(),
+  vocal: jsonb('vocal').$type<string[]>().default([]).notNull(),
   metadata_cid: text('metadata_cid'), // IPFS Pinata CID for immutable decentralized metadata
   image: text('image'), // Album or song cover art URL / Data URL
   album_id: text('album_id'), // Associated album ID

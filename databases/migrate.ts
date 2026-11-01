@@ -1,4 +1,5 @@
 import { userSql, songSql } from './client.js';
+import { NON_GENRE_SLUGS, partitionSongTags } from '../options.js';
 
 export async function runMigrations() {
   console.log('--- Initializing Neon Databases ---');
@@ -73,6 +74,10 @@ export async function runMigrations() {
       license_price REAL DEFAULT 25.0 NOT NULL,
       duration REAL,
       tags JSONB DEFAULT '[]'::jsonb NOT NULL,
+      genres JSONB DEFAULT '[]'::jsonb NOT NULL,
+      production JSONB DEFAULT '[]'::jsonb NOT NULL,
+      mood JSONB DEFAULT '[]'::jsonb NOT NULL,
+      vocal JSONB DEFAULT '[]'::jsonb NOT NULL,
       metadata_cid TEXT,
       public BOOLEAN DEFAULT FALSE NOT NULL,
       network TEXT,
@@ -84,6 +89,7 @@ export async function runMigrations() {
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS metadata_cid TEXT;`;
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS public BOOLEAN DEFAULT FALSE NOT NULL, ADD COLUMN IF NOT EXISTS network TEXT, ADD COLUMN IF NOT EXISTS chain_song_id TEXT, ADD COLUMN IF NOT EXISTS tx_hash TEXT;`;
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS family TEXT, ADD COLUMN IF NOT EXISTS basis TEXT;`;
+  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS genres JSONB DEFAULT '[]'::jsonb NOT NULL, ADD COLUMN IF NOT EXISTS production JSONB DEFAULT '[]'::jsonb NOT NULL, ADD COLUMN IF NOT EXISTS mood JSONB DEFAULT '[]'::jsonb NOT NULL, ADD COLUMN IF NOT EXISTS vocal JSONB DEFAULT '[]'::jsonb NOT NULL;`;
 
   await songSql`
     CREATE TABLE IF NOT EXISTS albums (
