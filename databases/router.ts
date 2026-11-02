@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { listStemsBySong } from './stems.js';
 import { listTakesBySong, deleteTake } from './takes.js';
 import { RequestError, readUser, readSong, readTake, checkUser, checkUserOrPair } from './users.js';
-import { requireSessionPayment, extractSessionToken, PaymentError, settleStreamCheckpoint, type SessionPaymentConfig } from '../broker/payment.js';
+import { requireSessionPayment, extractSessionToken, parseComposeToken, PaymentError, settleStreamCheckpoint, type SessionPaymentConfig } from '../broker/payment.js';
 import { waitForInFlightAudio } from '../storage/r2.js';
 import {
   createAlbum,
@@ -99,6 +99,30 @@ const albumPatch = z.object({
   cover: z.string().nullable().optional(),
   public: z.boolean().optional(),
 }).strict().refine(data => Object.keys(data).length > 0, 'At least one album field is required');
+
+function resolveViewerAddresses(request: FastifyRequest): string[] {
+  const raw = [
+    request.headers['x-user-address'],
+    request.headers['x-paired-svm-address'],
+    request.headers['x-account-address'],
+    request.headers['x-session-user-address'],
+  ];
+  const token = extractSessionToken(request);
+  if (token) {
+    const parsed = parseComposeToken(token);
+    if (parsed?.sub) raw.push(parsed.sub);
+  }
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry === 'string') {
+      for (const part of entry.split(',')) {
+        const trimmed = part.trim();
+        if (trimmed) out.push(trimmed);
+      }
+    }
+  }
+  return Array.from(new Set(out));
+}
 
 const playlistCreate = z.object({
   title: text,
@@ -333,13 +357,21 @@ export const databaseRouter: FastifyPluginAsync = async app => {
   app.post('/songs/:id/play', async (request, reply) => {
     try {
       const { id } = request.params as { id: string };
-      const viewer =
-        (request.headers['x-user-address'] as string | undefined) ||
-        (request.headers['x-session-user-address'] as string | undefined) ||
+      const playbackContext = String(request.headers['x-playback-context'] || '').trim().toLowerCase();
+      if (playbackContext.startsWith('mypage')) {
+        const existing = await getSongById(id);
+        if (!existing) return reply.status(404).send({ error: 'Song not found' });
+        return reply.send({ id: existing.id, plays: existing.plays ?? 0, last_played_at: existing.last_played_at, skipped: true });
+      }
+      const viewerAddresses = resolveViewerAddresses(request);
+      const fallbackViewer =
         (request.headers['cf-connecting-ip'] as string | undefined) ||
         request.ip ||
         undefined;
-      const updated = await incrementSongPlay(id, viewer);
+      const updated = await incrementSongPlay(
+        id,
+        viewerAddresses.length > 0 ? viewerAddresses : fallbackViewer,
+      );
       if (!updated) return reply.status(404).send({ error: 'Song not found' });
       return reply.send({ id: updated.id, plays: updated.plays ?? 0, last_played_at: updated.last_played_at });
     } catch (error) { return failure(request, reply, error, 'Failed to record song play'); }
@@ -396,6 +428,9 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       const { id } = request.params as { id: string };
       const listenedSeconds = (request.body as any)?.listenedSeconds;
       if (typeof listenedSeconds !== 'number' || !Number.isFinite(listenedSeconds) || listenedSeconds < 0 || ((request.body as any)?.terminal !== undefined && typeof (request.body as any)?.terminal !== 'boolean')) throw new RequestError('Invalid playback checkpoint', 400);
+      const playbackContext = String(request.headers['x-playback-context'] || '').trim().toLowerCase();
+      const isPrivateWorkspacePlayback = playbackContext.startsWith('mypage');
+      const viewerAddresses = resolveViewerAddresses(request);
       const viewer =
         (request.headers['x-user-address'] as string | undefined) ||
         (request.headers['x-session-user-address'] as string | undefined) ||
@@ -403,11 +438,18 @@ export const databaseRouter: FastifyPluginAsync = async app => {
 
       const intentId = String((request.body as any)?.paymentIntentId || '');
       if (request.headers['x-credit-source'] || intentId.startsWith('crd:')) {
-        if (listenedSeconds >= 10 && id) {
-          await incrementSongPlay(id, viewer || intentId).catch(() => {});
+        if (listenedSeconds >= 10 && id && !isPrivateWorkspacePlayback) {
+          await incrementSongPlay(id, viewerAddresses.length > 0 ? viewerAddresses : (viewer || intentId)).catch(() => {});
         }
         const { checkpointCredits } = await import('../credits/billing.js');
-        return reply.send(await checkpointCredits(request));
+        const creditCheckpoint = await checkpointCredits(request);
+        const receiptHeaders = (creditCheckpoint.result as any)?.headers as Record<string, string> | undefined;
+        if (receiptHeaders) {
+          for (const [name, value] of Object.entries(receiptHeaders)) reply.header(name, value);
+          reply.header('access-control-expose-headers', Object.keys(receiptHeaders).join(', '));
+        }
+        const status = creditCheckpoint.result.status;
+        return reply.status(status === 'queued' || status === 'submitted' ? 202 : 200).send(creditCheckpoint);
       }
       const song = await getSongById(id);
       if (!song) return reply.status(404).send({ error: 'Song not found' });
@@ -433,8 +475,8 @@ export const databaseRouter: FastifyPluginAsync = async app => {
         token: extractSessionToken(request) || undefined, songId: id, terminal: (request.body as any)?.terminal === true,
       });
 
-      if (listenedSeconds >= 10) {
-        await incrementSongPlay(id, viewer || paymentIntentId).catch(() => {});
+      if (listenedSeconds >= 10 && !isPrivateWorkspacePlayback) {
+        await incrementSongPlay(id, viewerAddresses.length > 0 ? viewerAddresses : (viewer || paymentIntentId)).catch(() => {});
       }
 
       for (const [name, value] of Object.entries(result.headers || {})) reply.header(name, value);
@@ -802,4 +844,5 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       return failure(request, reply, error, 'Failed to delete playlist');
     }
   });
+
 };

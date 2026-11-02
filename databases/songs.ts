@@ -4,7 +4,7 @@ import { songs, type Song, type NewSong } from './schema/songs.js';
 import { stems, type Stem, type NewStem } from './schema/stems.js';
 import { takes, type Take, type NewTake } from './schema/takes.js';
 import { commits } from './schema/commits.js';
-import { resolveIdentityAddresses, RequestError } from './users.js';
+import { resolveIdentityAddresses, parseAddress, RequestError } from './users.js';
 import { cacheGet, cacheSet, cacheDel } from './cache.js';
 import { ensureGenreCovers, normalizeGenreSlug } from './genres.js';
 import { isNonGenreTag, partitionSongTags } from '../options.js';
@@ -231,7 +231,7 @@ export async function updateSong(id: string, updates: Partial<NewSong>): Promise
   if (Array.isArray(normalizedUpdates.genres) && normalizedUpdates.genres.length > 0) {
     void ensureGenreCovers(normalizedUpdates.genres).catch(() => { });
   }
-  await invalidateMarketSongCache();
+  await Promise.all([cacheDel(`songs:id:${id}`), invalidateMarketSongCache()]);
   return result[0] || null;
 }
 
@@ -312,7 +312,7 @@ export async function deleteSong(id: string, licensees?: string[]): Promise<bool
   }
   const result = await songDb.delete(songs).where(eq(songs.id, id)).returning({ id: songs.id });
   if (result.length > 0) {
-    await invalidateMarketSongCache();
+    await Promise.all([cacheDel(`songs:id:${id}`), invalidateMarketSongCache()]);
   }
   return result.length > 0;
 }
@@ -580,13 +580,37 @@ export async function getMarketFolds(foldLimit = 50, windowMinutes = 60): Promis
   return payload;
 }
 
-export async function incrementSongPlay(id: string, viewerKey?: string): Promise<Song | null> {
-  if (viewerKey) {
-    const dedupKey = `${PLAY_DEDUP_PREFIX}${id}:${viewerKey}`;
-    const alreadyCounted = await cacheGet<number>(dedupKey);
-    if (alreadyCounted) {
-      return await getSongById(id);
+export async function incrementSongPlay(id: string, viewerKey?: string | string[]): Promise<Song | null> {
+  const song = await getSongById(id);
+  if (!song || !song.public) return song;
+
+  const rawViewers = (Array.isArray(viewerKey) ? viewerKey : viewerKey ? [viewerKey] : [])
+    .map(v => v.trim())
+    .filter(Boolean);
+
+  if (rawViewers.length > 0) {
+    const creatorAddresses = new Set(
+      (await resolveIdentityAddresses(song.creator)).map(a => (a.startsWith('0x') ? a.toLowerCase() : a)),
+    );
+    creatorAddresses.add(song.creator.startsWith('0x') ? song.creator.toLowerCase() : song.creator);
+
+    for (const raw of rawViewers) {
+      const normalized = raw.startsWith('0x') ? raw.toLowerCase() : raw;
+      if (creatorAddresses.has(normalized)) return song;
+      try {
+        const parsed = parseAddress(raw).value;
+        const normParsed = parsed.startsWith('0x') ? parsed.toLowerCase() : parsed;
+        if (creatorAddresses.has(normParsed)) return song;
+        const linked = await resolveIdentityAddresses(parsed);
+        for (const addr of linked) {
+          if (creatorAddresses.has(addr.startsWith('0x') ? addr.toLowerCase() : addr)) return song;
+        }
+      } catch {}
     }
+
+    const dedupSubject = rawViewers[0].startsWith('0x') ? rawViewers[0].toLowerCase() : rawViewers[0];
+    const dedupKey = `${PLAY_DEDUP_PREFIX}${id}:${dedupSubject}`;
+    if (await cacheGet<number>(dedupKey)) return song;
     await cacheSet(dedupKey, 1, PLAY_DEDUP_TTL);
   }
 
