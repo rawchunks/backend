@@ -33,6 +33,7 @@ import {
   deletePlaylist,
 } from './playlists.js';
 import { ensureGenreCovers } from './genres.js';
+import { getCreatorEarnings } from './earnings.js';
 
 const text = z.string().refine(value => value.trim().length > 0, 'Value must not be empty');
 const address = text.refine(value => { try { parseAddress(value); return true; } catch { return false; } }, 'Invalid wallet address');
@@ -86,17 +87,41 @@ const songPatch = z.object({
   public: z.boolean().optional(), network: text.optional(), chain_song_id: text.optional(), tx_hash: text.optional(),
 }).strict().refine(data => Object.keys(data).length > 0, 'At least one song field is required');
 
+const albumReleaseConfigSchema = z.object({
+  targetNetwork: z.string().nullable().optional(),
+  bundlePrice: z.number().finite().nonnegative().optional(),
+  editionSize: z.number().int().nonnegative().optional(),
+  releaseNotes: z.string().nullable().optional(),
+  licenses: z.number().int().nonnegative().optional(),
+  license_price: z.number().finite().nonnegative().optional(),
+  stream_price: z.number().finite().nonnegative().optional(),
+  network: z.string().nullable().optional(),
+  remixable: z.boolean().optional(),
+  status: z.enum(['draft', 'ready', 'released']).optional(),
+  release_date: z.string().nullable().optional(),
+}).nullable().optional();
+
 const albumCreate = z.object({
   title: text,
   creator: text,
-  description: z.string().optional(),
-  cover: z.string().optional(),
+  description: z.string().nullable().optional(),
+  concept: z.string().nullable().optional(),
+  genre: z.string().nullable().optional(),
+  cover: z.string().nullable().optional(),
+  gallery: z.array(z.string()).optional(),
+  release_config: albumReleaseConfigSchema,
+  releaseConfig: albumReleaseConfigSchema,
   public: z.boolean().optional(),
 });
 const albumPatch = z.object({
   title: text.optional(),
   description: z.string().nullable().optional(),
+  concept: z.string().nullable().optional(),
+  genre: z.string().nullable().optional(),
   cover: z.string().nullable().optional(),
+  gallery: z.array(z.string()).optional(),
+  release_config: albumReleaseConfigSchema,
+  releaseConfig: albumReleaseConfigSchema,
   public: z.boolean().optional(),
 }).strict().refine(data => Object.keys(data).length > 0, 'At least one album field is required');
 
@@ -606,7 +631,11 @@ export const databaseRouter: FastifyPluginAsync = async app => {
         title: body.title,
         creator,
         description: body.description || null,
+        concept: body.concept || null,
+        genre: body.genre || null,
         cover: body.cover || null,
+        gallery: body.gallery ?? [],
+        release_config: body.release_config ?? body.releaseConfig ?? null,
         public: body.public ?? false,
       });
       return reply.status(201).send(album);
@@ -634,7 +663,14 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       const existing = await getAlbumById(id);
       if (!existing) return reply.status(404).send({ error: 'Album not found' });
       await checkUserOrPair(userAddress, existing.creator);
-      const updates = albumPatch.parse(request.body);
+      const parsed = albumPatch.parse(request.body);
+      const { releaseConfig, ...rest } = parsed;
+      const updates = {
+        ...rest,
+        ...(releaseConfig !== undefined && rest.release_config === undefined
+          ? { release_config: releaseConfig }
+          : {}),
+      };
       const updated = await updateAlbum(id, updates);
       if (!updated) return reply.status(404).send({ error: 'Album not found' });
       return reply.send(updated);
@@ -845,4 +881,27 @@ export const databaseRouter: FastifyPluginAsync = async app => {
     }
   });
 
+  // Creator Earnings & Analytics route (EARN tab)
+  app.get('/earnings', async (request, reply) => {
+    try {
+      const { creator, network, refresh } = request.query as {
+        creator?: string;
+        network?: string;
+        refresh?: string;
+      };
+      if (!creator || !creator.trim()) {
+        return reply.status(400).send({ error: 'creator address is required' });
+      }
+      address.parse(creator);
+      const userAddress = readUser(request);
+      await checkUserOrPair(userAddress, creator);
+      const data = await getCreatorEarnings(creator, {
+        network,
+        refresh: refresh === 'true',
+      });
+      return reply.send(data);
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to retrieve creator earnings');
+    }
+  });
 };

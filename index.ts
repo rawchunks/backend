@@ -161,6 +161,7 @@ async function main() {
   app.post('/generate', forward('/api/generation/generate'));
   app.get('/status/:taskId', async (req: any, reply) => forward(`/api/generation/status/${encodeURIComponent(req.params.taskId)}`)(req, reply));
   app.get('/songs', forward('/api/songs'));
+  app.get('/earnings', forward('/api/earnings'));
   app.get('/songs/:id', async (req: any, reply: any) => forward(`/api/songs/${encodeURIComponent(req.params.id)}`)(req, reply));
   app.get('/songs/:id/stream', async (req: any, reply: any) => forward(`/api/songs/${encodeURIComponent(req.params.id)}/stream`)(req, reply));
   app.get('/stream/:id', async (req: any, reply: any) => forward(`/api/songs/${encodeURIComponent(req.params.id)}/stream`)(req, reply));
