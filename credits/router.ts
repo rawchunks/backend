@@ -87,16 +87,23 @@ export const creditsRouter: FastifyPluginAsync = async app => {
     const input = body(
       z.object({
         packId: z.enum(['usd-10', 'usd-25', 'usd-100']),
-        checkout: z.object({ kind: z.literal('balance') }).optional(),
-      }).strict(),
+        checkout: z.object({ kind: z.string().optional() }).passthrough().optional(),
+        network: id.optional(),
+        walletAddress: id.optional(),
+      }),
       req.body,
     );
-    return paypal.create(identity.owner, input.packId, key(req.headers));
+    const headerNetwork = typeof req.headers['x-network-id'] === 'string' ? req.headers['x-network-id'].trim() : undefined;
+    return paypal.create(identity.owner, input.packId, key(req.headers), {
+      kind: input.checkout?.kind,
+      network: input.network || headerNetwork,
+      walletAddress: input.walletAddress || identity.userAddress,
+    });
   });
 
   app.post('/credits/paypal/capture-order', async req => {
     const identity = await resolveCreditOwner(req);
-    const input = body(z.object({ operationId: id, orderId: id }).strict(), req.body);
+    const input = body(z.object({ operationId: id.optional(), orderId: id }), req.body);
     return paypal.capture(identity.owner, input.operationId, input.orderId);
   });
 
@@ -109,7 +116,7 @@ export const creditsRouter: FastifyPluginAsync = async app => {
         network: id,
         walletAddress: id,
         amountAtomics: amount,
-      }).strict(),
+      }),
       req.body,
     );
     return paypal.createLicense(identity.owner, input, key(req.headers));
@@ -119,7 +126,7 @@ export const creditsRouter: FastifyPluginAsync = async app => {
     const identity = await resolveCreditOwner(req);
     const input = body(
       z.object({
-        operationId: id,
+        operationId: id.optional(),
         orderId: id,
         card: z
           .object({
@@ -128,9 +135,8 @@ export const creditsRouter: FastifyPluginAsync = async app => {
             securityCode: z.string().min(3).max(4),
             name: z.string().max(128).optional(),
           })
-          .strict()
           .optional(),
-      }).strict(),
+      }),
       req.body,
     );
     return paypal.capture(identity.owner, input.operationId, input.orderId, input.card);
@@ -139,7 +145,11 @@ export const creditsRouter: FastifyPluginAsync = async app => {
   app.get('/credits/operations/:id', async req => {
     const identity = await resolveCreditOwner(req);
     const input = body(z.object({ id }), req.params);
-    const op = await paypal.operation(input.id, identity.owner);
+    let op = await paypal.operation(input.id, identity.owner);
+    if (op.status === 'pending' && op.order_id) {
+      await paypal.reconcile(op.id).catch(() => null);
+      op = await paypal.operation(input.id, identity.owner);
+    }
     return {
       id: op.id,
       status: op.status,

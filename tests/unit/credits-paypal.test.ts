@@ -155,4 +155,80 @@ describe('PayPal capture authority', () => {
       },
     });
   });
+
+  it('rejects reusing an already-captured or approved PayPal order in createOrder with 409 so CardFields never calls confirm-payment-source on a captured order', async () => {
+    const op = await paypal.create(owner, 'usd-10', 'request-captured');
+    await paypal.capture(owner, op.operationId, op.orderId);
+    await expect(paypal.create(owner, 'usd-10', 'request-captured')).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it('converts Card credit pack purchases 1:1 to USDC via Coinflow on the selected network when configured', async () => {
+    process.env.COINFLOW_SANDBOX_API_KEY = 'coinflow-sandbox-key';
+    let coinflowHeaders: Headers | null = null;
+    let coinflowPayload: any = null;
+    const packPaypal = new PayPal(store, async (url, init) => {
+      const parsed = new URL(String(url));
+      if (parsed.pathname === '/v1/oauth2/token') return Response.json({ access_token: 'provider-token', expires_in: 3600 });
+      if (parsed.pathname === '/v2/checkout/orders' && init?.method === 'POST') {
+        const input = JSON.parse(String(init.body));
+        order = {
+          id: 'order-pack-1',
+          status: 'CREATED',
+          intent: 'CAPTURE',
+          purchase_units: input.purchase_units.map((unit: any) => ({
+            ...unit,
+            payee: { merchant_id: 'merchant', email_address: 'merchant@example.invalid' },
+          })),
+        };
+        return Response.json(order);
+      }
+      if (parsed.pathname === '/v2/checkout/orders/order-pack-1/capture') {
+        order.status = 'COMPLETED';
+        const val = order.purchase_units[0].amount.value;
+        order.purchase_units[0].payments = {
+          captures: [{ id: 'capture-pack-1', status: 'COMPLETED', amount: { value: val, currency_code: 'USD' } }],
+        };
+        return Response.json(order);
+      }
+      if (parsed.pathname === '/v2/checkout/orders/order-pack-1') return Response.json(order);
+      if (parsed.pathname === '/api/auth/session-key') return Response.json({ key: 'session-key-pack' });
+      if (parsed.pathname === '/api/checkout/paypal/rawchunks') {
+        coinflowHeaders = new Headers(init?.headers);
+        coinflowPayload = JSON.parse(String(init?.body));
+        return Response.json({ paymentId: 'CF-PACK-999' });
+      }
+      return new Response('{}', { status: 404 });
+    });
+
+    const solanaWallet = '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU';
+    const created = await packPaypal.create(owner, 'usd-25', 'pack-req-1', {
+      kind: 'balance',
+      network: 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
+      walletAddress: solanaWallet,
+    });
+    const captured = await packPaypal.capture(owner, created.operationId, created.orderId);
+    expect(captured.status).toBe('credited');
+    expect(captured.coinflowPaymentId).toBe('CF-PACK-999');
+    expect(coinflowHeaders?.get('x-coinflow-auth-blockchain')).toBe('solana');
+    expect(coinflowHeaders?.get('x-coinflow-auth-wallet')).toBe(solanaWallet);
+    expect(coinflowPayload).toMatchObject({
+      subtotal: { cents: 2500, currency: 'USD' },
+      webhookInfo: {
+        packId: 'usd-25',
+        network: 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
+        paypalOrderId: 'order-pack-1',
+        paypalCaptureId: 'capture-pack-1',
+      },
+    });
+    expect((await store.balance(owner)).availableAtomics).toBe('25000000');
+  });
+
+  it('reconciles a CardFields order whose payment_source.card is confirmed while status is still CREATED', async () => {
+    const created = await paypal.create(owner, 'usd-10', 'cardfields-confirmed');
+    order.status = 'CREATED';
+    order.payment_source = { card: { last_digits: '6794', brand: 'MASTERCARD' } };
+    const reconciled = await paypal.reconcile(created.operationId);
+    expect(reconciled.status).toBe('credited');
+    expect((await store.balance(owner)).availableAtomics).toBe('10000000');
+  });
 });
