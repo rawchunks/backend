@@ -156,6 +156,7 @@ export function getComposeApiUrl(): string {
 
 export async function settleSessionPaymentAsync(params: {
   token: string;
+  paymentSignature?: string;
   network: string;
   userAddress: string;
   amountWei: string;
@@ -174,6 +175,7 @@ export async function settleSessionPaymentAsync(params: {
       'Content-Type': 'application/json',
       'x-network-id': params.network,
       'x-session-user-address': params.userAddress,
+      ...(params.paymentSignature ? { 'PAYMENT-SIGNATURE': params.paymentSignature } : {}),
     };
 
     const totalWei = BigInt(params.amountWei);
@@ -277,6 +279,9 @@ interface PaymentObligation {
 interface PlaybackPayment {
   id: string;
   token: string;
+  paymentSignature?: string;
+  holdOwner?: string;
+  holdId?: string;
   network: string;
   account: string;
   songId: string;
@@ -304,13 +309,19 @@ async function sendPayment(state: PlaybackPayment, operation: string, body: Paym
   try {
     response = await fetch(`${getComposeApiUrl()}/api/payments/${operation}`, {
       method: 'POST', signal: AbortSignal.timeout(20000),
-      headers: { Authorization: `Bearer ${state.token}`, 'Content-Type': 'application/json', 'x-network-id': state.network, 'x-session-user-address': state.account },
+      headers: {
+        Authorization: `Bearer ${state.token}`,
+        'Content-Type': 'application/json',
+        'x-network-id': state.network,
+        'x-session-user-address': state.account,
+        ...(state.paymentSignature ? { 'PAYMENT-SIGNATURE': state.paymentSignature } : {}),
+      },
       body: JSON.stringify(body),
     });
   } catch { throw new PaymentError(503, { error: 'Payment provider unavailable; obligation retained' }); }
   const headers: Record<string, string> = {};
   response.headers.forEach((value, name) => {
-    if (/^(payment-|x-payment-|x-session-|x-key-|x-settlement|x-transaction-|retry-after)/i.test(name)) headers[name] = value;
+    if (/^(payment-|x-payment-|x-session-|x-key-|x-settlement|x-receipt|x-transaction-|retry-after)/i.test(name)) headers[name] = value;
   });
   const result = await response.json().catch(() => null) as PaymentBody | null;
   if (!response.ok) throw new PaymentError(response.status, result || { error: 'Payment provider rejected the request' }, headers);
@@ -366,7 +377,8 @@ async function resolveStreamCreator(creatorAddress: string, network: string): Pr
 }
 
 export async function prepareStreamPaymentIntent(params: {
-  token: string; network: string; userAddress: string; maxAmountWei: string; songId: string;
+  token: string; paymentSignature?: string; holdOwner?: string; holdId?: string;
+  network: string; userAddress: string; maxAmountWei: string; songId: string;
   creatorAddress: string; payTo?: string; streamPriceUsd?: number; durationMs?: number; idempotencyKey?: string;
 }): Promise<string> {
   const identity = params.idempotencyKey || randomUUID();
@@ -380,7 +392,11 @@ export async function prepareStreamPaymentIntent(params: {
       const treasury = params.payTo || getPlatformTreasury(params.network);
       const creator = await resolveStreamCreator(params.creatorAddress, params.network);
       state = {
-        id, token: params.token, network: params.network, account: params.userAddress, songId: params.songId,
+        id, token: params.token,
+        ...(params.paymentSignature ? { paymentSignature: params.paymentSignature } : {}),
+        ...(params.holdOwner ? { holdOwner: params.holdOwner } : {}),
+        ...(params.holdId ? { holdId: params.holdId } : {}),
+        network: params.network, account: params.userAddress, songId: params.songId,
         creator, treasury, rate: String(rate), durationMs,
         admission: {
           maxAmountWei: params.maxAmountWei, service: 'rawchunks', action: 'stream-playback',
@@ -419,14 +435,39 @@ async function drainPayment(state: PlaybackPayment, lease: JobLease): Promise<Pl
       pending.settle = settlementBody(state, result.paymentIntentId, BigInt(pending.cumulativeWei));
       await lease.save(state.id, state);
     }
+    if (state.holdOwner && state.holdId) {
+      const { creditStore } = await import('../credits/store.js');
+      await creditStore().commit(state.holdOwner, state.holdId, BigInt(pending.cumulativeWei), pending.millis);
+    }
     const { result, headers } = await sendPayment(state, 'settle', pending.settle);
     const status = String(result.status || '');
     if (!durableStatuses.has(status)) throw new PaymentError(502, { error: 'Payment was not durably accepted', status }, headers);
+    const deltaAtomics = BigInt(pending.cumulativeWei) - BigInt(state.billedWei);
+    const cumulativeAtomics = BigInt(pending.cumulativeWei);
+    const cumulativeCreatorAtomics = state.creator ? (cumulativeAtomics * 8000n) / 10000n : 0n;
     pending.receipt = {
       status, acceptedListenedSeconds: pending.millis / 1000, billedWei: pending.cumulativeWei,
-      deltaWei: String(BigInt(pending.cumulativeWei) - BigInt(state.billedWei)), headers,
+      deltaWei: String(deltaAtomics), headers,
       ...(typeof result.txHash === 'string' ? { txHash: result.txHash } : {}),
     };
+    if (state.creator && state.songId && cumulativeCreatorAtomics > 0n) {
+      const earningId = state.holdId ? `crd:${state.holdId}` : `x402:${state.id}`;
+      import('../databases/earnings.js')
+        .then(({ recordSongEarning }) =>
+          recordSongEarning({
+            id: earningId,
+            songId: state.songId,
+            creator: state.creator,
+            network: state.network,
+            kind: 'stream',
+            grossAtomics: cumulativeAtomics,
+            creatorAtomics: cumulativeCreatorAtomics,
+            txHash: typeof result.txHash === 'string' ? result.txHash : null,
+            payer: state.account,
+          }),
+        )
+        .catch(() => {});
+    }
     state.billedWei = pending.cumulativeWei;
     state.acceptedMs = pending.millis;
     state.usedAdmission = true;
@@ -436,6 +477,10 @@ async function drainPayment(state: PlaybackPayment, lease: JobLease): Promise<Pl
   }
   if (state.terminal && !state.closed) {
     if (!state.usedAdmission) await sendPayment(state, 'abort', { paymentIntentId: state.intent, reason: 'Playback ended without billable audio' });
+    if (state.holdOwner && state.holdId) {
+      const { creditStore } = await import('../credits/store.js');
+      await creditStore().release(state.holdOwner, state.holdId);
+    }
     state.closed = true;
     await lease.save(state.id, state);
   }
@@ -482,7 +527,29 @@ export async function recoverPayments() {
           if (item.receipt?.status === 'confirmed' || !item.settle) continue;
           const { result, headers } = await sendPayment(state, 'settle', item.settle);
           const status = String(result.status || '');
-          if (durableStatuses.has(status)) item.receipt = { ...item.receipt!, status, headers, txHash: typeof result.txHash === 'string' ? result.txHash : item.receipt?.txHash };
+          if (durableStatuses.has(status)) {
+            item.receipt = { ...item.receipt!, status, headers, txHash: typeof result.txHash === 'string' ? result.txHash : item.receipt?.txHash };
+            if (state.creator && state.songId && item.receipt.txHash) {
+              const grossAtomics = BigInt(String(state.billedWei || item.receipt.billedWei || item.settle.finalAmountWei || '0'));
+              const creatorAtomics = (grossAtomics * 8000n) / 10000n;
+              const earningId = `x402:${state.id}`;
+              import('../databases/earnings.js')
+                .then(({ recordSongEarning }) =>
+                  recordSongEarning({
+                    id: earningId,
+                    songId: state.songId,
+                    creator: state.creator,
+                    network: state.network,
+                    kind: 'stream',
+                    grossAtomics,
+                    creatorAtomics,
+                    txHash: item.receipt?.txHash || null,
+                    payer: state.account,
+                  }),
+                )
+                .catch(() => {});
+            }
+          }
         }
         await lease.save(id, state);
         if (state.closed && state.obligations.every(item => item.receipt?.status === 'confirmed')) await valkey.srem(recoverySet, id);

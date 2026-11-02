@@ -5,8 +5,46 @@ import { authenticate } from './auth.js';
 import { creditStore, type CreditLotSource } from './store.js';
 import type { SessionPaymentConfig, SessionPaymentOptions, SessionPaymentResolver } from '../broker/payment.js';
 
-interface Billing { owner: string; hold: string }
+interface Billing {
+  owner: string;
+  hold: string;
+  network?: string;
+  userAddress?: string;
+  action?: string;
+}
 const context = new AsyncLocalStorage<Billing>();
+
+async function buildBatchSettlementSignature(
+  owner: string,
+  userAddress: string,
+  network: string,
+  holdId: string,
+): Promise<string> {
+  const store = creditStore();
+  const latestOp = await store.tx(async c =>
+    (
+      await c.query(
+        "SELECT context FROM credit_operations WHERE environment=$1 AND owner=$2 AND kind='purchase' AND status IN ('credited','completed') ORDER BY updated_at DESC LIMIT 1",
+        [store.environment, owner],
+      )
+    ).rows[0],
+  ).catch(() => null);
+  const coinflowPaymentId =
+    typeof latestOp?.context?.coinflowPaymentId === 'string' ? latestOp.context.coinflowPaymentId : undefined;
+  return Buffer.from(
+    JSON.stringify({
+      x402Version: 2,
+      scheme: 'batch-settlement',
+      network,
+      payload: {
+        owner,
+        userAddress,
+        holdId,
+        ...(coinflowPaymentId ? { coinflowPaymentId } : {}),
+      },
+    }),
+  ).toString('base64');
+}
 
 export async function bindCreditTask(taskId: string, worker: any) {
   const billing = context.getStore();
@@ -15,7 +53,18 @@ export async function bindCreditTask(taskId: string, worker: any) {
   await store.tx(c =>
     c.query(
       'UPDATE credit_holds SET context=$3 WHERE environment=$1 AND id=$2 AND NOT closed',
-      [store.environment, billing.hold, JSON.stringify({ kind: worker.kind, taskId, worker })],
+      [
+        store.environment,
+        billing.hold,
+        JSON.stringify({
+          kind: worker.kind,
+          taskId,
+          worker,
+          ...(billing.network ? { network: billing.network } : {}),
+          ...(billing.userAddress ? { userAddress: billing.userAddress } : {}),
+          ...(billing.action ? { action: billing.action } : {}),
+        }),
+      ],
     ),
   );
 }
@@ -80,12 +129,42 @@ export async function admitCredits(
   if (hold.context && !options?.metered) {
     throw Object.assign(new Error('This operation has already been admitted'), { statusCode: 409 });
   }
-  const billing = { owner: identity.owner, hold: hold.id };
+  const requestedNetwork =
+    typeof req.headers['x-network-id'] === 'string' && req.headers['x-network-id'].trim()
+      ? req.headers['x-network-id'].trim()
+      : undefined;
+  const billing: Billing = {
+    owner: identity.owner,
+    hold: hold.id,
+    network: requestedNetwork,
+    userAddress: identity.userAddress,
+    action: config.action,
+  };
   (req as any).creditBilling = billing;
   (req as any).creditMetered = Boolean(options?.metered);
   (req as any).paymentIntentId = hold.id;
   if (options?.metered && !hold.context) {
     const song = (req as any).song;
+    const streamNetwork = requestedNetwork || song.network;
+    let composePaymentIntentId: string | undefined;
+    if (process.env.COMPOSE_API_URL && streamNetwork) {
+      const { prepareStreamPaymentIntent } = await import('../broker/payment.js');
+      const paymentSignature = await buildBatchSettlementSignature(identity.owner, identity.userAddress, streamNetwork, hold.id);
+      composePaymentIntentId = await prepareStreamPaymentIntent({
+        token: `card:${hold.id}`,
+        paymentSignature,
+        holdOwner: identity.owner,
+        holdId: hold.id,
+        network: streamNetwork,
+        userAddress: identity.userAddress,
+        maxAmountWei: config.amountWei,
+        songId: song.id,
+        creatorAddress: song.creator,
+        streamPriceUsd: song.stream_price,
+        durationMs: Math.ceil(song.duration * 1000),
+        idempotencyKey: hold.id,
+      });
+    }
     await store.tx(c =>
       c.query(
         'UPDATE credit_holds SET context=$3 WHERE environment=$1 AND id=$2 AND context IS NULL',
@@ -97,6 +176,8 @@ export async function admitCredits(
             version: 1,
             songId: song.id,
             userAddress: identity.userAddress,
+            ...(streamNetwork ? { network: streamNetwork } : {}),
+            ...(composePaymentIntentId ? { paymentIntentId: composePaymentIntentId } : {}),
             rate: String(Math.round(song.stream_price * 1000000)),
             durationMs: Math.ceil(song.duration * 1000),
             startedAt: Date.now(),
@@ -116,15 +197,60 @@ export async function checkpointCredits(req: FastifyRequest) {
     throw Object.assign(new Error('Invalid playback checkpoint'), { statusCode: 400 });
   }
   const row = await store.tx(async c =>
-    (await c.query('SELECT * FROM credit_holds WHERE environment=$1 AND id=$2 AND owner=$3', [store.environment, input.paymentIntentId, identity.owner])).rows[0],
+    (
+      await c.query(
+        "SELECT * FROM credit_holds WHERE environment=$1 AND (id=$2 OR context->>'paymentIntentId'=$2) AND owner=$3",
+        [store.environment, input.paymentIntentId, identity.owner],
+      )
+    ).rows[0],
   );
   if (!row || row.context?.kind !== 'stream' || row.context.version !== 1 || row.context.songId !== (req.params as any).id || !identity.addresses.includes(row.context.userAddress)) {
     throw Object.assign(new Error('Unknown playback operation'), { statusCode: 404 });
+  }
+  const requestedNetwork =
+    typeof req.headers['x-network-id'] === 'string' && req.headers['x-network-id'].trim()
+      ? req.headers['x-network-id'].trim()
+      : undefined;
+  const streamNetwork: string | undefined = requestedNetwork || row.context.network;
+  if (row.context.paymentIntentId && process.env.COMPOSE_API_URL && streamNetwork) {
+    const { settleStreamCheckpoint } = await import('../broker/payment.js');
+    const receipt = await settleStreamCheckpoint({
+      paymentIntentId: row.context.paymentIntentId,
+      network: streamNetwork,
+      listenedSeconds: input.listenedSeconds!,
+      token: `card:${row.id}`,
+      songId: row.context.songId,
+      terminal: Boolean(input.terminal),
+    });
+    return { success: true, result: receipt };
   }
   const millis = Math.min(row.context.durationMs, Math.round(input.listenedSeconds! * 1000));
   const cumulative = (BigInt(millis) * BigInt(row.context.rate)) / 60000n;
   const result = await store.commit(identity.owner, row.id, cumulative, millis);
   if (input.terminal) await store.release(identity.owner, row.id);
+  const billedAtomics = BigInt(result.billedWei || '0');
+  if (billedAtomics > 0n && row.context.songId) {
+    Promise.all([
+      import('../databases/songs.js'),
+      import('../databases/earnings.js'),
+    ])
+      .then(async ([{ getSongById }, { recordSongEarning }]) => {
+        const song = await getSongById(row.context.songId);
+        const earningNetwork = streamNetwork || song?.network;
+        if (!song || !earningNetwork) return;
+        await recordSongEarning({
+          id: `crd:${row.id}`,
+          songId: song.id,
+          creator: song.creator,
+          network: earningNetwork,
+          kind: 'stream',
+          grossAtomics: billedAtomics,
+          creatorAtomics: (billedAtomics * 80n) / 100n,
+          payer: identity.userAddress,
+        });
+      })
+      .catch(() => {});
+  }
   return { success: true, result: { billedWei: result.billedWei, deltaWei: result.deltaWei, acceptedListenedSeconds: result.acceptedMs / 1000, status: 'credited' } };
 }
 
@@ -145,6 +271,30 @@ export function installCreditBilling(app: FastifyInstance) {
     else if (reply.statusCode < 400 && !row.context) {
       await store.commit(billing.owner, billing.hold, BigInt(row.maximum));
       await store.release(billing.owner, billing.hold);
+      if (row.credit_source === 'card' && process.env.COMPOSE_API_URL && billing.network && billing.userAddress) {
+        const network = billing.network;
+        const userAddress = billing.userAddress;
+        const action = billing.action || 'vibe';
+        setImmediate(async () => {
+          try {
+            const { settleSessionPaymentAsync } = await import('../broker/payment.js');
+            const paymentSignature = await buildBatchSettlementSignature(billing.owner, userAddress, network, row.id);
+            await settleSessionPaymentAsync({
+              token: `card:${row.id}`,
+              paymentSignature,
+              network,
+              userAddress,
+              amountWei: String(row.maximum),
+              action,
+              resource: row.resource,
+              method: req.method,
+              creatorAddress: row.creator || undefined,
+            });
+          } catch {
+            // Non-blocking background settlement
+          }
+        });
+      }
     }
     return payload;
   });
@@ -179,6 +329,27 @@ export async function recoverCreditServices() {
     if (task?.result?.status === 'ready') {
       await store.commit(hold.owner, hold.id, BigInt(hold.maximum));
       await store.release(hold.owner, hold.id);
+      const network = hold.context?.network || task?.params?.network;
+      const userAddress = hold.context?.userAddress || task?.params?.userAddress || task?.params?.creatorAddress || hold.owner;
+      if (hold.credit_source === 'card' && process.env.COMPOSE_API_URL && typeof network === 'string' && network) {
+        try {
+          const { settleSessionPaymentAsync } = await import('../broker/payment.js');
+          const paymentSignature = await buildBatchSettlementSignature(hold.owner, userAddress, network, hold.id);
+          void settleSessionPaymentAsync({
+            token: `card:${hold.id}`,
+            paymentSignature,
+            network,
+            userAddress,
+            amountWei: String(hold.maximum),
+            action: hold.context?.action || hold.context?.kind || 'generate',
+            resource: hold.resource,
+            method: 'POST',
+            creatorAddress: hold.creator || undefined,
+          });
+        } catch {
+          // Non-blocking background settlement
+        }
+      }
     } else if (task?.result?.status === 'error') {
       await store.release(hold.owner, hold.id);
     }
