@@ -222,6 +222,8 @@ export class Service {
         id: index === 0 ? songId : `${songId}-var${index + 1}`,
         title: index === 0 ? parent.title : `${parent.title} (Var ${index + 1})`,
         version: 1, source: index === 0 ? parent.source : songId, creator: parent.creator, url,
+        is_remix: Boolean(parent.is_remix || parent.source),
+        parent_chain_song_id: parent.parent_chain_song_id ?? null,
         licenses: index === 0 ? parent.licenses : 0, stream_price: parent.stream_price, license_price: index === 0 ? parent.license_price : 0,
         duration: ctx.durations?.[index],
         tags: parent.genres?.length ? parent.genres : parent.tags,

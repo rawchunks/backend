@@ -7,7 +7,7 @@ vi.mock('../../databases/client.js', async () => {
 import { databaseCause, clearPostgres, closePostgres, fixtures as f, initializePostgres, postgres } from '../support/database-postgres.js';
 import { runMigrations } from '../../databases/migrate.js';
 import { getUserConsent, putUserConsent, putWalletPair } from '../../databases/users.js';
-import { copySong, createSong, finalizeSong, getSongById, getFullSongProject, listAllSongs, listSongsByCreator, updateSong } from '../../databases/songs.js';
+import { copySong, createSong, deleteSong, finalizeSong, getSongById, getFullSongProject, getDeletedParentSongProject, listAllSongs, listSongsByCreator, updateSong } from '../../databases/songs.js';
 import { createStem, listStemsBySong, updateStemMixer } from '../../databases/stems.js';
 import { activateTake, createTake, listTakesBySong } from '../../databases/takes.js';
 import { createCommit, listCommitsBySong } from '../../databases/commits.js';
@@ -19,12 +19,41 @@ afterAll(closePostgres);
 describe('production gates exercised on fresh PostgreSQL initialized by production migrations', () => {
   it('creates and copies remixes without license amounts or prices', async () => {
     await createSong({ ...f.song, source: 'original', licenses: 10, license_price: 25, metadata_cid: 'cid' });
-    expect(await getSongById(f.song.id)).toMatchObject({ licenses: 0, license_price: 0, source: 'original' });
+    expect(await getSongById(f.song.id)).toMatchObject({ licenses: 0, license_price: 0, source: 'original', is_remix: true });
     const draft = await copySong(f.song.id);
-    expect(draft).toMatchObject({ licenses: 0, license_price: 0, source: 'original', public: false, metadata_cid: null });
+    expect(draft).toMatchObject({ licenses: 0, license_price: 0, source: 'original', is_remix: true, public: false, metadata_cid: null });
     await expect(updateSong(draft.id, { licenses: 10 })).rejects.toThrow('Remixes cannot be licensed');
     await expect(updateSong(draft.id, { license_price: 25 })).rejects.toThrow('Remixes cannot be licensed');
     expect(await updateSong(draft.id, { stream_price: .03 })).toMatchObject({ stream_price: expect.closeTo(.03) });
+  });
+  it('preserves remix copies, stems, and parent chain linkage when the original song is deleted', async () => {
+    const licenseeA = `0x${'c'.repeat(40)}`;
+    const licenseeB = `0x${'d'.repeat(40)}`;
+    await createSong({ ...f.song, public: true, metadata_cid: 'cid', chain_song_id: '2', network: 'eip155:84532', licenses: 10, license_price: 25 });
+    await createStem({ ...f.stem, name: 'vocals', url: 'https://fixture.invalid/vocals.wav' });
+    const remixA = await createSong({ ...f.song, id: 'remix-a', source: f.song.id, creator: licenseeA, public: false, metadata_cid: null, chain_song_id: null });
+    expect(remixA).toMatchObject({ is_remix: true, parent_chain_song_id: '2', network: 'eip155:84532' });
+    expect(await listStemsBySong('remix-a')).toHaveLength(1);
+    expect(await deleteSong(f.song.id, [licenseeA, licenseeB])).toBe(true);
+    expect(await getSongById(f.song.id)).toBeNull();
+    expect(await getDeletedParentSongProject(f.song.id)).toMatchObject({
+      song: { id: f.song.id, chain_song_id: '2', network: 'eip155:84532', is_remix: false },
+    });
+    expect(await getSongById('remix-a')).toMatchObject({ source: f.song.id, is_remix: true, parent_chain_song_id: '2', network: 'eip155:84532' });
+    const bSongs = await listSongsByCreator(licenseeB);
+    expect(bSongs).toHaveLength(1);
+    expect(bSongs[0]).toMatchObject({ source: f.song.id, is_remix: true, parent_chain_song_id: '2', network: 'eip155:84532', licenses: 0, license_price: 0 });
+    expect(await listStemsBySong(bSongs[0].id)).toHaveLength(1);
+  });
+  it('orders public songs by publication/minting timestamp while preserving creation order in creator catalog', async () => {
+    await createSong({ ...f.song, id: 'old-draft', public: false, created_at: new Date('2026-10-01T00:00:00.000Z') });
+    await createSong({ ...f.song, id: 'earlier-public', public: true, chain_song_id: '1', created_at: new Date('2026-10-20T00:00:00.000Z'), published_at: new Date('2026-10-20T00:00:00.000Z') });
+    await updateSong('old-draft', { metadata_cid: 'cid', network: 'eip155:84532', chain_song_id: '28', tx_hash: '0x123' });
+    const published = await updateSong('old-draft', { public: true });
+    expect(published?.created_at?.toISOString()).toBe('2026-10-01T00:00:00.000Z');
+    expect(published?.published_at?.getTime()).toBeGreaterThan(new Date('2026-10-20T00:00:00.000Z').getTime());
+    expect((await listAllSongs()).map((s) => s.id)).toEqual(['old-draft', 'earlier-public']);
+    expect((await listSongsByCreator(f.evm)).map((s) => s.id)).toEqual(['earlier-public', 'old-draft']);
   });
   it('opens an unminted song without creating a new version', async () => {
     await createSong(f.song);

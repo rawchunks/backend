@@ -8,6 +8,8 @@ export const songs = pgTable('songs', {
   family: text('family'),
   basis: text('basis'),
   source: text('source'), // Original song ID if forked / remixed
+  is_remix: boolean('is_remix').default(false).notNull(),
+  parent_chain_song_id: text('parent_chain_song_id'), // On-chain songId of parent song for remixes
   creator: text('creator').notNull(), // User EVM address
   url: text('url').notNull(), // Master stereo audio URL
   licenses: integer('licenses').default(0).notNull(), // Amount of licenses minted/available
@@ -28,6 +30,7 @@ export const songs = pgTable('songs', {
   tx_hash: text('tx_hash'),
   plays: integer('plays').default(0).notNull(),
   last_played_at: timestamp('last_played_at', { withTimezone: true }),
+  published_at: timestamp('published_at', { withTimezone: true }),
   created_at: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [
   index('songs_creator_created_idx').on(table.creator, table.created_at.desc()),

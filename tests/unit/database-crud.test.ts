@@ -103,7 +103,7 @@ describe('song and voice read/filter/update behavior', () => {
   });
   it('lists every public song newest first without an implicit limit', async () => {
     await listAllSongs();
-    expect(query()).toContain('order by "songs"."created_at" desc');
+    expect(query()).toContain('coalesce("songs"."published_at", "songs"."created_at") desc');
     expect(query()).not.toContain(' limit ');
     expect(params()).toEqual([true]);
   });

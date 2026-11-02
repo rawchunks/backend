@@ -67,6 +67,8 @@ export async function runMigrations() {
       family TEXT,
       basis TEXT,
       source TEXT,
+      is_remix BOOLEAN DEFAULT FALSE NOT NULL,
+      parent_chain_song_id TEXT,
       creator TEXT NOT NULL,
       url TEXT NOT NULL,
       licenses INTEGER DEFAULT 0 NOT NULL,
@@ -83,12 +85,24 @@ export async function runMigrations() {
       network TEXT,
       chain_song_id TEXT,
       tx_hash TEXT,
+      published_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
     );
   `;
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS metadata_cid TEXT;`;
-  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS public BOOLEAN DEFAULT FALSE NOT NULL, ADD COLUMN IF NOT EXISTS network TEXT, ADD COLUMN IF NOT EXISTS chain_song_id TEXT, ADD COLUMN IF NOT EXISTS tx_hash TEXT;`;
+  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS public BOOLEAN DEFAULT FALSE NOT NULL, ADD COLUMN IF NOT EXISTS network TEXT, ADD COLUMN IF NOT EXISTS chain_song_id TEXT, ADD COLUMN IF NOT EXISTS tx_hash TEXT, ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ;`;
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS family TEXT, ADD COLUMN IF NOT EXISTS basis TEXT;`;
+  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS is_remix BOOLEAN DEFAULT FALSE NOT NULL, ADD COLUMN IF NOT EXISTS parent_chain_song_id TEXT;`;
+  await songSql`UPDATE songs SET is_remix = TRUE WHERE source IS NOT NULL AND is_remix = FALSE;`;
+  await songSql`
+    UPDATE songs r
+    SET parent_chain_song_id = s.chain_song_id,
+        network = COALESCE(r.network, s.network)
+    FROM songs s
+    WHERE r.source = s.id
+      AND r.parent_chain_song_id IS NULL
+      AND s.chain_song_id IS NOT NULL;
+  `;
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS genres JSONB DEFAULT '[]'::jsonb NOT NULL, ADD COLUMN IF NOT EXISTS production JSONB DEFAULT '[]'::jsonb NOT NULL, ADD COLUMN IF NOT EXISTS mood JSONB DEFAULT '[]'::jsonb NOT NULL, ADD COLUMN IF NOT EXISTS vocal JSONB DEFAULT '[]'::jsonb NOT NULL;`;
 
   await songSql`

@@ -15,9 +15,13 @@ const MARKET_FOLDS_TTL = 60;
 const PLAY_DEDUP_PREFIX = 'songs:play-dedup:';
 const PLAY_DEDUP_TTL = 45;
 
+function toMarketSong(song: Song): Song {
+  return song.published_at ? { ...song, created_at: song.published_at } : song;
+}
+
 export async function invalidateMarketSongCache(): Promise<void> {
   const keys = ['songs:all'];
-  for (const limit of [12, 20, 50]) {
+  for (const limit of [12, 20, 50, 100]) {
     keys.push(`${MARKET_FOLDS_CACHE_PREFIX}${limit}`);
     for (const win of [15, 30, 60]) {
       keys.push(`${MARKET_FOLDS_CACHE_PREFIX}${limit}:${win}`);
@@ -34,6 +38,20 @@ export async function createSong(songData: NewSong): Promise<Song> {
     vocal: songData.vocal,
     tags: songData.tags,
   });
+  const isRemix = Boolean(songData.is_remix || songData.source);
+  let parentChainSongId = songData.parent_chain_song_id ?? null;
+  let inheritedNetwork = songData.network ?? null;
+  if (songData.source && (!parentChainSongId || !inheritedNetwork)) {
+    const parentSong = await getSongById(songData.source);
+    if (parentSong) {
+      if (!parentChainSongId && parentSong.chain_song_id) {
+        parentChainSongId = parentSong.chain_song_id;
+      }
+      if (!inheritedNetwork && parentSong.network) {
+        inheritedNetwork = parentSong.network;
+      }
+    }
+  }
   const result = await songDb.insert(songs).values({
     ...songData,
     tags: partitioned.genres,
@@ -41,14 +59,39 @@ export async function createSong(songData: NewSong): Promise<Song> {
     production: partitioned.production,
     mood: partitioned.mood,
     vocal: partitioned.vocal,
-    ...(songData.source ? { licenses: 0, license_price: 0 } : {}),
+    is_remix: isRemix,
+    parent_chain_song_id: parentChainSongId,
+    network: inheritedNetwork,
+    ...(isRemix ? { licenses: 0, license_price: 0 } : {}),
     creator: /^0x/i.test(songData.creator) ? songData.creator.toLowerCase() : songData.creator,
   }).returning();
+  const created = result[0];
+  if (created && songData.source) {
+    const sourceStems = await songDb.select().from(stems).where(eq(stems.song_id, songData.source));
+    if (sourceStems.length > 0) {
+      for (const stem of sourceStems) {
+        await songDb
+          .insert(stems)
+          .values({
+            id: randomUUID(),
+            song_id: created.id,
+            name: stem.name,
+            url: stem.url,
+            waveform_peaks_url: stem.waveform_peaks_url,
+            volume: stem.volume,
+            pan: stem.pan,
+            is_muted: stem.is_muted,
+            is_solo: stem.is_solo,
+          })
+          .onConflictDoNothing();
+      }
+    }
+  }
   if (partitioned.genres.length > 0) {
-    void ensureGenreCovers(partitioned.genres).catch(() => {});
+    void ensureGenreCovers(partitioned.genres).catch(() => { });
   }
   await invalidateMarketSongCache();
-  return result[0];
+  return created;
 }
 
 export async function copySong(id: string): Promise<Song> {
@@ -66,17 +109,17 @@ export async function copySong(id: string): Promise<Song> {
   for (const row of [...lanes, ...versions, ...history]) mapping[row.id] = randomUUID();
   const replace = (value: any): any => typeof value === 'string' ? mapping[value] ?? value
     : Array.isArray(value) ? value.map(replace)
-    : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([key, item]) => [mapping[key] ?? key, replace(item)])) : value;
+      : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([key, item]) => [mapping[key] ?? key, replace(item)])) : value;
   const draft = sql`select id from songs where basis = ${id} and metadata_cid is null order by version desc limit 1`;
   const destination = sql`coalesce((${draft}), ${next})`;
   const inserted = sql`exists (select 1 from songs where id = ${next})`;
   const statements: any[] = [
     songDb.execute(sql`select pg_advisory_xact_lock(hashtextextended(${family}, 0))`),
     songDb.execute(sql`
-    insert into songs (id, title, family, basis, creator, source, version, url, duration, tags, genres, production, mood, vocal, licenses, stream_price, license_price, network, image, album_id)
-    select ${next}, title, ${family}, ${id}, creator, source,
+    insert into songs (id, title, family, basis, creator, source, is_remix, parent_chain_song_id, version, url, duration, tags, genres, production, mood, vocal, licenses, stream_price, license_price, network, image, album_id)
+    select ${next}, title, ${family}, ${id}, creator, source, is_remix, parent_chain_song_id,
       (select coalesce(max(version), 0) + 1 from songs where coalesce(family, id) = ${family}),
-      url, duration, tags, genres, production, mood, vocal, case when source is null then licenses else 0 end, stream_price, case when source is null then license_price else 0 end, network, image, album_id
+      url, duration, tags, genres, production, mood, vocal, case when source is null and not is_remix then licenses else 0 end, stream_price, case when source is null and not is_remix then license_price else 0 end, network, image, album_id
     from songs where id = ${id} and not exists (${draft})
     `),
   ];
@@ -127,10 +170,11 @@ export async function listAllSongs(limit?: number, offset = 0): Promise<Song[]> 
     .select()
     .from(songs)
     .where(eq(songs.public, true))
-    .orderBy(desc(songs.created_at)).$dynamic();
+    .orderBy(sql`coalesce(${songs.published_at}, ${songs.created_at}) desc`).$dynamic();
   if (limit !== undefined) query.limit(limit);
   if (offset) query.offset(offset);
-  return await query;
+  const rows = await query;
+  return rows.map(toMarketSong);
 }
 
 function validatePagination(limit: number | undefined, offset: number) {
@@ -139,13 +183,24 @@ function validatePagination(limit: number | undefined, offset: number) {
 }
 
 export async function updateSong(id: string, updates: Partial<NewSong>): Promise<Song | null> {
-  if (['id', 'creator', 'created_at'].some((key) => key in updates)) throw new Error('Song identity and ownership cannot be updated');
-  if (['url', 'duration', 'source', 'version', 'family', 'basis', 'licenses', 'license_price'].some(key => key in updates)) {
-    const song = await getSongById(id);
-    if (song?.metadata_cid && ['url', 'duration', 'source', 'version', 'family', 'basis'].some(key => key in updates)) throw new RequestError('Open an editable version before changing this song', 409);
-    if ((song?.source || updates.source) && (updates.licenses || updates.license_price)) throw new RequestError('Remixes cannot be licensed');
+  if (['id', 'creator', 'created_at', 'published_at'].some((key) => key in updates)) throw new Error('Song identity and ownership cannot be updated');
+  let song: Song | null = null;
+  if (['url', 'duration', 'source', 'is_remix', 'version', 'family', 'basis', 'licenses', 'license_price', 'chain_song_id', 'tx_hash', 'public'].some(key => key in updates)) {
+    song = await getSongById(id);
+    if (song?.metadata_cid && ['url', 'duration', 'source', 'is_remix', 'version', 'family', 'basis'].some(key => key in updates)) throw new RequestError('Open an editable version before changing this song', 409);
+    if ((song?.source || song?.is_remix || updates.source || updates.is_remix) && (updates.licenses || updates.license_price)) throw new RequestError('Remixes cannot be licensed');
   }
   const normalizedUpdates: Partial<NewSong> = { ...updates };
+  if (updates.source) {
+    normalizedUpdates.is_remix = true;
+  }
+  if (
+    (updates.chain_song_id && !song?.chain_song_id) ||
+    (updates.tx_hash && !song?.tx_hash) ||
+    (updates.public === true && !song?.public)
+  ) {
+    normalizedUpdates.published_at = new Date();
+  }
   if (['tags', 'genres', 'production', 'mood', 'vocal'].some((key) => key in updates)) {
     const partitioned = partitionSongTags({
       genres: updates.genres,
@@ -174,13 +229,87 @@ export async function updateSong(id: string, updates: Partial<NewSong>): Promise
     .where(eq(songs.id, id))
     .returning();
   if (Array.isArray(normalizedUpdates.genres) && normalizedUpdates.genres.length > 0) {
-    void ensureGenreCovers(normalizedUpdates.genres).catch(() => {});
+    void ensureGenreCovers(normalizedUpdates.genres).catch(() => { });
   }
   await invalidateMarketSongCache();
   return result[0] || null;
 }
 
-export async function deleteSong(id: string): Promise<boolean> {
+export async function preserveLicensedRemixesBeforeDelete(id: string, licensees?: string[]): Promise<void> {
+  const song = await getSongById(id);
+  if (!song || song.source || song.is_remix) return;
+
+  const sourceStems = await songDb.select().from(stems).where(eq(stems.song_id, id));
+  const existingRemixes = await songDb.select().from(songs).where(eq(songs.source, id));
+  if (existingRemixes.length > 0) {
+    await songDb
+      .update(songs)
+      .set({
+        is_remix: true,
+        parent_chain_song_id: sql`coalesce(${songs.parent_chain_song_id}, ${song.chain_song_id ?? null})`,
+        network: sql`coalesce(${songs.network}, ${song.network ?? null})`,
+      })
+      .where(eq(songs.source, id));
+
+    if (sourceStems.length > 0) {
+      for (const remix of existingRemixes) {
+        const remixStems = await songDb.select({ id: stems.id }).from(stems).where(eq(stems.song_id, remix.id));
+        if (remixStems.length === 0) {
+          await songDb.insert(stems).values(
+            sourceStems.map((stem) => ({
+              id: `stm-${randomUUID()}`,
+              song_id: remix.id,
+              name: stem.name,
+              url: stem.url,
+              waveform_peaks_url: stem.waveform_peaks_url,
+              volume: stem.volume,
+              pan: stem.pan,
+              is_muted: stem.is_muted,
+              is_solo: stem.is_solo,
+            })),
+          );
+        }
+      }
+    }
+  }
+
+  if (Array.isArray(licensees) && licensees.length > 0) {
+    const creatorNorm = song.creator.toLowerCase();
+    const existingCreators = new Set(existingRemixes.map((r) => r.creator.toLowerCase()));
+    for (const licensee of licensees) {
+      const trimmed = licensee?.trim();
+      if (!trimmed) continue;
+      const norm = trimmed.toLowerCase();
+      if (norm === creatorNorm || existingCreators.has(norm)) continue;
+      existingCreators.add(norm);
+      await createSong({
+        id: `sng-${randomUUID()}`,
+        title: song.title,
+        source: song.id,
+        is_remix: true,
+        parent_chain_song_id: song.chain_song_id ?? null,
+        creator: trimmed,
+        url: song.url,
+        duration: song.duration,
+        tags: song.genres?.length ? song.genres : song.tags,
+        genres: song.genres,
+        production: song.production,
+        mood: song.mood,
+        vocal: song.vocal,
+        licenses: 0,
+        license_price: 0,
+        stream_price: song.stream_price,
+        image: song.image,
+        network: song.network ?? null,
+      });
+    }
+  }
+}
+
+export async function deleteSong(id: string, licensees?: string[]): Promise<boolean> {
+  if (licensees !== undefined) {
+    await preserveLicensedRemixesBeforeDelete(id, licensees);
+  }
   const result = await songDb.delete(songs).where(eq(songs.id, id)).returning({ id: songs.id });
   if (result.length > 0) {
     await invalidateMarketSongCache();
@@ -240,13 +369,14 @@ export async function queryPublicSongs(params: MarketQueryParams = {}): Promise<
 
   if (params.sinceMinutes && Number.isFinite(params.sinceMinutes) && params.sinceMinutes > 0) {
     const mins = Math.floor(params.sinceMinutes);
-    conditions.push(sql`${songs.created_at} >= NOW() - (${mins} * INTERVAL '1 minute')`);
+    conditions.push(sql`coalesce(${songs.published_at}, ${songs.created_at}) >= NOW() - (${mins} * INTERVAL '1 minute')`);
   }
 
   const whereClause = conditions.length === 1 ? conditions[0] : and(...conditions);
+  const publishedOrder = sql`coalesce(${songs.published_at}, ${songs.created_at}) desc`;
   const orderByClause = params.sort === 'popular'
-    ? [desc(songs.plays), desc(songs.created_at)]
-    : [desc(songs.created_at)];
+    ? [desc(songs.plays), publishedOrder]
+    : [publishedOrder];
 
   const [items, countRows] = await Promise.all([
     songDb
@@ -264,7 +394,7 @@ export async function queryPublicSongs(params: MarketQueryParams = {}): Promise<
 
   const total = countRows[0]?.count ?? 0;
   return {
-    items,
+    items: items.map(toMarketSong),
     total,
     limit,
     offset,
@@ -343,43 +473,45 @@ export async function getMarketFolds(foldLimit = 50, windowMinutes = 60): Promis
   const rawFetchLimit = Math.min(safeLimit * 3, 250);
   const windowCutoff = new Date(Date.now() - safeWindow * 60 * 1000).toISOString();
 
+  const publishedOrder = sql`coalesce(${songs.published_at}, ${songs.created_at}) desc`;
   const [newReleasesRaw, popularRaw, recentPool, statsRows] = await Promise.all([
     songDb
       .select()
       .from(songs)
       .where(eq(songs.public, true))
-      .orderBy(desc(songs.created_at))
+      .orderBy(publishedOrder)
       .limit(rawFetchLimit),
     songDb
       .select()
       .from(songs)
       .where(eq(songs.public, true))
-      .orderBy(desc(songs.plays), desc(songs.created_at))
+      .orderBy(desc(songs.plays), publishedOrder)
       .limit(rawFetchLimit),
     songDb
       .select()
       .from(songs)
       .where(eq(songs.public, true))
-      .orderBy(desc(songs.created_at))
+      .orderBy(publishedOrder)
       .limit(250),
     songDb
       .select({
         total: sql<number>`count(*)::int`,
-        lastHour: sql<number>`count(*) filter (where ${songs.created_at} >= ${windowCutoff}::timestamptz)::int`,
+        lastHour: sql<number>`count(*) filter (where coalesce(${songs.published_at}, ${songs.created_at}) >= ${windowCutoff}::timestamptz)::int`,
       })
       .from(songs)
       .where(eq(songs.public, true)),
   ]);
 
-  const newReleases = groupSongsByFamilyLimit(newReleasesRaw, safeLimit);
-  const popular = groupSongsByFamilyLimit(popularRaw, safeLimit);
+  const newReleases = groupSongsByFamilyLimit(newReleasesRaw.map(toMarketSong), safeLimit);
+  const popular = groupSongsByFamilyLimit(popularRaw.map(toMarketSong), safeLimit);
   const totalPublic = statsRows[0]?.total ?? recentPool.length;
   const lastHourCount = statsRows[0]?.lastHour ?? 0;
 
   const genreMap = new Map<string, Song[]>();
   const creatorMap = new Map<string, Song[]>();
 
-  for (const song of recentPool) {
+  for (const rawSong of recentPool) {
+    const song = toMarketSong(rawSong);
     const genre = extractPrimaryGenre(song);
     const gList = genreMap.get(genre) || [];
     gList.push(song);
@@ -477,15 +609,42 @@ export async function incrementSongPlay(id: string, viewerKey?: string): Promise
   return updated;
 }
 
+export async function getDeletedParentSongProject(id: string): Promise<{
+  song: Song | null;
+  stems: Stem[];
+  takes: Take[];
+}> {
+  const remixRows = await songDb
+    .select()
+    .from(songs)
+    .where(eq(songs.source, id))
+    .limit(10);
+  const candidate = remixRows.find((r) => Boolean(r.parent_chain_song_id)) ?? remixRows[0];
+  if (!candidate) {
+    return { song: null, stems: [], takes: [] };
+  }
+  const synthesizedSong: Song = {
+    ...candidate,
+    id,
+    family: id,
+    basis: null,
+    source: null,
+    is_remix: false,
+    parent_chain_song_id: null,
+    chain_song_id: candidate.parent_chain_song_id ?? null,
+    public: true,
+  };
+  const remixStems = await songDb.select().from(stems).where(eq(stems.song_id, candidate.id));
+  return { song: synthesizedSong, stems: remixStems, takes: [] };
+}
+
 export async function getFullSongProject(id: string): Promise<{
   song: Song | null;
   stems: Stem[];
   takes: Take[];
 }> {
   const song = await getSongById(id);
-  if (!song) {
-    return { song: null, stems: [], takes: [] };
-  }
+  if (!song) return { song: null, stems: [], takes: [] };
   const songStems = await songDb.select().from(stems).where(eq(stems.song_id, id));
   const songTakes = await songDb.select().from(takes).where(eq(takes.song_id, id));
   return { song, stems: songStems, takes: songTakes };
@@ -525,10 +684,11 @@ export async function finalizeSong(songId: string, outputs: NewSong[], master: N
       vocal: output.vocal,
       tags: output.tags,
     });
+    const isRemix = Boolean(output.is_remix ?? (output.source && output.source !== songId));
     statements.push(songDb.execute(sql`
-      insert into songs (id, title, version, source, creator, url, licenses, stream_price, license_price, duration, tags, genres, production, mood, vocal, image, album_id)
-      select ${output.id}, ${output.title}, ${output.version ?? 1}, ${output.source ?? null}, ${output.creator}, ${output.url},
-        ${output.source ? 0 : output.licenses ?? 0}, ${output.stream_price ?? .02}, ${output.source ? 0 : output.license_price ?? 25},
+      insert into songs (id, title, version, source, is_remix, parent_chain_song_id, creator, url, licenses, stream_price, license_price, duration, tags, genres, production, mood, vocal, image, album_id)
+      select ${output.id}, ${output.title}, ${output.version ?? 1}, ${output.source ?? null}, ${isRemix}, ${output.parent_chain_song_id ?? null}, ${output.creator}, ${output.url},
+        ${isRemix ? 0 : output.licenses ?? 0}, ${output.stream_price ?? .02}, ${isRemix ? 0 : output.license_price ?? 25},
         ${output.duration ?? null},
         ${JSON.stringify(partitioned.genres)}::jsonb,
         ${JSON.stringify(partitioned.genres)}::jsonb,

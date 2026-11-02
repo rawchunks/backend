@@ -2,6 +2,7 @@ import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { getWalletPair, getWalletPairsByAddresses, putWalletPair, getUserConsent, putUserConsent, getUserGuides, putUserGuides, parseAddress, updateProfile } from './users.js';
 import { listSongsByCreator, listAllSongs, getFullSongProject, updateSong, deleteSong, getSongById, createSong, copySong, queryPublicSongs, getMarketFolds, incrementSongPlay } from './songs.js';
+import * as songsModule from './songs.js';
 import { randomUUID } from 'node:crypto';
 import { listStemsBySong } from './stems.js';
 import { listTakesBySong, deleteTake } from './takes.js';
@@ -70,6 +71,7 @@ const listQuery = z.object({
 const consentQuery = z.object({ version: text.optional(), type: text.optional() });
 const songPatch = z.object({
   title: text.optional(), version: z.number().int().positive().optional(), source: text.nullable().optional(),
+  is_remix: z.boolean().optional(), parent_chain_song_id: text.nullable().optional(),
   url: text.optional(), licenses: z.number().int().nonnegative().optional(),
   stream_price: z.number().finite().nonnegative().optional(), license_price: z.number().finite().nonnegative().optional(),
   duration: z.number().finite().nonnegative().nullable().optional(),
@@ -345,9 +347,15 @@ export const databaseRouter: FastifyPluginAsync = async app => {
   app.get('/songs/:id', async (request, reply) => {
     try {
       const { id } = request.params as { id: string };
-      await requireSongReader(request, id);
-      const project = await getFullSongProject(id);
-      if (!project.song) return reply.status(404).send({ error: 'Song not found' });
+      const existing = await getSongById(id);
+      if (existing && !existing.public) {
+        await readSong(request, id);
+      }
+      let project = await getFullSongProject(id);
+      if (!project?.song && 'getDeletedParentSongProject' in songsModule && typeof songsModule.getDeletedParentSongProject === 'function') {
+        project = await songsModule.getDeletedParentSongProject(id);
+      }
+      if (!project?.song) return reply.status(404).send({ error: 'Song not found' });
       return reply.send(project);
     } catch (error) { return failure(request, reply, error, 'Failed to retrieve song'); }
   });
@@ -459,10 +467,20 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       const { id } = request.params as { id: string };
       const creator = readUser(request);
       const source = await requireSongReader(request, id);
-      if (source.source) throw new RequestError('Remixes cannot be remixed', 409);
+      if (source.source || source.is_remix) throw new RequestError('Remixes cannot be remixed', 409);
       if (!source.chain_song_id || !source.network || !source.url) throw new RequestError('The source song has not been minted', 409);
+      const ensureOnly = Boolean((request.body as { ensureOnly?: boolean } | null | undefined)?.ensureOnly);
+      if (ensureOnly) {
+        const existingSongs = (await listSongsByCreator(creator)) || [];
+        const existing = existingSongs.find((s) => s.source === source.id);
+        if (existing) {
+          return reply.status(200).send(existing);
+        }
+      }
       const song = await createSong({
-        id: `sng-${randomUUID()}`, title: source.title, source: source.id, creator, url: source.url,
+        id: `sng-${randomUUID()}`, title: source.title, source: source.id,
+        is_remix: true, parent_chain_song_id: source.chain_song_id,
+        creator, url: source.url,
         duration: source.duration,
         tags: source.genres?.length ? source.genres : source.tags,
         genres: source.genres,
@@ -479,7 +497,15 @@ export const databaseRouter: FastifyPluginAsync = async app => {
     try {
       const { id } = request.params as { id: string };
       await readSong(request, id);
-      return await deleteSong(id) ? reply.send({ success: true, id }) : reply.status(404).send({ error: 'Song not found' });
+      const licensees = Array.isArray((request.body as { licensees?: string[] } | null | undefined)?.licensees)
+        ? (request.body as { licensees: string[] }).licensees
+        : undefined;
+      if (!licensees && 'preserveLicensedRemixesBeforeDelete' in songsModule && typeof songsModule.preserveLicensedRemixesBeforeDelete === 'function') {
+        await songsModule.preserveLicensedRemixesBeforeDelete(id);
+      }
+      return await (licensees ? deleteSong(id, licensees) : deleteSong(id))
+        ? reply.send({ success: true, id })
+        : reply.status(404).send({ error: 'Song not found' });
     } catch (error) { return failure(request, reply, error, 'Failed to delete song'); }
   });
   app.post('/songs/:id/version', async (request, reply) => {
