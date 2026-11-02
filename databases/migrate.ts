@@ -111,11 +111,16 @@ export async function runMigrations() {
       title TEXT NOT NULL,
       creator TEXT NOT NULL,
       description TEXT,
+      concept TEXT,
+      genre TEXT,
       cover TEXT,
+      gallery JSONB DEFAULT '[]'::jsonb NOT NULL,
+      release_config JSONB DEFAULT '{}'::jsonb NOT NULL,
       public BOOLEAN DEFAULT FALSE NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
     );
   `;
+  await songSql`ALTER TABLE albums ADD COLUMN IF NOT EXISTS concept TEXT, ADD COLUMN IF NOT EXISTS genre TEXT, ADD COLUMN IF NOT EXISTS gallery JSONB DEFAULT '[]'::jsonb NOT NULL, ADD COLUMN IF NOT EXISTS release_config JSONB DEFAULT '{}'::jsonb NOT NULL;`;
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS image TEXT;`;
   await songSql`UPDATE songs SET image = '' WHERE image = '/hero.png';`;
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS album_id TEXT REFERENCES albums(id) ON DELETE SET NULL;`;
