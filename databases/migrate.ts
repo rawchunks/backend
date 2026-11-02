@@ -127,6 +127,23 @@ export async function runMigrations() {
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS plays INTEGER DEFAULT 0 NOT NULL, ADD COLUMN IF NOT EXISTS last_played_at TIMESTAMPTZ;`;
 
   await songSql`
+    CREATE TABLE IF NOT EXISTS song_earnings (
+      id TEXT PRIMARY KEY,
+      song_id TEXT NOT NULL REFERENCES songs(id) ON DELETE CASCADE,
+      creator TEXT NOT NULL,
+      network TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('license', 'stream')),
+      gross_atomics BIGINT DEFAULT 0 NOT NULL,
+      creator_atomics BIGINT DEFAULT 0 NOT NULL,
+      tx_hash TEXT,
+      payer TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+    );
+  `;
+  await songSql`CREATE INDEX IF NOT EXISTS song_earnings_song_idx ON song_earnings (song_id);`;
+  await songSql`CREATE INDEX IF NOT EXISTS song_earnings_creator_idx ON song_earnings (creator, network);`;
+
+  await songSql`
     CREATE TABLE IF NOT EXISTS playlists (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,

@@ -1,4 +1,4 @@
-import { pgTable, text, integer, real, boolean, timestamp, jsonb, index, check } from 'drizzle-orm/pg-core';
+import { pgTable, text, integer, real, boolean, timestamp, jsonb, bigint, index, check } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
 export const songs = pgTable('songs', {
@@ -42,5 +42,24 @@ export const songs = pgTable('songs', {
   check('songs_values_check', sql`${table.version} > 0 and ${table.licenses} >= 0 and ${table.stream_price} >= 0 and ${table.stream_price} < 'Infinity'::real and ${table.license_price} >= 0 and ${table.license_price} < 'Infinity'::real and (${table.duration} is null or (${table.duration} >= 0 and ${table.duration} < 'Infinity'::real))`),
 ]);
 
+export const songEarnings = pgTable('song_earnings', {
+  id: text('id').primaryKey(),
+  song_id: text('song_id').notNull().references(() => songs.id, { onDelete: 'cascade' }),
+  creator: text('creator').notNull(),
+  network: text('network').notNull(),
+  kind: text('kind').notNull(),
+  gross_atomics: bigint('gross_atomics', { mode: 'bigint' }).default(0n).notNull(),
+  creator_atomics: bigint('creator_atomics', { mode: 'bigint' }).default(0n).notNull(),
+  tx_hash: text('tx_hash'),
+  payer: text('payer'),
+  created_at: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('song_earnings_song_idx').on(table.song_id),
+  index('song_earnings_creator_idx').on(table.creator, table.network),
+  check('song_earnings_kind_check', sql`${table.kind} in ('license', 'stream')`),
+]);
+
 export type Song = typeof songs.$inferSelect;
 export type NewSong = typeof songs.$inferInsert;
+export type SongEarning = typeof songEarnings.$inferSelect;
+export type NewSongEarning = typeof songEarnings.$inferInsert;
