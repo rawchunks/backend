@@ -125,7 +125,6 @@ export async function runMigrations() {
   await songSql`UPDATE songs SET image = '' WHERE image = '/hero.png';`;
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS album_id TEXT REFERENCES albums(id) ON DELETE SET NULL;`;
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS plays INTEGER DEFAULT 0 NOT NULL, ADD COLUMN IF NOT EXISTS last_played_at TIMESTAMPTZ;`;
-
   await songSql`
     CREATE TABLE IF NOT EXISTS song_earnings (
       id TEXT PRIMARY KEY,
@@ -135,13 +134,68 @@ export async function runMigrations() {
       kind TEXT NOT NULL CHECK (kind IN ('license', 'stream')),
       gross_atomics BIGINT DEFAULT 0 NOT NULL,
       creator_atomics BIGINT DEFAULT 0 NOT NULL,
+      streamed_ms BIGINT DEFAULT 0 NOT NULL,
       tx_hash TEXT,
       payer TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
     );
   `;
+  await songSql`ALTER TABLE song_earnings ADD COLUMN IF NOT EXISTS streamed_ms BIGINT DEFAULT 0 NOT NULL;`;
   await songSql`CREATE INDEX IF NOT EXISTS song_earnings_song_idx ON song_earnings (song_id);`;
   await songSql`CREATE INDEX IF NOT EXISTS song_earnings_creator_idx ON song_earnings (creator, network);`;
+  await songSql`CREATE INDEX IF NOT EXISTS song_earnings_created_idx ON song_earnings (created_at DESC);`;
+
+  // Deduplicate x402 rows where a credit hold row already recorded the exact same on-chain settlement tx_hash
+  await songSql`
+    DELETE FROM song_earnings a
+    USING song_earnings b
+    WHERE a.song_id = b.song_id
+      AND a.tx_hash IS NOT NULL
+      AND a.tx_hash = b.tx_hash
+      AND a.id LIKE 'x402:%'
+      AND b.id LIKE 'crd:%';
+  `;
+
+  // Backfill exact streamed_ms on stream earnings from gross_atomics and song stream_price (atomics per 60,000 ms)
+  await songSql`
+    UPDATE song_earnings se
+    SET streamed_ms = LEAST(
+      GREATEST(COALESCE(s.duration, 180) * 1000, 60000)::bigint,
+      GREATEST(
+        1,
+        ROUND((se.gross_atomics::numeric * 60000.0) / GREATEST(COALESCE(NULLIF(s.stream_price, 0), 0.01) * 1000000.0, 1.0))
+      )::bigint
+    )
+    FROM songs s
+    WHERE se.song_id = s.id
+      AND se.kind = 'stream'
+      AND se.streamed_ms = 0
+      AND se.gross_atomics > 0;
+  `;
+
+  // Backfill license earnings from remix purchases where buyer != original creator
+  await songSql`
+    INSERT INTO song_earnings (
+      id, song_id, creator, network, kind, gross_atomics, creator_atomics, streamed_ms, tx_hash, payer, created_at
+    )
+    SELECT
+      'lic:' || r.id,
+      s.id,
+      CASE WHEN s.creator LIKE '0x%' THEN LOWER(s.creator) ELSE s.creator END,
+      COALESCE(r.network, s.network, 'eip155:84532'),
+      'license',
+      ROUND(GREATEST(COALESCE(s.license_price, 0), 0) * 1000000)::bigint,
+      ROUND(GREATEST(COALESCE(s.license_price, 0), 0) * 800000)::bigint,
+      0,
+      COALESCE(r.tx_hash, s.tx_hash),
+      r.creator,
+      r.created_at
+    FROM songs r
+    JOIN songs s ON s.id = r.source
+    WHERE LOWER(r.creator) <> LOWER(s.creator)
+      AND COALESCE(s.license_price, 0) > 0
+    ON CONFLICT (id) DO NOTHING;
+  `;
 
   await songSql`
     CREATE TABLE IF NOT EXISTS playlists (

@@ -462,6 +462,7 @@ async function drainPayment(state: PlaybackPayment, lease: JobLease): Promise<Pl
             kind: 'stream',
             grossAtomics: cumulativeAtomics,
             creatorAtomics: cumulativeCreatorAtomics,
+            streamedMs: pending.millis,
             txHash: typeof result.txHash === 'string' ? result.txHash : null,
             payer: state.account,
           }),

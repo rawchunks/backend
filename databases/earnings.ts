@@ -56,12 +56,41 @@ export interface RecordSongEarningInput {
   kind: 'license' | 'stream';
   grossAtomics: bigint | number | string;
   creatorAtomics: bigint | number | string;
+  streamedMs?: bigint | number | string | null;
   txHash?: string | null;
   payer?: string | null;
+  createdAt?: Date | string | number | null;
+}
+
+export interface EarningEventItem {
+  id: string;
+  songId: string;
+  songTitle: string;
+  genre: string;
+  network: string;
+  networkFamily: 'base' | 'tempo' | 'solana' | 'other';
+  networkLabel: string;
+  kind: 'license' | 'stream';
+  royaltiesUsd: number;
+  platformFeeUsd: number;
+  totalUsd: number;
+  streamedMs: number;
+  durationMs: number;
+  ratioPct: number;
+  txHash: string | null;
+  explorerUrl: string | null;
+  payer: string | null;
+  timestamp: number;
 }
 
 export interface SongEarningsItem {
   songId: string;
+  title: string;
+  image: string | null;
+  genres: string[];
+  primaryGenre: string;
+  durationSec: number;
+  durationMs: number;
   chainSongId: string | null;
   network: string | null;
   networkFamily: 'base' | 'tempo' | 'solana' | 'other';
@@ -76,8 +105,14 @@ export interface SongEarningsItem {
   licenseProfitUsd: number;
   streamProfitUsd: number;
   totalProfitUsd: number;
+  platformFeeUsd: number;
+  grossUsd: number;
   plays: number;
   streamSettlements: number;
+  streamedMs: number;
+  avgStreamedMs: number;
+  ratioPct: number;
+  lastPlayedAt: number;
 }
 
 export interface NetworkEarningsBreakdown {
@@ -88,19 +123,28 @@ export interface NetworkEarningsBreakdown {
   licensesSold: number;
   licensesRemaining: number;
   plays: number;
+  streamedMs: number;
   licenseProfitUsd: number;
   streamProfitUsd: number;
   totalProfitUsd: number;
+  platformFeeUsd: number;
+  grossUsd: number;
 }
 
 export interface CreatorEarningsSummary {
   totalProfitUsd: number;
   licenseProfitUsd: number;
   streamProfitUsd: number;
+  platformFeeUsd: number;
+  grossUsd: number;
   licensesSold: number;
   licensesRemaining: number;
   licensesMinted: number;
   totalPlays: number;
+  totalStreamedMs: number;
+  avgStreamedMs: number;
+  avgRatioPct: number;
+  peakRatioPct: number;
   publishedCount: number;
   activeNetworkFilter: string;
 }
@@ -111,6 +155,7 @@ export interface CreatorEarningsResponse {
   summary: CreatorEarningsSummary;
   networks: NetworkEarningsBreakdown[];
   songs: Record<string, SongEarningsItem>;
+  events: EarningEventItem[];
 }
 
 interface ComposeChainInfo {
@@ -148,6 +193,22 @@ function toBigIntSafe(value: bigint | number | string | null | undefined): bigin
     }
   }
   return 0n;
+}
+
+function toIsoTimestamp(val: Date | string | number | null | undefined): string | null {
+  if (!val) return null;
+  if (val instanceof Date) {
+    return Number.isFinite(val.getTime()) ? val.toISOString() : null;
+  }
+  if (typeof val === 'number') {
+    const d = new Date(val);
+    return Number.isFinite(d.getTime()) ? d.toISOString() : null;
+  }
+  if (typeof val === 'string') {
+    const ms = Date.parse(val);
+    return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+  }
+  return null;
 }
 
 function atomicsToUsd(atomics: bigint): number {
@@ -263,11 +324,14 @@ export async function recordSongEarning(input: RecordSongEarningInput): Promise<
 
   const gross = toBigIntSafe(input.grossAtomics);
   const creatorShare = toBigIntSafe(input.creatorAtomics);
+  const streamedMs = toBigIntSafe(input.streamedMs);
   if (gross <= 0n && creatorShare <= 0n) return;
+
+  const createdAtIso = toIsoTimestamp(input.createdAt);
 
   await songSql`
     INSERT INTO song_earnings (
-      id, song_id, creator, network, kind, gross_atomics, creator_atomics, tx_hash, payer
+      id, song_id, creator, network, kind, gross_atomics, creator_atomics, streamed_ms, tx_hash, payer, created_at
     ) VALUES (
       ${id},
       ${songId},
@@ -276,14 +340,18 @@ export async function recordSongEarning(input: RecordSongEarningInput): Promise<
       ${input.kind},
       ${gross.toString()}::bigint,
       ${creatorShare.toString()}::bigint,
+      ${streamedMs.toString()}::bigint,
       ${input.txHash ?? null},
-      ${input.payer ?? null}
+      ${input.payer ?? null},
+      COALESCE(${createdAtIso}::timestamptz, NOW())
     )
     ON CONFLICT (id) DO UPDATE SET
       gross_atomics = GREATEST(song_earnings.gross_atomics, EXCLUDED.gross_atomics),
       creator_atomics = GREATEST(song_earnings.creator_atomics, EXCLUDED.creator_atomics),
+      streamed_ms = GREATEST(song_earnings.streamed_ms, EXCLUDED.streamed_ms),
       tx_hash = COALESCE(EXCLUDED.tx_hash, song_earnings.tx_hash),
-      payer = COALESCE(EXCLUDED.payer, song_earnings.payer)
+      payer = COALESCE(EXCLUDED.payer, song_earnings.payer),
+      created_at = LEAST(song_earnings.created_at, EXCLUDED.created_at)
   `;
 
   await cacheDel(`earnings:creator:${creator}`);
@@ -359,7 +427,10 @@ async function readSolanaSongState(rpcUrl: string, chainSongId: string): Promise
   }
 }
 
-async function syncValkeyStreamPayments(creatorAddresses: Set<string>, songMap: Map<string, { creator: string; network: string | null }>): Promise<void> {
+async function syncValkeyStreamPayments(
+  creatorAddresses: Set<string>,
+  songMap: Map<string, { creator: string; network: string | null; streamPrice: number }>,
+): Promise<void> {
   try {
     const [activeIds, contextKeys] = await Promise.all([
       valkey.smembers('rawchunks:payments').catch(() => [] as string[]),
@@ -379,11 +450,14 @@ async function syncValkeyStreamPayments(creatorAddresses: Set<string>, songMap: 
         if (!raw) return;
         const state = JSON.parse(raw) as {
           id?: string;
+          holdId?: string;
           songId?: string;
           creator?: string;
           payer?: string;
+          account?: string;
           network?: string;
           billedWei?: string;
+          acceptedMs?: number;
           obligations?: Array<{
             millis?: number;
             deltaWei?: string;
@@ -413,14 +487,18 @@ async function syncValkeyStreamPayments(creatorAddresses: Set<string>, songMap: 
         const billedAtomics = toBigIntSafe(state.billedWei);
 
         let sumObligationGross = 0n;
+        let maxMillis = Math.max(0, Number(state.acceptedMs || 0));
         let lastTxHash: string | null = null;
-        let lastPayer: string | null = state.payer || null;
+        let lastPayer: string | null = state.payer || state.account || null;
         let lastNetwork: string | null = state.network || songMeta?.network || null;
 
         if (Array.isArray(state.obligations) && state.obligations.length > 0) {
           for (const ob of state.obligations) {
             const obGross = toBigIntSafe(ob.settle?.finalAmountWei || ob.receipt?.deltaWei || ob.deltaWei);
             sumObligationGross += obGross;
+            if (typeof ob.millis === 'number' && ob.millis > maxMillis) {
+              maxMillis = ob.millis;
+            }
             if (ob.receipt?.txHash || ob.settle?.txHash) {
               lastTxHash = ob.receipt?.txHash || ob.settle?.txHash || lastTxHash;
             }
@@ -432,17 +510,23 @@ async function syncValkeyStreamPayments(creatorAddresses: Set<string>, songMap: 
         const totalGross = billedAtomics >= sumObligationGross ? billedAtomics : sumObligationGross;
         if (totalGross <= 0n) return;
 
+        if (maxMillis <= 0 && songMeta && songMeta.streamPrice > 0) {
+          maxMillis = Math.round((Number(totalGross) * 60000) / (songMeta.streamPrice * 1_000_000));
+        }
+
         const creatorShare = (totalGross * CREATOR_SHARE_BPS) / BPS_DENOMINATOR;
         const network = lastNetwork || 'eip155:84532';
+        const earningId = state.holdId ? `crd:${state.holdId}` : `x402:${sessionId}`;
 
         await recordSongEarning({
-          id: `x402:${sessionId}`,
+          id: earningId,
           songId: state.songId,
           creator: normalizedCreator,
           network,
           kind: 'stream',
           grossAtomics: totalGross,
           creatorAtomics: creatorShare,
+          streamedMs: maxMillis,
           txHash: lastTxHash,
           payer: lastPayer,
         });
@@ -455,17 +539,20 @@ async function syncValkeyStreamPayments(creatorAddresses: Set<string>, songMap: 
   }
 }
 
-async function syncCreditStreamHolds(songIds: string[], songMap: Map<string, { creator: string; network: string | null }>): Promise<void> {
+async function syncCreditStreamHolds(
+  songIds: string[],
+  songMap: Map<string, { creator: string; network: string | null; streamPrice: number }>,
+): Promise<void> {
   if (!songIds.length || process.env.CREDITS_ENABLED !== 'true') return;
   try {
     const { creditStore } = await import('../credits/store.js');
     const store = creditStore();
     const res = await store.tx((c) =>
       c.query(
-        `SELECT id, owner AS account, settled, context
+        `SELECT id, owner AS account, charged, created_at, context
          FROM credit_holds
          WHERE environment = $1
-           AND settled > 0
+           AND charged > 0
            AND context->>'kind' = 'stream'
            AND context->>'songId' = ANY($2)`,
         [store.environment, songIds],
@@ -474,8 +561,17 @@ async function syncCreditStreamHolds(songIds: string[], songMap: Map<string, { c
     const rows = (res.rows || []) as Array<{
       id: string;
       account: string;
-      settled: string | number;
-      context?: { songId?: string; creator?: string };
+      charged: string | number;
+      created_at?: Date | string;
+      context?: {
+        songId?: string;
+        creator?: string;
+        network?: string;
+        userAddress?: string;
+        acceptedMs?: number | string;
+        rate?: number | string;
+        startedAt?: number | string;
+      };
     }>;
 
     for (const row of rows) {
@@ -483,22 +579,87 @@ async function syncCreditStreamHolds(songIds: string[], songMap: Map<string, { c
       if (!songId) continue;
       const meta = songMap.get(songId);
       if (!meta) continue;
-      const gross = toBigIntSafe(row.settled);
+      const gross = toBigIntSafe(row.charged);
       if (gross <= 0n) continue;
       const creatorShare = (gross * CREATOR_SHARE_BPS) / BPS_DENOMINATOR;
+      let streamedMs = toBigIntSafe(row.context?.acceptedMs);
+      if (streamedMs <= 0n) {
+        const rate = toBigIntSafe(row.context?.rate);
+        if (rate > 0n) {
+          streamedMs = (gross * 60000n) / rate;
+        } else if (meta.streamPrice > 0) {
+          streamedMs = BigInt(Math.round((Number(gross) * 60000) / (meta.streamPrice * 1_000_000)));
+        }
+      }
+      const startedAtMs = Number(row.context?.startedAt || 0);
+      const createdAt = startedAtMs > 0 ? new Date(startedAtMs) : row.created_at;
+
       await recordSongEarning({
         id: `crd:${row.id}`,
         songId,
         creator: meta.creator,
-        network: meta.network || 'eip155:84532',
+        network: row.context?.network || meta.network || 'eip155:84532',
         kind: 'stream',
         grossAtomics: gross,
         creatorAtomics: creatorShare,
-        payer: row.account,
+        streamedMs,
+        payer: row.context?.userAddress || row.account,
+        createdAt,
       });
     }
   } catch {
     // Non-fatal credit hold sync
+  }
+}
+
+async function syncLicensedRemixEarnings(allSongIds: string[]): Promise<void> {
+  if (!allSongIds.length) return;
+  try {
+    const rows = await songSql`
+      SELECT
+        r.id AS remix_id,
+        r.source AS song_id,
+        r.creator AS payer,
+        r.tx_hash,
+        r.created_at,
+        p.creator AS parent_creator,
+        COALESCE(r.network, p.network, 'eip155:84532') AS network,
+        COALESCE(p.license_price, 0) AS license_price
+      FROM songs r
+      JOIN songs p ON p.id = r.source
+      WHERE r.source = ANY(${allSongIds})
+        AND LOWER(r.creator) <> LOWER(p.creator)
+        AND COALESCE(p.license_price, 0) > 0
+    `;
+    for (const r of rows as Array<{
+      remix_id: string;
+      song_id: string;
+      payer: string;
+      tx_hash: string | null;
+      created_at: Date | string;
+      parent_creator: string;
+      network: string;
+      license_price: number;
+    }>) {
+      const gross = BigInt(Math.round(Number(r.license_price) * 1_000_000));
+      if (gross <= 0n) continue;
+      const creatorShare = (gross * CREATOR_SHARE_BPS) / BPS_DENOMINATOR;
+      await recordSongEarning({
+        id: `lic:${r.remix_id}`,
+        songId: r.song_id,
+        creator: r.parent_creator,
+        network: r.network,
+        kind: 'license',
+        grossAtomics: gross,
+        creatorAtomics: creatorShare,
+        streamedMs: 0n,
+        txHash: r.tx_hash,
+        payer: r.payer,
+        createdAt: r.created_at,
+      });
+    }
+  } catch {
+    // Non-fatal license remix sync
   }
 }
 
@@ -509,7 +670,7 @@ export async function getCreatorEarnings(
   const normalizedInput = normalizeCreator(creatorInput);
   const addresses = await resolveIdentityAddresses(normalizedInput);
   const normalizedAddresses = Array.from(new Set([normalizedInput, ...addresses.map(normalizeCreator)]));
-  const cacheKey = `earnings:creator:${normalizedAddresses.slice().sort().join(',')}`;
+  const cacheKey = `earnings:v2:creator:${normalizedAddresses.slice().sort().join(',')}`;
 
   let baseData: CreatorEarningsResponse | undefined;
   if (!options?.refresh) {
@@ -521,9 +682,13 @@ export async function getCreatorEarnings(
     const publishedSongs = allCreatorSongs.filter(
       (s) => Boolean((s.public || s.chain_song_id || s.metadata_cid) && !s.source),
     );
-    const songMap = new Map<string, { creator: string; network: string | null }>();
+    const songMap = new Map<string, { creator: string; network: string | null; streamPrice: number }>();
     for (const s of allCreatorSongs) {
-      songMap.set(s.id, { creator: normalizeCreator(s.creator), network: s.network || null });
+      songMap.set(s.id, {
+        creator: normalizeCreator(s.creator),
+        network: s.network || null,
+        streamPrice: Math.max(0, Number(s.stream_price || 0)),
+      });
     }
 
     const creatorSet = new Set(normalizedAddresses);
@@ -532,6 +697,7 @@ export async function getCreatorEarnings(
     await Promise.all([
       syncValkeyStreamPayments(creatorSet, songMap),
       syncCreditStreamHolds(allSongIds, songMap),
+      syncLicensedRemixEarnings(allSongIds),
     ]);
 
     const chains = await getComposeChains();
@@ -539,9 +705,10 @@ export async function getCreatorEarnings(
     const [rawEarningsRows, rawRemixRows] = allSongIds.length > 0
       ? await Promise.all([
           songSql`
-            SELECT song_id, kind, creator_atomics, gross_atomics, tx_hash, network
+            SELECT id, song_id, kind, creator_atomics, gross_atomics, streamed_ms, tx_hash, payer, network, created_at
             FROM song_earnings
             WHERE song_id = ANY(${allSongIds})
+            ORDER BY created_at DESC
           `,
           songSql`
             SELECT source, COUNT(DISTINCT creator)::int AS cnt
@@ -553,12 +720,16 @@ export async function getCreatorEarnings(
       : [[], []];
 
     const dbEarningsRows = rawEarningsRows as Array<{
+      id: string;
       song_id: string;
-      kind: string;
+      kind: 'license' | 'stream';
       creator_atomics: string;
       gross_atomics: string;
+      streamed_ms: string;
       tx_hash: string | null;
+      payer: string | null;
       network: string;
+      created_at: Date | string;
     }>;
     const remixRows = rawRemixRows as Array<{ source: string; cnt: number }>;
 
@@ -567,26 +738,72 @@ export async function getCreatorEarnings(
       if (r.source && r.cnt > 0) remixCountBySong.set(r.source, Number(r.cnt));
     }
 
-    const streamAtomicsBySong = new Map<string, { atomics: bigint; count: number; lastTxHash: string | null }>();
-    const recordedLicenseAtomicsBySong = new Map<string, bigint>();
+    const streamStatsBySong = new Map<
+      string,
+      {
+        creatorAtomics: bigint;
+        grossAtomics: bigint;
+        streamedMs: bigint;
+        count: number;
+        lastTxHash: string | null;
+        lastAt: number;
+      }
+    >();
+    const licenseStatsBySong = new Map<
+      string,
+      {
+        creatorAtomics: bigint;
+        grossAtomics: bigint;
+        count: number;
+        lastTxHash: string | null;
+        lastAt: number;
+      }
+    >();
 
     for (const row of dbEarningsRows) {
       const share = toBigIntSafe(row.creator_atomics);
+      const gross = toBigIntSafe(row.gross_atomics);
+      const ms = toBigIntSafe(row.streamed_ms);
+      const ts = row.created_at ? new Date(row.created_at).getTime() : 0;
+
       if (row.kind === 'stream') {
-        const prev = streamAtomicsBySong.get(row.song_id) || { atomics: 0n, count: 0, lastTxHash: null };
-        prev.atomics += share;
+        const prev = streamStatsBySong.get(row.song_id) || {
+          creatorAtomics: 0n,
+          grossAtomics: 0n,
+          streamedMs: 0n,
+          count: 0,
+          lastTxHash: null,
+          lastAt: 0,
+        };
+        prev.creatorAtomics += share;
+        prev.grossAtomics += gross;
+        prev.streamedMs += ms;
         prev.count += 1;
-        if (row.tx_hash) prev.lastTxHash = row.tx_hash;
-        streamAtomicsBySong.set(row.song_id, prev);
+        if (row.tx_hash && !prev.lastTxHash) prev.lastTxHash = row.tx_hash;
+        if (ts > prev.lastAt) prev.lastAt = ts;
+        streamStatsBySong.set(row.song_id, prev);
       } else if (row.kind === 'license') {
-        recordedLicenseAtomicsBySong.set(
-          row.song_id,
-          (recordedLicenseAtomicsBySong.get(row.song_id) || 0n) + share,
-        );
+        const prev = licenseStatsBySong.get(row.song_id) || {
+          creatorAtomics: 0n,
+          grossAtomics: 0n,
+          count: 0,
+          lastTxHash: null,
+          lastAt: 0,
+        };
+        prev.creatorAtomics += share;
+        prev.grossAtomics += gross;
+        prev.count += 1;
+        if (row.tx_hash && !prev.lastTxHash) prev.lastTxHash = row.tx_hash;
+        if (ts > prev.lastAt) prev.lastAt = ts;
+        licenseStatsBySong.set(row.song_id, prev);
       }
     }
 
     const songsRecord: Record<string, SongEarningsItem> = {};
+    const publishedSongLookup = new Map<string, (typeof publishedSongs)[number]>();
+    for (const s of publishedSongs) {
+      publishedSongLookup.set(s.id, s);
+    }
 
     await Promise.all(
       publishedSongs.map(async (song) => {
@@ -603,11 +820,19 @@ export async function getCreatorEarnings(
           }
         }
 
+        const licenseEntry = licenseStatsBySong.get(song.id) || {
+          creatorAtomics: 0n,
+          grossAtomics: 0n,
+          count: 0,
+          lastTxHash: null,
+          lastAt: 0,
+        };
+
         const dbAllocation = Math.max(0, Number(song.licenses || 0));
         const onChainRemaining = onChain ? Number(onChain.licenseAmount) : dbAllocation;
         const remixCount = remixCountBySong.get(song.id) || 0;
         const chainDiffSold = Math.max(0, Math.max(dbAllocation, onChainRemaining) - Math.max(0, onChainRemaining));
-        const licensesSold = Math.max(chainDiffSold, remixCount);
+        const licensesSold = Math.max(chainDiffSold, remixCount, licenseEntry.count);
         const licensesRemaining = Math.max(0, onChainRemaining);
         const licensesMinted = Math.max(dbAllocation, licensesRemaining + licensesSold);
 
@@ -618,26 +843,119 @@ export async function getCreatorEarnings(
           ? onChain.streamPrice
           : BigInt(Math.round(Math.max(0, Number(song.stream_price || 0)) * 1_000_000));
 
+        const computedLicenseGrossAtomics = BigInt(licensesSold) * licensePriceAtomics;
         const computedLicenseProfitAtomics =
-          BigInt(licensesSold) * ((licensePriceAtomics * CREATOR_SHARE_BPS) / BPS_DENOMINATOR);
-        const dbLicenseProfitAtomics = recordedLicenseAtomicsBySong.get(song.id) || 0n;
-        const licenseProfitAtomics =
-          computedLicenseProfitAtomics >= dbLicenseProfitAtomics
-            ? computedLicenseProfitAtomics
-            : dbLicenseProfitAtomics;
+          (computedLicenseGrossAtomics * CREATOR_SHARE_BPS) / BPS_DENOMINATOR;
 
-        const streamEntry = streamAtomicsBySong.get(song.id) || {
-          atomics: 0n,
+        const licenseProfitAtomics =
+          computedLicenseProfitAtomics >= licenseEntry.creatorAtomics
+            ? computedLicenseProfitAtomics
+            : licenseEntry.creatorAtomics;
+        const licenseGrossAtomics =
+          computedLicenseGrossAtomics >= licenseEntry.grossAtomics
+            ? computedLicenseGrossAtomics
+            : licenseEntry.grossAtomics;
+
+        // If on-chain shows more licenses sold than recorded in song_earnings, persist the on-chain license sale
+        if (licensesSold > licenseEntry.count && licensePriceAtomics > 0n && network) {
+          const missingCount = licensesSold - licenseEntry.count;
+          const unitGross = licensePriceAtomics;
+          const unitCreator = (unitGross * CREATOR_SHARE_BPS) / BPS_DENOMINATOR;
+          for (let idx = 0; idx < missingCount; idx++) {
+            const synId = `onc:lic:${song.id}:${licenseEntry.count + idx + 1}`;
+            const synCreatedAt = song.last_played_at || song.created_at || new Date();
+            await recordSongEarning({
+              id: synId,
+              songId: song.id,
+              creator: song.creator,
+              network,
+              kind: 'license',
+              grossAtomics: unitGross,
+              creatorAtomics: unitCreator,
+              streamedMs: 0n,
+              txHash: song.tx_hash || null,
+              createdAt: synCreatedAt,
+            });
+            if (!dbEarningsRows.some((r) => r.id === synId)) {
+              dbEarningsRows.push({
+                id: synId,
+                song_id: song.id,
+                kind: 'license',
+                creator_atomics: unitCreator.toString(),
+                gross_atomics: unitGross.toString(),
+                streamed_ms: '0',
+                tx_hash: song.tx_hash || null,
+                payer: null,
+                network,
+                created_at: synCreatedAt,
+              });
+            }
+          }
+        }
+
+        const streamEntry = streamStatsBySong.get(song.id) || {
+          creatorAtomics: 0n,
+          grossAtomics: 0n,
+          streamedMs: 0n,
           count: 0,
           lastTxHash: null,
+          lastAt: 0,
         };
-        const streamProfitAtomics = streamEntry.atomics;
-        const totalProfitAtomics = licenseProfitAtomics + streamProfitAtomics;
+        const streamProfitAtomics = streamEntry.creatorAtomics;
+        const streamGrossAtomics =
+          streamEntry.grossAtomics >= streamProfitAtomics
+            ? streamEntry.grossAtomics
+            : (streamProfitAtomics * BPS_DENOMINATOR) / CREATOR_SHARE_BPS;
 
-        const txHash = song.tx_hash || streamEntry.lastTxHash || null;
+        const totalProfitAtomics = licenseProfitAtomics + streamProfitAtomics;
+        const totalGrossAtomics = licenseGrossAtomics + streamGrossAtomics;
+        const totalFeeAtomics =
+          totalGrossAtomics > totalProfitAtomics ? totalGrossAtomics - totalProfitAtomics : 0n;
+
+        const durationSec = song.duration && song.duration > 0 ? Number(song.duration) : 180;
+        const durationMs = Math.max(1000, Math.round(durationSec * 1000));
+        const dbPlays = Math.max(0, Number(song.plays || 0));
+        const plays = Math.max(dbPlays, streamEntry.count);
+
+        let streamedMs = Number(streamEntry.streamedMs);
+        if (streamedMs <= 0 && streamGrossAtomics > 0n && streamPriceAtomics > 0n) {
+          streamedMs = Math.round(Number((streamGrossAtomics * 60000n) / streamPriceAtomics));
+        }
+
+        const effectivePlayCountForAvg = streamEntry.count > 0 ? streamEntry.count : plays;
+        const avgStreamedMs =
+          effectivePlayCountForAvg > 0 && streamedMs > 0
+            ? Math.round(streamedMs / effectivePlayCountForAvg)
+            : 0;
+        const ratioPct =
+          durationMs > 0 && avgStreamedMs > 0
+            ? Number(Math.min(100, (avgStreamedMs / durationMs) * 100).toFixed(1))
+            : 0;
+
+        const genres = Array.isArray(song.genres) && song.genres.length > 0
+          ? song.genres.filter(Boolean)
+          : Array.isArray(song.tags) && song.tags.length > 0
+            ? song.tags.filter(Boolean)
+            : [];
+        const primaryGenre = genres[0] || 'Uncategorized';
+
+        const lastPlayedMs = Math.max(
+          song.last_played_at ? new Date(song.last_played_at).getTime() : 0,
+          streamEntry.lastAt,
+          licenseEntry.lastAt,
+          song.created_at ? new Date(song.created_at).getTime() : 0,
+        );
+
+        const txHash = song.tx_hash || streamEntry.lastTxHash || licenseEntry.lastTxHash || null;
 
         songsRecord[song.id] = {
           songId: song.id,
+          title: song.title || 'Untitled',
+          image: song.image || null,
+          genres,
+          primaryGenre,
+          durationSec,
+          durationMs,
           chainSongId: song.chain_song_id || null,
           network,
           networkFamily: family,
@@ -652,11 +970,96 @@ export async function getCreatorEarnings(
           licenseProfitUsd: atomicsToUsd(licenseProfitAtomics),
           streamProfitUsd: atomicsToUsd(streamProfitAtomics),
           totalProfitUsd: atomicsToUsd(totalProfitAtomics),
-          plays: Math.max(0, Number(song.plays || 0)),
+          platformFeeUsd: atomicsToUsd(totalFeeAtomics),
+          grossUsd: atomicsToUsd(totalGrossAtomics),
+          plays,
           streamSettlements: streamEntry.count,
+          streamedMs,
+          avgStreamedMs,
+          ratioPct,
+          lastPlayedAt: lastPlayedMs,
         };
       }),
     );
+
+    // Build events array from song_earnings for published creator songs
+    const events: EarningEventItem[] = [];
+    for (const row of dbEarningsRows) {
+      const songItem = songsRecord[row.song_id];
+      if (!songItem) continue;
+      const creatorAtomics = toBigIntSafe(row.creator_atomics);
+      const rawGross = toBigIntSafe(row.gross_atomics);
+      const grossAtomics =
+        rawGross >= creatorAtomics
+          ? rawGross
+          : (creatorAtomics * BPS_DENOMINATOR) / CREATOR_SHARE_BPS;
+      const feeAtomics = grossAtomics > creatorAtomics ? grossAtomics - creatorAtomics : 0n;
+
+      const net = row.network || songItem.network || 'eip155:84532';
+      const { family, label } = classifyNetwork(net);
+      let evStreamedMs = Number(toBigIntSafe(row.streamed_ms));
+      if (row.kind === 'stream' && evStreamedMs <= 0 && songItem.streamPriceUsd > 0) {
+        evStreamedMs = Math.round((atomicsToUsd(grossAtomics) * 60000) / songItem.streamPriceUsd);
+      }
+      const evRatioPct =
+        row.kind === 'stream' && songItem.durationMs > 0 && evStreamedMs > 0
+          ? Number(Math.min(100, (evStreamedMs / songItem.durationMs) * 100).toFixed(1))
+          : 0;
+      const txHash = row.tx_hash || (row.kind === 'license' ? songItem.txHash : null);
+      const ts = row.created_at ? new Date(row.created_at).getTime() : songItem.lastPlayedAt;
+
+      events.push({
+        id: row.id,
+        songId: row.song_id,
+        songTitle: songItem.title,
+        genre: songItem.primaryGenre,
+        network: net,
+        networkFamily: family,
+        networkLabel: label,
+        kind: row.kind,
+        royaltiesUsd: atomicsToUsd(creatorAtomics),
+        platformFeeUsd: atomicsToUsd(feeAtomics),
+        totalUsd: atomicsToUsd(grossAtomics),
+        streamedMs: evStreamedMs,
+        durationMs: songItem.durationMs,
+        ratioPct: evRatioPct,
+        txHash,
+        explorerUrl: resolveExplorerTxUrl(net, txHash, chains),
+        payer: row.payer || null,
+        timestamp: ts,
+      });
+    }
+
+    for (const songItem of Object.values(songsRecord)) {
+      const extraPlays = Math.max(0, songItem.plays - songItem.streamSettlements);
+      if (extraPlays > 0) {
+        const net = songItem.network || 'eip155:84532';
+        for (let idx = 0; idx < extraPlays; idx++) {
+          events.push({
+            id: `play:${songItem.songId}:${idx + 1}`,
+            songId: songItem.songId,
+            songTitle: songItem.title,
+            genre: songItem.primaryGenre,
+            network: net,
+            networkFamily: songItem.networkFamily,
+            networkLabel: songItem.networkLabel,
+            kind: 'stream',
+            royaltiesUsd: 0,
+            platformFeeUsd: 0,
+            totalUsd: 0,
+            streamedMs: 0,
+            durationMs: songItem.durationMs,
+            ratioPct: 0,
+            txHash: null,
+            explorerUrl: null,
+            payer: null,
+            timestamp: songItem.lastPlayedAt,
+          });
+        }
+      }
+    }
+
+    events.sort((a, b) => b.timestamp - a.timestamp);
 
     const networkBuckets = new Map<string, NetworkEarningsBreakdown>();
     for (const item of Object.values(songsRecord)) {
@@ -669,32 +1072,28 @@ export async function getCreatorEarnings(
         licensesSold: 0,
         licensesRemaining: 0,
         plays: 0,
+        streamedMs: 0,
         licenseProfitUsd: 0,
         streamProfitUsd: 0,
         totalProfitUsd: 0,
+        platformFeeUsd: 0,
+        grossUsd: 0,
       };
       existing.songCount += 1;
       existing.licensesSold += item.licensesSold;
       existing.licensesRemaining += item.licensesRemaining;
       existing.plays += item.plays;
+      existing.streamedMs += item.streamedMs;
       existing.licenseProfitUsd = Number((existing.licenseProfitUsd + item.licenseProfitUsd).toFixed(6));
       existing.streamProfitUsd = Number((existing.streamProfitUsd + item.streamProfitUsd).toFixed(6));
       existing.totalProfitUsd = Number((existing.totalProfitUsd + item.totalProfitUsd).toFixed(6));
+      existing.platformFeeUsd = Number((existing.platformFeeUsd + item.platformFeeUsd).toFixed(6));
+      existing.grossUsd = Number((existing.grossUsd + item.grossUsd).toFixed(6));
       networkBuckets.set(key, existing);
     }
 
     const allItems = Object.values(songsRecord);
-    const summary: CreatorEarningsSummary = {
-      totalProfitUsd: Number(allItems.reduce((acc, s) => acc + s.totalProfitUsd, 0).toFixed(6)),
-      licenseProfitUsd: Number(allItems.reduce((acc, s) => acc + s.licenseProfitUsd, 0).toFixed(6)),
-      streamProfitUsd: Number(allItems.reduce((acc, s) => acc + s.streamProfitUsd, 0).toFixed(6)),
-      licensesSold: allItems.reduce((acc, s) => acc + s.licensesSold, 0),
-      licensesRemaining: allItems.reduce((acc, s) => acc + s.licensesRemaining, 0),
-      licensesMinted: allItems.reduce((acc, s) => acc + s.licensesMinted, 0),
-      totalPlays: allItems.reduce((acc, s) => acc + s.plays, 0),
-      publishedCount: allItems.length,
-      activeNetworkFilter: 'all',
-    };
+    const summary = buildSummaryFromItems(allItems, 'all');
 
     baseData = {
       creator: normalizedInput,
@@ -702,6 +1101,7 @@ export async function getCreatorEarnings(
       summary,
       networks: Array.from(networkBuckets.values()).sort((a, b) => b.totalProfitUsd - a.totalProfitUsd),
       songs: songsRecord,
+      events,
     };
 
     await cacheSet(cacheKey, baseData, EARNINGS_CACHE_TTL, 15_000);
@@ -719,20 +1119,60 @@ export async function getCreatorEarnings(
     }
   }
   const filteredItems = Object.values(filteredSongs);
+  const filteredEvents = baseData.events.filter((ev) => matchesNetworkFilter(ev.network, filter));
 
   return {
     ...baseData,
-    summary: {
-      totalProfitUsd: Number(filteredItems.reduce((acc, s) => acc + s.totalProfitUsd, 0).toFixed(6)),
-      licenseProfitUsd: Number(filteredItems.reduce((acc, s) => acc + s.licenseProfitUsd, 0).toFixed(6)),
-      streamProfitUsd: Number(filteredItems.reduce((acc, s) => acc + s.streamProfitUsd, 0).toFixed(6)),
-      licensesSold: filteredItems.reduce((acc, s) => acc + s.licensesSold, 0),
-      licensesRemaining: filteredItems.reduce((acc, s) => acc + s.licensesRemaining, 0),
-      licensesMinted: filteredItems.reduce((acc, s) => acc + s.licensesMinted, 0),
-      totalPlays: filteredItems.reduce((acc, s) => acc + s.plays, 0),
-      publishedCount: filteredItems.length,
-      activeNetworkFilter: filter,
-    },
+    summary: buildSummaryFromItems(filteredItems, filter),
     songs: filteredSongs,
+    events: filteredEvents,
+  };
+}
+
+function buildSummaryFromItems(items: SongEarningsItem[], activeNetworkFilter: string): CreatorEarningsSummary {
+  const totalProfitUsd = Number(items.reduce((acc, s) => acc + s.totalProfitUsd, 0).toFixed(6));
+  const licenseProfitUsd = Number(items.reduce((acc, s) => acc + s.licenseProfitUsd, 0).toFixed(6));
+  const streamProfitUsd = Number(items.reduce((acc, s) => acc + s.streamProfitUsd, 0).toFixed(6));
+  const platformFeeUsd = Number(items.reduce((acc, s) => acc + s.platformFeeUsd, 0).toFixed(6));
+  const grossUsd = Number(items.reduce((acc, s) => acc + s.grossUsd, 0).toFixed(6));
+  const licensesSold = items.reduce((acc, s) => acc + s.licensesSold, 0);
+  const licensesRemaining = items.reduce((acc, s) => acc + s.licensesRemaining, 0);
+  const licensesMinted = items.reduce((acc, s) => acc + s.licensesMinted, 0);
+  const totalPlays = items.reduce((acc, s) => acc + s.plays, 0);
+  const totalStreamedMs = items.reduce((acc, s) => acc + s.streamedMs, 0);
+  const totalSettlements = items.reduce((acc, s) => acc + s.streamSettlements, 0);
+  const effectivePlayDenom = totalSettlements > 0 ? totalSettlements : totalPlays;
+  const avgStreamedMs = effectivePlayDenom > 0 ? Math.round(totalStreamedMs / effectivePlayDenom) : 0;
+
+  // Weighted average ratio across songs with streams
+  let weightedRatioNum = 0;
+  let weightedRatioDen = 0;
+  let peakRatioPct = 0;
+  for (const s of items) {
+    if (s.ratioPct > peakRatioPct) peakRatioPct = s.ratioPct;
+    const weight = s.streamSettlements > 0 ? s.streamSettlements : s.plays;
+    if (weight > 0 && s.ratioPct > 0) {
+      weightedRatioNum += s.ratioPct * weight;
+      weightedRatioDen += weight;
+    }
+  }
+  const avgRatioPct = weightedRatioDen > 0 ? Number((weightedRatioNum / weightedRatioDen).toFixed(1)) : 0;
+
+  return {
+    totalProfitUsd,
+    licenseProfitUsd,
+    streamProfitUsd,
+    platformFeeUsd,
+    grossUsd,
+    licensesSold,
+    licensesRemaining,
+    licensesMinted,
+    totalPlays,
+    totalStreamedMs,
+    avgStreamedMs,
+    avgRatioPct,
+    peakRatioPct: Number(peakRatioPct.toFixed(1)),
+    publishedCount: items.length,
+    activeNetworkFilter,
   };
 }
