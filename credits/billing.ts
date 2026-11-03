@@ -14,6 +14,107 @@ interface Billing {
 }
 const context = new AsyncLocalStorage<Billing>();
 
+const EVM_CARD_PAYER_POOL = [
+  '0xfafe4721cd793c6acc377ea9596e0a940fd9173c',
+  '0x640a98e15f734cd7c4e2c9be6184bff721a20245',
+  '0xcb0e1a2fd3fcc141cc2f5f76627018a047ce1850',
+  '0x058271e764154c322F3D3dDC18aF44F7d91B1c80',
+  '0x1d7909c2f158678addbae81d86105f7f7d4f2f3d',
+];
+
+const SVM_CARD_PAYER_POOL = [
+  'J62vBhiY1skwoXLmh3VG7jpgu6nrwczXh7NAfZgZn2tz',
+  '37JroxVmoush852hx51BVpsLYPwy9taxCmKLuQHgTXco',
+  'Bwdz2pkvWkKKjeuyL1XhxdtLDsEUcKMGYtvU5nwyy2Yp',
+  '7BBctXD2MmTAtJgo6zucZ8MNq11XRdv2hWdLKqy6SgES',
+];
+
+const cardComposeSessionCache = new Map<string, { token: string; userAddress: string; expiresAt: number }>();
+
+async function resolveCardComposeSession(
+  network: string,
+  preferredAddress?: string,
+): Promise<{ token: string; userAddress: string } | null> {
+  const composeUrl = (process.env.COMPOSE_API_URL || '').replace(/\/+$/, '');
+  if (!composeUrl || !network) return null;
+
+  const cached = cardComposeSessionCache.get(network);
+  if (cached && cached.expiresAt > Date.now() + 60000) {
+    return { token: cached.token, userAddress: cached.userAddress };
+  }
+
+  const isSolana = network.startsWith('solana:');
+  const pool = isSolana ? SVM_CARD_PAYER_POOL : EVM_CARD_PAYER_POOL;
+  const candidates: string[] = [];
+  if (preferredAddress && (isSolana ? !preferredAddress.startsWith('0x') : preferredAddress.startsWith('0x'))) {
+    candidates.push(preferredAddress);
+  }
+  for (const addr of pool) {
+    if (!candidates.includes(addr)) candidates.push(addr);
+  }
+
+  for (const addr of candidates) {
+    try {
+      const sesRes = await fetch(`${composeUrl}/api/session`, {
+        headers: {
+          'x-session-user-address': addr,
+          'x-network-id': network,
+          'x-chain-id': network,
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (sesRes.ok) {
+        const sesData = (await sesRes.json()) as any;
+        const existingToken = sesData?.token || sesData?.session?.token;
+        const remaining = BigInt(sesData?.budgetRemaining || sesData?.session?.budgetRemaining || '0');
+        const expiresAt = Number(sesData?.expiresAt || sesData?.session?.expiresAt) || Date.now() + 600000;
+        if (sesData?.hasSession && typeof existingToken === 'string' && existingToken && remaining >= 100000n) {
+          const entry = {
+            token: existingToken,
+            userAddress: addr,
+            expiresAt: Math.min(expiresAt, Date.now() + 600000),
+          };
+          cardComposeSessionCache.set(network, entry);
+          return { token: entry.token, userAddress: entry.userAddress };
+        }
+      }
+
+      const keyRes = await fetch(`${composeUrl}/api/keys`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-session-user-address': addr,
+          'x-network-id': network,
+          'x-chain-id': network,
+        },
+        body: JSON.stringify({
+          budgetLimit: '10000000',
+          expiresAt: Date.now() + 24 * 3600 * 1000,
+          network,
+          ...(network.startsWith('eip155:') ? { chainId: Number(network.split(':')[1]) } : {}),
+          purpose: 'session',
+          name: 'rawchunks-card-credits',
+        }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!keyRes.ok) continue;
+      const keyData = (await keyRes.json()) as any;
+      if (typeof keyData?.token === 'string' && keyData.token) {
+        const entry = {
+          token: keyData.token as string,
+          userAddress: addr,
+          expiresAt: Date.now() + 600000,
+        };
+        cardComposeSessionCache.set(network, entry);
+        return { token: entry.token, userAddress: entry.userAddress };
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
 async function buildBatchSettlementSignature(
   owner: string,
   userAddress: string,
@@ -111,7 +212,8 @@ export async function admitCredits(
       );
     }
     const rate = Math.round(song.stream_price * 1000000);
-    const durationMs = Math.ceil((song.duration || 0) * 1000);
+    const durationSec = song.duration && song.duration > 0 ? song.duration : 180;
+    const durationMs = Math.ceil(durationSec * 1000);
     if (!Number.isSafeInteger(rate) || rate < 0 || !Number.isSafeInteger(durationMs) || durationMs <= 0) {
       throw new Error('Streaming price or duration unavailable');
     }
@@ -145,25 +247,51 @@ export async function admitCredits(
   (req as any).paymentIntentId = hold.id;
   if (options?.metered && !hold.context) {
     const song = (req as any).song;
-    const streamNetwork = requestedNetwork || song.network;
+    const durationSec = song.duration && song.duration > 0 ? song.duration : 180;
+    const durationMs = Math.ceil(durationSec * 1000);
+    let streamNetwork: string | undefined = requestedNetwork || song.network;
     let composePaymentIntentId: string | undefined;
+    let composeToken: string | undefined;
+    let composeUserAddress: string | undefined;
     if (process.env.COMPOSE_API_URL && streamNetwork) {
       const { prepareStreamPaymentIntent } = await import('../broker/payment.js');
-      const paymentSignature = await buildBatchSettlementSignature(identity.owner, identity.userAddress, streamNetwork, hold.id);
-      composePaymentIntentId = await prepareStreamPaymentIntent({
-        token: `card:${hold.id}`,
-        paymentSignature,
-        holdOwner: identity.owner,
-        holdId: hold.id,
-        network: streamNetwork,
-        userAddress: identity.userAddress,
-        maxAmountWei: config.amountWei,
-        songId: song.id,
-        creatorAddress: song.creator,
-        streamPriceUsd: song.stream_price,
-        durationMs: Math.ceil(song.duration * 1000),
-        idempotencyKey: hold.id,
-      });
+      const tryPrepare = async (net: string) => {
+        const composeSession = await resolveCardComposeSession(net, identity.userAddress);
+        const token = composeSession?.token || `card:${hold.id}`;
+        const payerAddr = composeSession?.userAddress || identity.userAddress;
+        const paymentSignature = await buildBatchSettlementSignature(identity.owner, payerAddr, net, hold.id);
+        const intentId = await prepareStreamPaymentIntent({
+          token,
+          paymentSignature,
+          holdOwner: identity.owner,
+          holdId: hold.id,
+          network: net,
+          userAddress: payerAddr,
+          maxAmountWei: config.amountWei,
+          songId: song.id,
+          creatorAddress: song.creator,
+          streamPriceUsd: song.stream_price,
+          durationMs,
+          idempotencyKey: hold.id,
+        });
+        return { intentId, token, payerAddr, net };
+      };
+      try {
+        const prepared = await tryPrepare(streamNetwork);
+        composePaymentIntentId = prepared.intentId;
+        composeToken = prepared.token;
+        composeUserAddress = prepared.payerAddr;
+      } catch (err: any) {
+        if (err?.statusCode === 409 && song.network && song.network !== streamNetwork) {
+          const prepared = await tryPrepare(song.network);
+          streamNetwork = prepared.net;
+          composePaymentIntentId = prepared.intentId;
+          composeToken = prepared.token;
+          composeUserAddress = prepared.payerAddr;
+        } else {
+          throw err;
+        }
+      }
     }
     await store.tx(c =>
       c.query(
@@ -178,8 +306,10 @@ export async function admitCredits(
             userAddress: identity.userAddress,
             ...(streamNetwork ? { network: streamNetwork } : {}),
             ...(composePaymentIntentId ? { paymentIntentId: composePaymentIntentId } : {}),
+            ...(composeToken ? { composeToken } : {}),
+            ...(composeUserAddress ? { composeUserAddress } : {}),
             rate: String(Math.round(song.stream_price * 1000000)),
-            durationMs: Math.ceil(song.duration * 1000),
+            durationMs,
             startedAt: Date.now(),
           }),
         ],
@@ -211,14 +341,14 @@ export async function checkpointCredits(req: FastifyRequest) {
     typeof req.headers['x-network-id'] === 'string' && req.headers['x-network-id'].trim()
       ? req.headers['x-network-id'].trim()
       : undefined;
-  const streamNetwork: string | undefined = requestedNetwork || row.context.network;
+  const streamNetwork: string | undefined = row.context.network || requestedNetwork;
   if (row.context.paymentIntentId && process.env.COMPOSE_API_URL && streamNetwork) {
     const { settleStreamCheckpoint } = await import('../broker/payment.js');
     const receipt = await settleStreamCheckpoint({
       paymentIntentId: row.context.paymentIntentId,
       network: streamNetwork,
       listenedSeconds: input.listenedSeconds!,
-      token: `card:${row.id}`,
+      token: row.context.composeToken || `card:${row.id}`,
       songId: row.context.songId,
       terminal: Boolean(input.terminal),
     });
@@ -246,6 +376,7 @@ export async function checkpointCredits(req: FastifyRequest) {
           kind: 'stream',
           grossAtomics: billedAtomics,
           creatorAtomics: (billedAtomics * 80n) / 100n,
+          streamedMs: result.acceptedMs,
           payer: identity.userAddress,
         });
       })
@@ -271,24 +402,31 @@ export function installCreditBilling(app: FastifyInstance) {
     else if (reply.statusCode < 400 && !row.context) {
       await store.commit(billing.owner, billing.hold, BigInt(row.maximum));
       await store.release(billing.owner, billing.hold);
-      if (row.credit_source === 'card' && process.env.COMPOSE_API_URL && billing.network && billing.userAddress) {
-        const network = billing.network;
-        const userAddress = billing.userAddress;
+      if (row.credit_source === 'card' && process.env.COMPOSE_API_URL) {
+        const network = billing.network || (billing.userAddress && !billing.userAddress.startsWith('0x') ? 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1' : 'eip155:84532');
+        const userAddress = billing.userAddress || billing.owner;
         const action = billing.action || 'vibe';
         setImmediate(async () => {
           try {
             const { settleSessionPaymentAsync } = await import('../broker/payment.js');
-            const paymentSignature = await buildBatchSettlementSignature(billing.owner, userAddress, network, row.id);
+            const composeSession = await resolveCardComposeSession(network, userAddress);
+            const token = composeSession?.token || `card:${row.id}`;
+            const payerAddr = composeSession?.userAddress || userAddress;
+            const paymentSignature = await buildBatchSettlementSignature(billing.owner, payerAddr, network, row.id);
+            const creatorMatch =
+              row.creator && row.creator.startsWith('0x') !== network.startsWith('solana:')
+                ? row.creator
+                : undefined;
             await settleSessionPaymentAsync({
-              token: `card:${row.id}`,
+              token,
               paymentSignature,
               network,
-              userAddress,
+              userAddress: payerAddr,
               amountWei: String(row.maximum),
               action,
               resource: row.resource,
               method: req.method,
-              creatorAddress: row.creator || undefined,
+              creatorAddress: creatorMatch,
             });
           } catch {
             // Non-blocking background settlement
@@ -329,22 +467,35 @@ export async function recoverCreditServices() {
     if (task?.result?.status === 'ready') {
       await store.commit(hold.owner, hold.id, BigInt(hold.maximum));
       await store.release(hold.owner, hold.id);
-      const network = hold.context?.network || task?.params?.network;
       const userAddress = hold.context?.userAddress || task?.params?.userAddress || task?.params?.creatorAddress || hold.owner;
-      if (hold.credit_source === 'card' && process.env.COMPOSE_API_URL && typeof network === 'string' && network) {
+      const rawNetwork = hold.context?.network || task?.params?.network;
+      const network =
+        typeof rawNetwork === 'string' && rawNetwork
+          ? rawNetwork
+          : typeof userAddress === 'string' && !userAddress.startsWith('0x')
+            ? 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1'
+            : 'eip155:84532';
+      if (hold.credit_source === 'card' && process.env.COMPOSE_API_URL && network) {
         try {
           const { settleSessionPaymentAsync } = await import('../broker/payment.js');
-          const paymentSignature = await buildBatchSettlementSignature(hold.owner, userAddress, network, hold.id);
+          const composeSession = await resolveCardComposeSession(network, userAddress);
+          const token = composeSession?.token || `card:${hold.id}`;
+          const payerAddr = composeSession?.userAddress || userAddress;
+          const paymentSignature = await buildBatchSettlementSignature(hold.owner, payerAddr, network, hold.id);
+          const creatorMatch =
+            hold.creator && hold.creator.startsWith('0x') !== network.startsWith('solana:')
+              ? hold.creator
+              : undefined;
           void settleSessionPaymentAsync({
-            token: `card:${hold.id}`,
+            token,
             paymentSignature,
             network,
-            userAddress,
+            userAddress: payerAddr,
             amountWei: String(hold.maximum),
             action: hold.context?.action || hold.context?.kind || 'generate',
             resource: hold.resource,
             method: 'POST',
-            creatorAddress: hold.creator || undefined,
+            creatorAddress: creatorMatch,
           });
         } catch {
           // Non-blocking background settlement
