@@ -103,8 +103,22 @@ export const creditsRouter: FastifyPluginAsync = async app => {
 
   app.post('/credits/paypal/capture-order', async req => {
     const identity = await resolveCreditOwner(req);
-    const input = body(z.object({ operationId: id.optional(), orderId: id }), req.body);
-    return paypal.capture(identity.owner, input.operationId, input.orderId);
+    const input = body(
+      z.object({
+        operationId: id.optional(),
+        orderId: id,
+        card: z
+          .object({
+            number: z.string().min(12).max(24),
+            expiry: z.string().min(4).max(10),
+            securityCode: z.string().min(3).max(4),
+            name: z.string().max(128).optional(),
+          })
+          .optional(),
+      }),
+      req.body,
+    );
+    return paypal.capture(identity.owner, input.operationId, input.orderId, input.card);
   });
 
   app.post('/credits/license/create-order', async req => {

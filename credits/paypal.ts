@@ -173,13 +173,16 @@ export class PayPal {
     const apiKey = process.env.COINFLOW_SANDBOX_API_KEY;
     if (!apiKey) throw fail('Coinflow Sandbox configuration unavailable', 503);
     const coinflowBase = 'https://api-sandbox.coinflow.cash';
-    const blockchain = op.context?.blockchain || blockchainForNetwork(op.context?.network) || 'solana';
     const rawWallet = typeof (op.context?.walletAddress || op.owner) === 'string' ? String(op.context?.walletAddress || op.owner).trim() : '';
+    const blockchain =
+      op.context?.blockchain ||
+      blockchainForNetwork(op.context?.network) ||
+      (rawWallet.startsWith('0x') ? 'base' : 'solana');
     const walletAddress =
       blockchain === 'solana'
         ? (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(rawWallet)
             ? rawWallet
-            : process.env.SOLANA_TREASURY_WALLET || 'AmKD9311222222222222222222222222222222222222')
+            : process.env.SOLANA_TREASURY_WALLET || '139ckThCRxYDDFXgfRjH4TCiaTJETbb1UMLwACvWJ1fq')
         : (/^0x[a-fA-F0-9]{40}$/.test(rawWallet)
             ? rawWallet
             : process.env.FACILITATOR_ETHEREUM_ADDRESS || process.env.TREASURY_WALLET || '0x742d35Cc6634C0532925a3b844Bc9e7595f5bE21');
@@ -189,7 +192,8 @@ export class PayPal {
       method: 'GET',
       headers: {
         Authorization: apiKey,
-        'x-coinflow-auth-user-id': op.id,
+        'x-coinflow-auth-wallet': walletAddress,
+        'x-coinflow-auth-blockchain': blockchain,
       },
       signal: AbortSignal.timeout(15000),
     });
@@ -197,22 +201,82 @@ export class PayPal {
     const { key: sessionKey } = (await sessionRes.json()) as { key?: string };
     if (typeof sessionKey !== 'string' || !sessionKey) throw fail('Invalid Coinflow session-key response');
 
+    const btRes = await this.transport('https://api.test.basistheory.com/tokens', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'BT-API-KEY': process.env.BASISTHEORY_TEST_API_KEY || 'key_test_us_pub_9dHTSnq4U88b42p354zPqq',
+      },
+      body: JSON.stringify({
+        id: "{{ data.number | alias_card: 'true', 'true' }}_bt",
+        type: 'card',
+        data: {
+          number: '4111111111111111',
+          cvc: '123',
+          expiration_month: 12,
+          expiration_year: 2028,
+        },
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!btRes.ok) throw fail(`BasisTheory card tokenization failed (${btRes.status})`);
+    const btData = (await btRes.json()) as { id?: string };
+    if (typeof btData.id !== 'string' || !btData.id) throw fail('Invalid BasisTheory token response');
+
+    const regRes = await this.transport(`${coinflowBase}/api/tokenize/register`, {
+      method: 'POST',
+      headers: {
+        Authorization: apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        token: btData.id,
+        provider: 'one',
+        merchantId: 'rawchunks',
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!regRes.ok) throw fail(`Coinflow token registration failed (${regRes.status})`);
+    const regData = (await regRes.json()) as { token?: string };
+    if (typeof regData.token !== 'string' || !regData.token) throw fail('Invalid Coinflow token registration response');
+
     const cents = Number(op.context?.cents) || Math.max(1, Math.round(Number(op.amount) / 10000));
     const email = (payerEmail || process.env.PAYPAL_CREATOR_EMAIL || 'sb-1llge53425539@personal.example.com').toLowerCase();
-    const checkoutRes = await this.transport(`${coinflowBase}/api/checkout/paypal/rawchunks`, {
+    const checkoutRes = await this.transport(`${coinflowBase}/api/checkout/card/rawchunks`, {
       method: 'POST',
       headers: {
         Authorization: apiKey,
         'x-coinflow-auth-session-key': sessionKey,
-        'x-coinflow-auth-user-id': op.id,
         'x-coinflow-auth-wallet': walletAddress,
         'x-coinflow-auth-blockchain': blockchain,
+        'x-device-id': `dev-${op.id}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
         subtotal: { cents, currency: 'USD' },
+        settlementType: 'Credits',
         email,
-        paypal: { email },
+        chargebackProtectionData: [
+          {
+            productName: op.kind === 'license' ? 'Rawchunks Song License' : 'Rawchunks Credits',
+            productType: op.kind === 'license' ? 'inGameProduct' : 'topUp',
+            quantity: 1,
+          },
+        ],
+        card: {
+          cardToken: regData.token,
+          email,
+          firstName: 'Rawchunks',
+          lastName: 'User',
+          address1: '123 Main St',
+          city: 'New York',
+          state: 'NY',
+          zip: '10001',
+          country: 'US',
+          expYear: '28',
+          expMonth: '12',
+          saveCard: false,
+        },
         webhookInfo: {
           operationId: op.id,
           ...(op.context?.songId ? { songId: op.context.songId } : {}),
@@ -223,11 +287,11 @@ export class PayPal {
           paypalCaptureId: captureId,
         },
       }),
-      signal: AbortSignal.timeout(20000),
+      signal: AbortSignal.timeout(25000),
     });
     if (!checkoutRes.ok) {
       const errBody = await checkoutRes.json().catch(() => ({})) as any;
-      throw fail(`Coinflow PayPal checkout failed (${checkoutRes.status})${errBody?.details ? `: ${JSON.stringify(errBody.details)}` : ''}`);
+      throw fail(`Coinflow card checkout failed (${checkoutRes.status})${errBody?.details ? `: ${JSON.stringify(errBody.details)}` : ''}`);
     }
     const { paymentId } = (await checkoutRes.json()) as { paymentId?: string };
     if (typeof paymentId !== 'string' || !paymentId) throw fail('Coinflow returned no paymentId');
@@ -335,7 +399,7 @@ export class PayPal {
       return this.coinflowCheckout(op, capture.id, order.payer?.email_address, true);
     }
     let coinflowPaymentId: string | undefined = op.context?.coinflowPaymentId;
-    if ((op.context?.network || op.context?.blockchain) && process.env.COINFLOW_SANDBOX_API_KEY) {
+    if (process.env.COINFLOW_SANDBOX_API_KEY) {
       try {
         const cf = await this.coinflowCheckout(op, capture.id, order.payer?.email_address, false);
         coinflowPaymentId = cf.coinflowPaymentId;
