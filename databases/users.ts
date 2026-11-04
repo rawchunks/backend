@@ -3,7 +3,7 @@ import { userSql, songSql } from './client.js';
 import type { FastifyRequest } from 'fastify';
 import { getSongById } from './songs.js';
 import { verifyCachedTokenAddress } from '../credits/auth.js';
-import { cacheGet, cacheMGet, cacheSet, singleFlight } from './cache.js';
+import { cacheGet, cacheMGet, cacheSet, cacheDel, singleFlight } from './cache.js';
 
 export const STARTER_SONG_ID = 'sng-95ee3b8a-e8a0-4f6d-bef4-69bac7528e35';
 
@@ -690,4 +690,110 @@ export async function readTake(request: FastifyRequest, takeId: string, songId?:
   const rows = await songSql`SELECT song_id FROM takes WHERE id = ${takeId} LIMIT 1`;
   if (!rows[0] || (songId && rows[0].song_id !== songId)) throw new RequestError('Take not found', 404);
   return readSong(request, rows[0].song_id);
+}
+
+const FOLLOW_CACHE_TTL_SEC = 180;
+
+export async function getFollowedCreators(followerAddress: string): Promise<string[]> {
+  const followerAddrs = await resolveIdentityAddresses(followerAddress);
+  if (!followerAddrs.length) return [];
+  const primary = followerAddrs[0];
+  const cacheKey = `follows:list:${primary}`;
+  const cached = await cacheGet<string[]>(cacheKey);
+  if (cached) return cached;
+
+  const rows = await userSql`
+    SELECT creator_address, MAX(created_at) AS latest
+    FROM public.follows
+    WHERE follower_address = ANY(${followerAddrs})
+    GROUP BY creator_address
+    ORDER BY latest DESC
+  `;
+  const list = rows.map((r: any) => String(r.creator_address));
+  await cacheSet(cacheKey, list, FOLLOW_CACHE_TTL_SEC);
+  return list;
+}
+
+export async function getCreatorFollowStats(
+  creatorAddress: string,
+  viewerAddress?: string | null
+): Promise<{ creator: string; followersCount: number; following: boolean }> {
+  const creatorAddrs = await resolveIdentityAddresses(creatorAddress);
+  const canonicalCreator = creatorAddrs[0] || parseAddress(creatorAddress).value;
+  const countKey = `follows:count:${canonicalCreator}`;
+
+  let followersCount = await cacheGet<number>(countKey);
+  if (typeof followersCount !== 'number') {
+    const countRows = await userSql`
+      SELECT COUNT(DISTINCT follower_address)::int AS count
+      FROM public.follows
+      WHERE creator_address = ANY(${creatorAddrs})
+    `;
+    followersCount = Number(countRows[0]?.count ?? 0);
+    await cacheSet(countKey, followersCount, FOLLOW_CACHE_TTL_SEC);
+  }
+
+  let following = false;
+  if (viewerAddress && viewerAddress.trim()) {
+    try {
+      const viewerList = await getFollowedCreators(viewerAddress);
+      const creatorSet = new Set(creatorAddrs.map((a) => (a.startsWith('0x') ? a.toLowerCase() : a)));
+      following = viewerList.some((c) => creatorSet.has(c.startsWith('0x') ? c.toLowerCase() : c));
+    } catch {
+      following = false;
+    }
+  }
+
+  return {
+    creator: canonicalCreator,
+    followersCount,
+    following,
+  };
+}
+
+export async function toggleCreatorFollow(
+  followerAddress: string,
+  creatorAddress: string,
+  explicitFollow?: boolean
+): Promise<{ creator: string; followersCount: number; following: boolean }> {
+  const followerAddrs = await resolveIdentityAddresses(followerAddress);
+  const creatorAddrs = await resolveIdentityAddresses(creatorAddress);
+  const canonicalFollower = followerAddrs[0] || parseAddress(followerAddress).value;
+  const canonicalCreator = creatorAddrs[0] || parseAddress(creatorAddress).value;
+
+  const creatorSet = new Set(creatorAddrs.map((a) => (a.startsWith('0x') ? a.toLowerCase() : a)));
+  if (followerAddrs.some((a) => creatorSet.has(a.startsWith('0x') ? a.toLowerCase() : a))) {
+    throw new RequestError('Cannot follow your own profile', 400);
+  }
+
+  const existingRows = await userSql`
+    SELECT 1
+    FROM public.follows
+    WHERE follower_address = ANY(${followerAddrs})
+      AND creator_address = ANY(${creatorAddrs})
+    LIMIT 1
+  `;
+  const isCurrentlyFollowing = existingRows.length > 0;
+  const shouldFollow = explicitFollow !== undefined ? explicitFollow : !isCurrentlyFollowing;
+
+  if (shouldFollow && !isCurrentlyFollowing) {
+    await userSql`
+      INSERT INTO public.follows (follower_address, creator_address)
+      VALUES (${canonicalFollower}, ${canonicalCreator})
+      ON CONFLICT (follower_address, creator_address) DO NOTHING
+    `;
+  } else if (!shouldFollow && isCurrentlyFollowing) {
+    await userSql`
+      DELETE FROM public.follows
+      WHERE follower_address = ANY(${followerAddrs})
+        AND creator_address = ANY(${creatorAddrs})
+    `;
+  }
+
+  await Promise.all([
+    ...creatorAddrs.map((c) => cacheDel(`follows:count:${c}`)),
+    ...followerAddrs.map((f) => cacheDel(`follows:list:${f}`)),
+  ]);
+
+  return getCreatorFollowStats(canonicalCreator, canonicalFollower);
 }

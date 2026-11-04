@@ -1,6 +1,6 @@
-import { eq, desc, inArray, sql, and } from 'drizzle-orm';
-import { songDb } from './client.js';
-import { songs, type Song, type NewSong } from './schema/songs.js';
+import { eq, desc, asc, inArray, sql, and } from 'drizzle-orm';
+import { songDb, songSql } from './client.js';
+import { songs, songComments, songLikes, type Song, type NewSong, type SongComment } from './schema/songs.js';
 import { stems, type Stem, type NewStem } from './schema/stems.js';
 import { takes, type Take, type NewTake } from './schema/takes.js';
 import { commits } from './schema/commits.js';
@@ -736,4 +736,199 @@ export async function finalizeSong(songId: string, outputs: NewSong[], master: N
     where ${pending} on conflict (id) do nothing
   `));
   await songDb.batch(statements as [any, ...any[]]);
+}
+
+const COMMENTS_CACHE_TTL_SEC = 180;
+const LIKES_CACHE_TTL_SEC = 180;
+
+export async function getSongComments(songId: string): Promise<SongComment[]> {
+  const cacheKey = `comments:song:${songId}`;
+  const cached = await cacheGet<SongComment[]>(cacheKey);
+  if (cached) return cached;
+
+  const rows = await songDb
+    .select()
+    .from(songComments)
+    .where(eq(songComments.song_id, songId))
+    .orderBy(asc(songComments.timestamp_sec), asc(songComments.created_at));
+
+  await cacheSet(cacheKey, rows, COMMENTS_CACHE_TTL_SEC);
+  return rows;
+}
+
+export async function addSongComment(input: {
+  songId: string;
+  author: string;
+  body: string;
+  timestampSec: number;
+}): Promise<SongComment> {
+  const cleanBody = input.body.trim();
+  if (!cleanBody || cleanBody.length > 280) {
+    throw new RequestError('Comment must be between 1 and 280 characters', 400);
+  }
+  const parsedAuthor = parseAddress(input.author).value;
+  const song = await getSongById(input.songId);
+  if (!song) {
+    throw new RequestError('Song not found', 404);
+  }
+  if (!song.public) {
+    throw new RequestError('Comments are only enabled on published songs', 403);
+  }
+
+  const maxDur = typeof song.duration === 'number' && song.duration > 0 ? song.duration : 600;
+  const clampedTime = Math.max(0, Math.min(maxDur, Number.isFinite(input.timestampSec) ? input.timestampSec : 0));
+  const id = `cmt-${randomUUID()}`;
+
+  const [inserted] = await songDb
+    .insert(songComments)
+    .values({
+      id,
+      song_id: input.songId,
+      author: parsedAuthor,
+      body: cleanBody,
+      timestamp_sec: Number(clampedTime.toFixed(2)),
+    })
+    .returning();
+
+  const [updatedSong] = await songDb
+    .update(songs)
+    .set({
+      comments_count: sql`(SELECT count(*)::int FROM comments WHERE song_id = ${input.songId})`,
+    })
+    .where(eq(songs.id, input.songId))
+    .returning();
+
+  await Promise.all([
+    cacheDel(`comments:song:${input.songId}`),
+    updatedSong ? cacheSet(`songs:id:${input.songId}`, updatedSong, 120) : cacheDel(`songs:id:${input.songId}`),
+    invalidateMarketSongCache(),
+  ]);
+
+  return inserted;
+}
+
+export async function deleteSongComment(
+  songId: string,
+  commentId: string,
+  requesterAddress: string
+): Promise<boolean> {
+  const rows = await songDb
+    .select()
+    .from(songComments)
+    .where(and(eq(songComments.id, commentId), eq(songComments.song_id, songId)))
+    .limit(1);
+  const existing = rows[0];
+  if (!existing) return false;
+
+  const requesterAddrs = await resolveIdentityAddresses(requesterAddress);
+  const song = await getSongById(songId);
+  const allowedAddrs = new Set(
+    [
+      existing.author,
+      ...(song ? [song.creator] : []),
+    ].map((a) => (a.startsWith('0x') ? a.toLowerCase() : a))
+  );
+  const isAuthorized = requesterAddrs.some((a) =>
+    allowedAddrs.has(a.startsWith('0x') ? a.toLowerCase() : a)
+  );
+  if (!isAuthorized) {
+    throw new RequestError('Not authorized to delete this comment', 403);
+  }
+
+  await songDb.delete(songComments).where(eq(songComments.id, commentId));
+  const [updatedSong] = await songDb
+    .update(songs)
+    .set({
+      comments_count: sql`(SELECT count(*)::int FROM comments WHERE song_id = ${songId})`,
+    })
+    .where(eq(songs.id, songId))
+    .returning();
+
+  await Promise.all([
+    cacheDel(`comments:song:${songId}`),
+    updatedSong ? cacheSet(`songs:id:${songId}`, updatedSong, 120) : cacheDel(`songs:id:${songId}`),
+    invalidateMarketSongCache(),
+  ]);
+
+  return true;
+}
+
+export async function getUserLikedSongIds(userAddress: string): Promise<string[]> {
+  const addrs = await resolveIdentityAddresses(userAddress);
+  if (!addrs.length) return [];
+  const primary = addrs[0];
+  const cacheKey = `likes:user:${primary}`;
+  const cached = await cacheGet<string[]>(cacheKey);
+  if (cached) return cached;
+
+  const rows = await songSql`
+    SELECT l.song_id, MAX(l.created_at) AS latest
+    FROM likes l
+    JOIN songs s ON s.id = l.song_id
+    WHERE l.user_address = ANY(${addrs})
+      AND s.public = true
+    GROUP BY l.song_id
+    ORDER BY latest DESC
+  `;
+  const ids = rows.map((r: any) => String(r.song_id));
+  await cacheSet(cacheKey, ids, LIKES_CACHE_TTL_SEC);
+  return ids;
+}
+
+export async function toggleSongLike(
+  songId: string,
+  userAddress: string,
+  explicitLike?: boolean
+): Promise<{ songId: string; liked: boolean; likesCount: number }> {
+  const addrs = await resolveIdentityAddresses(userAddress);
+  const canonicalUser = addrs[0] || parseAddress(userAddress).value;
+
+  const song = await getSongById(songId);
+  if (!song) throw new RequestError('Song not found', 404);
+  if (!song.public) throw new RequestError('Likes are only enabled on published songs', 403);
+
+  const existing = await songSql`
+    SELECT 1 FROM likes
+    WHERE song_id = ${songId}
+      AND user_address = ANY(${addrs})
+    LIMIT 1
+  `;
+  const isCurrentlyLiked = existing.length > 0;
+  const shouldLike = explicitLike !== undefined ? explicitLike : !isCurrentlyLiked;
+
+  if (shouldLike && !isCurrentlyLiked) {
+    await songSql`
+      INSERT INTO likes (song_id, user_address)
+      VALUES (${songId}, ${canonicalUser})
+      ON CONFLICT (song_id, user_address) DO NOTHING
+    `;
+  } else if (!shouldLike && isCurrentlyLiked) {
+    await songSql`
+      DELETE FROM likes
+      WHERE song_id = ${songId}
+        AND user_address = ANY(${addrs})
+    `;
+  }
+
+  const [updatedSong] = await songDb
+    .update(songs)
+    .set({
+      likes: sql`(SELECT count(DISTINCT user_address)::int FROM likes WHERE song_id = ${songId})`,
+    })
+    .where(eq(songs.id, songId))
+    .returning();
+
+  const likesCount = Number(updatedSong?.likes ?? 0);
+
+  await Promise.all([
+    ...addrs.map((a) => cacheDel(`likes:user:${a}`)),
+    updatedSong ? cacheSet(`songs:id:${songId}`, updatedSong, 120) : cacheDel(`songs:id:${songId}`),
+    invalidateMarketSongCache(),
+  ]);
+
+  return {
+    songId,
+    liked: shouldLike,
+    likesCount,
+  };
 }
