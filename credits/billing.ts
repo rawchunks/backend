@@ -14,52 +14,52 @@ interface Billing {
 }
 const context = new AsyncLocalStorage<Billing>();
 
-const EVM_CARD_PAYER_POOL = [
-  '0xfafe4721cd793c6acc377ea9596e0a940fd9173c',
-  '0x640a98e15f734cd7c4e2c9be6184bff721a20245',
-  '0xcb0e1a2fd3fcc141cc2f5f76627018a047ce1850',
-  '0x058271e764154c322F3D3dDC18aF44F7d91B1c80',
-  '0x1d7909c2f158678addbae81d86105f7f7d4f2f3d',
-];
-
-const SVM_CARD_PAYER_POOL = [
-  'J62vBhiY1skwoXLmh3VG7jpgu6nrwczXh7NAfZgZn2tz',
-  '37JroxVmoush852hx51BVpsLYPwy9taxCmKLuQHgTXco',
-  'Bwdz2pkvWkKKjeuyL1XhxdtLDsEUcKMGYtvU5nwyy2Yp',
-  '7BBctXD2MmTAtJgo6zucZ8MNq11XRdv2hWdLKqy6SgES',
-];
-
 const cardComposeSessionCache = new Map<string, { token: string; userAddress: string; expiresAt: number }>();
+
+function composeSessionCacheKey(network: string, userAddress: string): string {
+  return `${network}:${userAddress.startsWith('0x') ? userAddress.toLowerCase() : userAddress}`;
+}
+
+export function invalidateCardComposeSession(network: string, userAddress: string): void {
+  if (!network || !userAddress) return;
+  cardComposeSessionCache.delete(composeSessionCacheKey(network, userAddress));
+}
 
 async function resolveCardComposeSession(
   network: string,
-  preferredAddress?: string,
+  userAddress?: string,
+  requiredAmountWei?: string,
+  forceRefresh = false,
 ): Promise<{ token: string; userAddress: string } | null> {
   const composeUrl = (process.env.COMPOSE_API_URL || '').replace(/\/+$/, '');
-  if (!composeUrl || !network) return null;
-
-  const cached = cardComposeSessionCache.get(network);
-  if (cached && cached.expiresAt > Date.now() + 60000) {
-    return { token: cached.token, userAddress: cached.userAddress };
-  }
+  if (!composeUrl || !network || !userAddress) return null;
 
   const isSolana = network.startsWith('solana:');
-  const pool = isSolana ? SVM_CARD_PAYER_POOL : EVM_CARD_PAYER_POOL;
-  const candidates: string[] = [];
-  if (preferredAddress && (isSolana ? !preferredAddress.startsWith('0x') : preferredAddress.startsWith('0x'))) {
-    candidates.push(preferredAddress);
-  }
-  for (const addr of pool) {
-    if (!candidates.includes(addr)) candidates.push(addr);
+  if (isSolana ? userAddress.startsWith('0x') : !userAddress.startsWith('0x')) {
+    return null;
   }
 
-  for (const addr of candidates) {
-    try {
+  const minRequired =
+    requiredAmountWei && /^\d+$/.test(requiredAmountWei) && BigInt(requiredAmountWei) > 0n
+      ? BigInt(requiredAmountWei)
+      : 100000n;
+  const cacheKey = composeSessionCacheKey(network, userAddress);
+
+  if (forceRefresh) {
+    cardComposeSessionCache.delete(cacheKey);
+  } else {
+    const cached = cardComposeSessionCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now() + 60000) {
+      return { token: cached.token, userAddress: cached.userAddress };
+    }
+  }
+
+  try {
+    if (!forceRefresh) {
       const sesRes = await fetch(`${composeUrl}/api/session`, {
         headers: {
-          'x-session-user-address': addr,
+          'x-session-user-address': userAddress,
           'x-network-id': network,
-          'x-chain-id': network,
         },
         signal: AbortSignal.timeout(10000),
       });
@@ -68,49 +68,67 @@ async function resolveCardComposeSession(
         const existingToken = sesData?.token || sesData?.session?.token;
         const remaining = BigInt(sesData?.budgetRemaining || sesData?.session?.budgetRemaining || '0');
         const expiresAt = Number(sesData?.expiresAt || sesData?.session?.expiresAt) || Date.now() + 600000;
-        if (sesData?.hasSession && typeof existingToken === 'string' && existingToken && remaining >= 100000n) {
+        if (sesData?.hasSession && typeof existingToken === 'string' && existingToken && remaining >= minRequired) {
           const entry = {
             token: existingToken,
-            userAddress: addr,
+            userAddress,
             expiresAt: Math.min(expiresAt, Date.now() + 600000),
           };
-          cardComposeSessionCache.set(network, entry);
+          cardComposeSessionCache.set(cacheKey, entry);
           return { token: entry.token, userAddress: entry.userAddress };
         }
       }
+    }
 
-      const keyRes = await fetch(`${composeUrl}/api/keys`, {
+    const requestKey = (budgetLimit: string) =>
+      fetch(`${composeUrl}/api/keys`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-session-user-address': addr,
+          'x-session-user-address': userAddress,
           'x-network-id': network,
-          'x-chain-id': network,
         },
         body: JSON.stringify({
-          budgetLimit: '10000000',
+          budgetLimit,
           expiresAt: Date.now() + 24 * 3600 * 1000,
           network,
-          ...(network.startsWith('eip155:') ? { chainId: Number(network.split(':')[1]) } : {}),
           purpose: 'session',
           name: 'rawchunks-card-credits',
         }),
         signal: AbortSignal.timeout(10000),
       });
-      if (!keyRes.ok) continue;
-      const keyData = (await keyRes.json()) as any;
-      if (typeof keyData?.token === 'string' && keyData.token) {
-        const entry = {
-          token: keyData.token as string,
-          userAddress: addr,
-          expiresAt: Date.now() + 600000,
-        };
-        cardComposeSessionCache.set(network, entry);
-        return { token: entry.token, userAddress: entry.userAddress };
+
+    const initialBudget = minRequired > 10000000n ? String(minRequired) : '10000000';
+    let keyRes = await requestKey(initialBudget);
+    if (!keyRes.ok && keyRes.status === 402) {
+      const errBody = (await keyRes.json().catch(() => null)) as any;
+      const balStr = errBody?.details?.balanceWei;
+      const allowStr = errBody?.details?.allowanceWei;
+      const availWei =
+        typeof balStr === 'string' && /^\d+$/.test(balStr) && typeof allowStr === 'string' && /^\d+$/.test(allowStr)
+          ? (BigInt(balStr) < BigInt(allowStr) ? BigInt(balStr) : BigInt(allowStr))
+          : typeof balStr === 'string' && /^\d+$/.test(balStr)
+            ? BigInt(balStr)
+            : typeof allowStr === 'string' && /^\d+$/.test(allowStr)
+              ? BigInt(allowStr)
+              : 0n;
+      if (availWei >= minRequired) {
+        keyRes = await requestKey(String(availWei));
       }
-    } catch {
-      continue;
     }
+    if (!keyRes.ok) return null;
+    const keyData = (await keyRes.json()) as any;
+    if (typeof keyData?.token === 'string' && keyData.token) {
+      const entry = {
+        token: keyData.token as string,
+        userAddress,
+        expiresAt: Date.now() + 600000,
+      };
+      cardComposeSessionCache.set(cacheKey, entry);
+      return { token: entry.token, userAddress: entry.userAddress };
+    }
+  } catch {
+    return null;
   }
   return null;
 }
