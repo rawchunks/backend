@@ -264,75 +264,93 @@ export async function admitCredits(
   (req as any).creditMetered = Boolean(options?.metered);
   (req as any).paymentIntentId = hold.id;
   if (options?.metered && !hold.context) {
-    const song = (req as any).song;
-    const durationSec = song.duration && song.duration > 0 ? song.duration : 180;
-    const durationMs = Math.ceil(durationSec * 1000);
-    let streamNetwork: string | undefined = requestedNetwork || song.network;
-    let composePaymentIntentId: string | undefined;
-    let composeToken: string | undefined;
-    let composeUserAddress: string | undefined;
-    if (process.env.COMPOSE_API_URL && streamNetwork) {
-      const { prepareStreamPaymentIntent } = await import('../broker/payment.js');
-      const tryPrepare = async (net: string) => {
-        const composeSession = await resolveCardComposeSession(net, identity.userAddress);
-        const token = composeSession?.token || `card:${hold.id}`;
-        const payerAddr = composeSession?.userAddress || identity.userAddress;
-        const paymentSignature = await buildBatchSettlementSignature(identity.owner, payerAddr, net, hold.id);
-        const intentId = await prepareStreamPaymentIntent({
-          token,
-          paymentSignature,
-          holdOwner: identity.owner,
-          holdId: hold.id,
-          network: net,
-          userAddress: payerAddr,
-          maxAmountWei: config.amountWei,
-          songId: song.id,
-          creatorAddress: song.creator,
-          streamPriceUsd: song.stream_price,
-          durationMs,
-          idempotencyKey: hold.id,
-        });
-        return { intentId, token, payerAddr, net };
-      };
-      try {
-        const prepared = await tryPrepare(streamNetwork);
-        composePaymentIntentId = prepared.intentId;
-        composeToken = prepared.token;
-        composeUserAddress = prepared.payerAddr;
-      } catch (err: any) {
-        if (err?.statusCode === 409 && song.network && song.network !== streamNetwork) {
-          const prepared = await tryPrepare(song.network);
-          streamNetwork = prepared.net;
-          composePaymentIntentId = prepared.intentId;
-          composeToken = prepared.token;
-          composeUserAddress = prepared.payerAddr;
-        } else {
-          throw err;
+    try {
+      const song = (req as any).song;
+      const durationSec = song.duration && song.duration > 0 ? song.duration : 180;
+      const durationMs = Math.ceil(durationSec * 1000);
+      const streamNetwork: string | undefined = requestedNetwork || song.network;
+      let composePaymentIntentId: string | undefined;
+      let composeToken: string | undefined;
+      let composeUserAddress: string | undefined;
+      if (process.env.COMPOSE_API_URL && streamNetwork) {
+        const { prepareStreamPaymentIntent, PaymentError } = await import('../broker/payment.js');
+        let composeSession = await resolveCardComposeSession(streamNetwork, identity.userAddress, config.amountWei);
+        if (composeSession?.token) {
+          const payerAddr = composeSession.userAddress;
+          const paymentSignature = await buildBatchSettlementSignature(identity.owner, payerAddr, streamNetwork, hold.id);
+          try {
+            composePaymentIntentId = await prepareStreamPaymentIntent({
+              token: composeSession.token,
+              paymentSignature,
+              holdOwner: identity.owner,
+              holdId: hold.id,
+              network: streamNetwork,
+              userAddress: payerAddr,
+              maxAmountWei: config.amountWei,
+              songId: song.id,
+              creatorAddress: song.creator,
+              streamPriceUsd: song.stream_price,
+              durationMs,
+              idempotencyKey: hold.id,
+            });
+            composeToken = composeSession.token;
+            composeUserAddress = payerAddr;
+          } catch (prepErr) {
+            if (prepErr instanceof PaymentError && (prepErr.statusCode === 401 || prepErr.statusCode === 402)) {
+              invalidateCardComposeSession(streamNetwork, identity.userAddress);
+              composeSession = await resolveCardComposeSession(streamNetwork, identity.userAddress, config.amountWei, true);
+              if (composeSession?.token) {
+                composePaymentIntentId = await prepareStreamPaymentIntent({
+                  token: composeSession.token,
+                  paymentSignature,
+                  holdOwner: identity.owner,
+                  holdId: hold.id,
+                  network: streamNetwork,
+                  userAddress: composeSession.userAddress,
+                  maxAmountWei: config.amountWei,
+                  songId: song.id,
+                  creatorAddress: song.creator,
+                  streamPriceUsd: song.stream_price,
+                  durationMs,
+                  idempotencyKey: `${hold.id}:retry`,
+                }).catch(() => undefined);
+                if (composePaymentIntentId) {
+                  composeToken = composeSession.token;
+                  composeUserAddress = composeSession.userAddress;
+                }
+              }
+            } else {
+              throw prepErr;
+            }
+          }
         }
       }
+      await store.tx(c =>
+        c.query(
+          'UPDATE credit_holds SET context=$3 WHERE environment=$1 AND id=$2 AND context IS NULL',
+          [
+            store.environment,
+            hold.id,
+            JSON.stringify({
+              kind: 'stream',
+              version: 1,
+              songId: song.id,
+              userAddress: identity.userAddress,
+              ...(streamNetwork ? { network: streamNetwork } : {}),
+              ...(composePaymentIntentId ? { paymentIntentId: composePaymentIntentId } : {}),
+              ...(composeToken ? { composeToken } : {}),
+              ...(composeUserAddress ? { composeUserAddress } : {}),
+              rate: String(Math.round(song.stream_price * 1000000)),
+              durationMs,
+              startedAt: Date.now(),
+            }),
+          ],
+        ),
+      );
+    } catch (err) {
+      await store.release(identity.owner, hold.id).catch(() => {});
+      throw err;
     }
-    await store.tx(c =>
-      c.query(
-        'UPDATE credit_holds SET context=$3 WHERE environment=$1 AND id=$2 AND context IS NULL',
-        [
-          store.environment,
-          hold.id,
-          JSON.stringify({
-            kind: 'stream',
-            version: 1,
-            songId: song.id,
-            userAddress: identity.userAddress,
-            ...(streamNetwork ? { network: streamNetwork } : {}),
-            ...(composePaymentIntentId ? { paymentIntentId: composePaymentIntentId } : {}),
-            ...(composeToken ? { composeToken } : {}),
-            ...(composeUserAddress ? { composeUserAddress } : {}),
-            rate: String(Math.round(song.stream_price * 1000000)),
-            durationMs,
-            startedAt: Date.now(),
-          }),
-        ],
-      ),
-    );
   }
   reply.header('x-credit-hold-id', hold.id);
 }
@@ -360,17 +378,25 @@ export async function checkpointCredits(req: FastifyRequest) {
       ? req.headers['x-network-id'].trim()
       : undefined;
   const streamNetwork: string | undefined = row.context.network || requestedNetwork;
-  if (row.context.paymentIntentId && process.env.COMPOSE_API_URL && streamNetwork) {
-    const { settleStreamCheckpoint } = await import('../broker/payment.js');
-    const receipt = await settleStreamCheckpoint({
-      paymentIntentId: row.context.paymentIntentId,
-      network: streamNetwork,
-      listenedSeconds: input.listenedSeconds!,
-      token: row.context.composeToken || `card:${row.id}`,
-      songId: row.context.songId,
-      terminal: Boolean(input.terminal),
-    });
-    return { success: true, result: receipt };
+  if (row.context.paymentIntentId && row.context.composeToken && process.env.COMPOSE_API_URL && streamNetwork) {
+    const { settleStreamCheckpoint, PaymentError } = await import('../broker/payment.js');
+    try {
+      const receipt = await settleStreamCheckpoint({
+        paymentIntentId: row.context.paymentIntentId,
+        network: streamNetwork,
+        listenedSeconds: input.listenedSeconds!,
+        token: row.context.composeToken,
+        songId: row.context.songId,
+        terminal: Boolean(input.terminal),
+      });
+      return { success: true, result: receipt };
+    } catch (err) {
+      if (err instanceof PaymentError && (err.statusCode === 401 || err.statusCode === 402)) {
+        invalidateCardComposeSession(streamNetwork, row.context.composeUserAddress || identity.userAddress);
+      } else {
+        throw err;
+      }
+    }
   }
   const millis = Math.min(row.context.durationMs, Math.round(input.listenedSeconds! * 1000));
   const cumulative = (BigInt(millis) * BigInt(row.context.rate)) / 60000n;

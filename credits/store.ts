@@ -273,12 +273,20 @@ export class CreditStore {
           existing.credit_source !== source ||
           String(existing.maximum) !== String(maximum) ||
           existing.resource !== resource ||
-          (existing.creator || undefined) !== creator ||
-          existing.closed
+          (existing.creator || undefined) !== creator
         ) {
           throw fail('Operation reservation replay mismatch');
         }
-        return existing;
+        if (existing.closed) {
+          if (BigInt(existing.charged) > 0n || existing.context) {
+            throw fail('Operation reservation replay mismatch');
+          }
+          await c.query('DELETE FROM credit_hold_lots WHERE environment=$1 AND hold_id=$2', [this.environment, id]);
+          await c.query('DELETE FROM credit_postings WHERE environment=$1 AND id=$2', [this.environment, `release:${id}`]);
+          await c.query('DELETE FROM credit_holds WHERE environment=$1 AND id=$2', [this.environment, id]);
+        } else {
+          return existing;
+        }
       }
 
       const lots = (
