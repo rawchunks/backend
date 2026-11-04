@@ -158,4 +158,90 @@ describe('Credits & Session action-aware routing', () => {
     expect(res.status).toBe(200);
     expect(calls.map(c => c.source)).toEqual(['promo', 'card']);
   });
+
+  it('evicts unadmitted and rejected rawchunks:stream:* entries on restore without firing background /stream requests', async () => {
+    const storageMap = new Map<string, string>([
+      [
+        'rawchunks:stream:dead-unadmitted',
+        JSON.stringify({
+          id: 'dead-unadmitted',
+          songId: 'sng-65891b7d-a32e-4ffe-b231-1b919033a3f2',
+          billing: { source: 'card', token: null, account: '0x1111111111111111111111111111111111111111', network: 'eip155:84532', walletToken: 'tok' },
+          alternatives: [],
+          intent: null,
+          observedMs: 0,
+          acceptedMs: 0,
+          durationMs: 180000,
+          terminal: true,
+          rejected: false,
+          exempt: false,
+        }),
+      ],
+      [
+        'rawchunks:stream:dead-rejected',
+        JSON.stringify({
+          id: 'dead-rejected',
+          songId: 'sng-f6e9ba93-d506-46f7-b0b8-1e134cd83f73',
+          billing: { source: 'card', token: null, account: '0x1111111111111111111111111111111111111111', network: 'eip155:84532', walletToken: 'tok' },
+          alternatives: [],
+          intent: null,
+          observedMs: 0,
+          acceptedMs: 0,
+          durationMs: 180000,
+          terminal: true,
+          rejected: true,
+          exempt: false,
+        }),
+      ],
+      [
+        'rawchunks:stream:valid-admitted',
+        JSON.stringify({
+          id: 'valid-admitted',
+          songId: 'sng-valid-1',
+          billing: { source: 'card', token: null, account: '0x1111111111111111111111111111111111111111', network: 'eip155:84532', walletToken: 'tok' },
+          alternatives: [],
+          intent: 'crd:0x1111111111111111:valid-admitted',
+          observedMs: 12000,
+          acceptedMs: 0,
+          durationMs: 180000,
+          terminal: false,
+          rejected: false,
+          exempt: false,
+        }),
+      ],
+    ]);
+    vi.stubGlobal('localStorage', {
+      get length() { return storageMap.size; },
+      key: (i: number) => Array.from(storageMap.keys())[i] ?? null,
+      getItem: (k: string) => storageMap.get(k) ?? null,
+      setItem: (k: string, v: string) => { storageMap.set(k, v); },
+      removeItem: (k: string) => { storageMap.delete(k); },
+    });
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', async (url: string) => {
+      calls.push(url);
+      return Response.json({
+        success: true,
+        result: {
+          status: 'credited',
+          acceptedListenedSeconds: 12,
+          billedWei: '6000',
+          deltaWei: '6000',
+        },
+      });
+    });
+
+    const { store } = await import('../../../app/src/lib/store');
+    await Promise.all(Array.from((store as any).playbacks.values()).map((l: any) => l.running));
+
+    // Both dead entries are evicted without calling /api/songs/:id/stream
+    expect(storageMap.has('rawchunks:stream:dead-unadmitted')).toBe(false);
+    expect(storageMap.has('rawchunks:stream:dead-rejected')).toBe(false);
+    expect(calls.some(u => u.endsWith('/stream'))).toBe(false);
+
+    // Valid admitted entry sent its terminal checkpoint and cleaned itself up
+    expect(calls).toEqual(['https://api.rawchunks.space/api/songs/sng-valid-1/stream/checkpoint']);
+    expect(storageMap.has('rawchunks:stream:valid-admitted')).toBe(false);
+    expect((store as any).playbacks.size).toBe(0);
+  });
 });
