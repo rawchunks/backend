@@ -124,7 +124,9 @@ describe('PayPal capture authority', () => {
       }
       if (parsed.pathname === '/v2/checkout/orders/order-license-1') return Response.json(order);
       if (parsed.pathname === '/api/auth/session-key') return Response.json({ key: 'session-key-1' });
-      if (parsed.pathname === '/api/checkout/paypal/rawchunks') {
+      if (parsed.pathname === '/tokens') return Response.json({ id: 'bt-token-1' });
+      if (parsed.pathname === '/api/tokenize/register') return Response.json({ token: 'cf-card-token-1' });
+      if (parsed.pathname === '/api/checkout/card/rawchunks' || parsed.pathname === '/api/checkout/paypal/rawchunks') {
         coinflowPayload = JSON.parse(String(init?.body));
         return Response.json({ paymentId: 'CF-PAY-123' });
       }
@@ -192,7 +194,9 @@ describe('PayPal capture authority', () => {
       }
       if (parsed.pathname === '/v2/checkout/orders/order-pack-1') return Response.json(order);
       if (parsed.pathname === '/api/auth/session-key') return Response.json({ key: 'session-key-pack' });
-      if (parsed.pathname === '/api/checkout/paypal/rawchunks') {
+      if (parsed.pathname === '/tokens') return Response.json({ id: 'bt-token-pack' });
+      if (parsed.pathname === '/api/tokenize/register') return Response.json({ token: 'cf-card-token-pack' });
+      if (parsed.pathname === '/api/checkout/card/rawchunks' || parsed.pathname === '/api/checkout/paypal/rawchunks') {
         coinflowHeaders = new Headers(init?.headers);
         coinflowPayload = JSON.parse(String(init?.body));
         return Response.json({ paymentId: 'CF-PACK-999' });
