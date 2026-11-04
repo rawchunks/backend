@@ -1,4 +1,4 @@
-import { pgTable, text, integer, real, boolean, timestamp, jsonb, bigint, index, check } from 'drizzle-orm/pg-core';
+import { pgTable, text, integer, real, boolean, timestamp, jsonb, bigint, index, check, primaryKey } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
 export const songs = pgTable('songs', {
@@ -29,6 +29,8 @@ export const songs = pgTable('songs', {
   chain_song_id: text('chain_song_id'),
   tx_hash: text('tx_hash'),
   plays: integer('plays').default(0).notNull(),
+  likes: integer('likes').default(0).notNull(),
+  comments_count: integer('comments_count').default(0).notNull(),
   last_played_at: timestamp('last_played_at', { withTimezone: true }),
   published_at: timestamp('published_at', { withTimezone: true }),
   created_at: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
@@ -59,7 +61,32 @@ export const songEarnings = pgTable('song_earnings', {
   check('song_earnings_kind_check', sql`${table.kind} in ('license', 'stream')`),
 ]);
 
+export const songComments = pgTable('comments', {
+  id: text('id').primaryKey(),
+  song_id: text('song_id').notNull().references(() => songs.id, { onDelete: 'cascade' }),
+  author: text('author').notNull(),
+  body: text('body').notNull(),
+  timestamp_sec: real('timestamp_sec').default(0).notNull(),
+  created_at: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('comments_song_timestamp_idx').on(table.song_id, table.timestamp_sec),
+  index('comments_author_idx').on(table.author),
+  check('comments_body_check', sql`char_length(${table.body}) between 1 and 280 and ${table.timestamp_sec} >= 0 and ${table.timestamp_sec} < 'Infinity'::real`),
+]);
+
+export const songLikes = pgTable('likes', {
+  song_id: text('song_id').notNull().references(() => songs.id, { onDelete: 'cascade' }),
+  user_address: text('user_address').notNull(),
+  created_at: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.song_id, table.user_address] }),
+  index('likes_user_created_idx').on(table.user_address, table.created_at.desc()),
+]);
+
 export type Song = typeof songs.$inferSelect;
 export type NewSong = typeof songs.$inferInsert;
 export type SongEarning = typeof songEarnings.$inferSelect;
 export type NewSongEarning = typeof songEarnings.$inferInsert;
+export type SongComment = typeof songComments.$inferSelect;
+export type NewSongComment = typeof songComments.$inferInsert;
+export type SongLike = typeof songLikes.$inferSelect;

@@ -55,7 +55,17 @@ export async function runMigrations() {
       END IF;
     END $$;
   `;
-  console.log('✓ User database schema verified (wallet_pairs).');
+  await userSql`
+    CREATE TABLE IF NOT EXISTS follows (
+      follower_address TEXT NOT NULL,
+      creator_address TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+      PRIMARY KEY (follower_address, creator_address)
+    );
+  `;
+  await userSql`CREATE INDEX IF NOT EXISTS follows_creator_idx ON follows (creator_address, created_at DESC);`;
+  await userSql`CREATE INDEX IF NOT EXISTS follows_follower_idx ON follows (follower_address, created_at DESC);`;
+  console.log('✓ User database schema verified (wallet_pairs, follows).');
 
   // 2. Song Database Migrations
   console.log('Migrating Song Database (songs, stems, takes, commits)...');
@@ -125,6 +135,31 @@ export async function runMigrations() {
   await songSql`UPDATE songs SET image = '' WHERE image = '/hero.png';`;
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS album_id TEXT REFERENCES albums(id) ON DELETE SET NULL;`;
   await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS plays INTEGER DEFAULT 0 NOT NULL, ADD COLUMN IF NOT EXISTS last_played_at TIMESTAMPTZ;`;
+  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS likes INTEGER DEFAULT 0 NOT NULL, ADD COLUMN IF NOT EXISTS comments_count INTEGER DEFAULT 0 NOT NULL;`;
+
+  await songSql`
+    CREATE TABLE IF NOT EXISTS comments (
+      id TEXT PRIMARY KEY,
+      song_id TEXT NOT NULL REFERENCES songs(id) ON DELETE CASCADE,
+      author TEXT NOT NULL,
+      body TEXT NOT NULL CHECK (char_length(body) BETWEEN 1 AND 280),
+      timestamp_sec REAL DEFAULT 0 NOT NULL CHECK (timestamp_sec >= 0 AND timestamp_sec < 'Infinity'::real),
+      created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+    );
+  `;
+  await songSql`CREATE INDEX IF NOT EXISTS comments_song_timestamp_idx ON comments (song_id, timestamp_sec ASC);`;
+  await songSql`CREATE INDEX IF NOT EXISTS comments_author_idx ON comments (author);`;
+
+  await songSql`
+    CREATE TABLE IF NOT EXISTS likes (
+      song_id TEXT NOT NULL REFERENCES songs(id) ON DELETE CASCADE,
+      user_address TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+      PRIMARY KEY (song_id, user_address)
+    );
+  `;
+  await songSql`CREATE INDEX IF NOT EXISTS likes_user_created_idx ON likes (user_address, created_at DESC);`;
+
   await songSql`
     CREATE TABLE IF NOT EXISTS song_earnings (
       id TEXT PRIMARY KEY,

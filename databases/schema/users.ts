@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, jsonb } from 'drizzle-orm/pg-core';
+import { pgTable, text, timestamp, jsonb, primaryKey, index } from 'drizzle-orm/pg-core';
 
 export const walletPairs = pgTable('wallet_pairs', {
   evm_address: text('evm_address').unique(),
@@ -15,5 +15,16 @@ export const walletPairs = pgTable('wallet_pairs', {
   guides_seen: jsonb('guides_seen').$type<string[]>().default([]).notNull(),
 });
 
+export const follows = pgTable('follows', {
+  follower_address: text('follower_address').notNull(),
+  creator_address: text('creator_address').notNull(),
+  created_at: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.follower_address, table.creator_address] }),
+  index('follows_creator_idx').on(table.creator_address, table.created_at.desc()),
+  index('follows_follower_idx').on(table.follower_address, table.created_at.desc()),
+]);
+
 export type WalletPairRow = typeof walletPairs.$inferSelect;
 export type NewWalletPair = typeof walletPairs.$inferInsert;
+export type FollowRow = typeof follows.$inferSelect;
