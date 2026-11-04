@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { getWalletPair, getWalletPairsByAddresses, putWalletPair, getUserConsent, putUserConsent, getUserGuides, putUserGuides, parseAddress, updateProfile } from './users.js';
-import { listSongsByCreator, listAllSongs, getFullSongProject, updateSong, deleteSong, getSongById, createSong, copySong, queryPublicSongs, getMarketFolds, incrementSongPlay } from './songs.js';
+import { getWalletPair, getWalletPairsByAddresses, putWalletPair, getUserConsent, putUserConsent, getUserGuides, putUserGuides, parseAddress, updateProfile, getFollowedCreators, getCreatorFollowStats, toggleCreatorFollow } from './users.js';
+import { listSongsByCreator, listAllSongs, getFullSongProject, updateSong, deleteSong, getSongById, createSong, copySong, queryPublicSongs, getMarketFolds, incrementSongPlay, getSongComments, addSongComment, deleteSongComment, getUserLikedSongIds, toggleSongLike } from './songs.js';
 import * as songsModule from './songs.js';
 import { randomUUID } from 'node:crypto';
 import { listStemsBySong } from './stems.js';
@@ -33,7 +33,7 @@ import {
   deletePlaylist,
 } from './playlists.js';
 import { ensureGenreCovers } from './genres.js';
-import { getCreatorEarnings } from './earnings.js';
+import { getCreatorEarnings, recordSongEarning } from './earnings.js';
 
 const text = z.string().refine(value => value.trim().length > 0, 'Value must not be empty');
 const address = text.refine(value => { try { parseAddress(value); return true; } catch { return false; } }, 'Invalid wallet address');
@@ -195,7 +195,8 @@ export async function resolveSongStreamPayment(request: FastifyRequest): Promise
     if (identity.addresses.includes(creator)) return null;
   }
   const rate = Math.round(song.stream_price * 1000000);
-  const durationMs = Math.ceil((song.duration || 0) * 1000);
+  const durationSec = song.duration && song.duration > 0 ? song.duration : 180;
+  const durationMs = Math.ceil(durationSec * 1000);
   if (!Number.isSafeInteger(rate) || rate < 0 || !Number.isSafeInteger(durationMs) || durationMs <= 0) throw new RequestError('Streaming price or duration unavailable', 503);
   if (!rate) return null;
   return {
@@ -557,6 +558,21 @@ export const databaseRouter: FastifyPluginAsync = async app => {
         licenses: 0, image: source.image,
         stream_price: source.stream_price, license_price: 0, network: source.network,
       });
+      if (creator.toLowerCase() !== source.creator.toLowerCase() && (source.license_price ?? 0) > 0 && source.network) {
+        const gross = BigInt(Math.round(Number(source.license_price) * 1_000_000));
+        void recordSongEarning({
+          id: `lic:${song.id}`,
+          songId: source.id,
+          creator: source.creator,
+          network: source.network,
+          kind: 'license',
+          grossAtomics: gross,
+          creatorAtomics: (gross * 8000n) / 10000n,
+          streamedMs: 0n,
+          txHash: source.tx_hash || null,
+          payer: creator,
+        }).catch(() => {});
+      }
       return reply.status(201).send(song);
     } catch (error) { return failure(request, reply, error, 'Could not create remix'); }
   });
@@ -902,6 +918,147 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       return reply.send(data);
     } catch (error) {
       return failure(request, reply, error, 'Failed to retrieve creator earnings');
+    }
+  });
+
+  // =========================================================================
+  // Social Streaming Routes: Timed Comments, Song Likes, Creator Follows
+  // =========================================================================
+
+  app.get('/songs/:id/comments', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string };
+      const rows = await getSongComments(id);
+      const authorAddresses = Array.from(new Set(rows.map((r) => r.author)));
+      const pairs = authorAddresses.length > 0 ? await getWalletPairsByAddresses(authorAddresses) : [];
+      const profileMap = new Map<string, { nickname?: string | null; avatar?: string | null }>();
+      for (const p of pairs) {
+        if (p.evmAddress) profileMap.set(p.evmAddress.toLowerCase(), p);
+        if (p.svmAddress) profileMap.set(p.svmAddress, p);
+      }
+      const enriched = rows.map((row) => {
+        const key = row.author.startsWith('0x') ? row.author.toLowerCase() : row.author;
+        const prof = profileMap.get(key) || profileMap.get(row.author);
+        return {
+          ...row,
+          authorNickname: prof?.nickname ?? null,
+          authorAvatar: prof?.avatar ?? null,
+        };
+      });
+      return reply.send(enriched);
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to fetch song comments');
+    }
+  });
+
+  app.post('/songs/:id/comments', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string };
+      const userAddress = readUser(request);
+      const bodySchema = z.object({
+        body: z.string().trim().min(1).max(280),
+        timestampSec: z.number().min(0).max(3600).default(0),
+      });
+      const parsed = bodySchema.parse(request.body);
+      const created = await addSongComment({
+        songId: id,
+        author: userAddress,
+        body: parsed.body,
+        timestampSec: parsed.timestampSec,
+      });
+      const prof = await getWalletPair(created.author);
+      return reply.status(201).send({
+        ...created,
+        authorNickname: prof?.nickname ?? null,
+        authorAvatar: prof?.avatar ?? null,
+      });
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to post song comment');
+    }
+  });
+
+  app.delete('/songs/:id/comments/:commentId', async (request, reply) => {
+    try {
+      const { id, commentId } = request.params as { id: string; commentId: string };
+      const userAddress = readUser(request);
+      const deleted = await deleteSongComment(id, commentId, userAddress);
+      if (!deleted) return reply.status(404).send({ error: 'Comment not found' });
+      return reply.send({ success: true, id: commentId });
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to delete song comment');
+    }
+  });
+
+  app.get('/likes', async (request, reply) => {
+    try {
+      const { user } = request.query as { user?: string };
+      const targetUser = user?.trim() || (request.headers['x-session-user-address'] as string | undefined)?.trim();
+      if (!targetUser) {
+        return reply.send({ songIds: [] });
+      }
+      address.parse(targetUser);
+      const songIds = await getUserLikedSongIds(targetUser);
+      return reply.send({ songIds });
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to retrieve liked songs');
+    }
+  });
+
+  app.post('/songs/:id/like', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string };
+      const userAddress = readUser(request);
+      const bodySchema = z.object({ liked: z.boolean().optional() }).optional();
+      const parsed = bodySchema.parse(request.body ?? {});
+      const result = await toggleSongLike(id, userAddress, parsed?.liked);
+      return reply.send(result);
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to update song like');
+    }
+  });
+
+  app.get('/follows', async (request, reply) => {
+    try {
+      const { user } = request.query as { user?: string };
+      const targetUser = user?.trim() || (request.headers['x-session-user-address'] as string | undefined)?.trim();
+      if (!targetUser) {
+        return reply.send({ creators: [] });
+      }
+      address.parse(targetUser);
+      const creators = await getFollowedCreators(targetUser);
+      return reply.send({ creators });
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to retrieve followed creators');
+    }
+  });
+
+  app.get('/creators/:creatorAddress/social', async (request, reply) => {
+    try {
+      const { creatorAddress } = request.params as { creatorAddress: string };
+      address.parse(creatorAddress);
+      const { viewer } = request.query as { viewer?: string };
+      const viewerAddr =
+        viewer?.trim() ||
+        (request.headers['x-session-user-address'] as string | undefined)?.trim() ||
+        null;
+      const stats = await getCreatorFollowStats(creatorAddress, viewerAddr);
+      return reply.send(stats);
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to retrieve creator social stats');
+    }
+  });
+
+  app.post('/creators/:creatorAddress/follow', async (request, reply) => {
+    try {
+      const { creatorAddress } = request.params as { creatorAddress: string };
+      address.parse(creatorAddress);
+      const userAddress = readUser(request);
+      const bodySchema = z.object({ following: z.boolean().optional() }).optional();
+      const parsed = bodySchema.parse(request.body ?? {});
+      const stats = await toggleCreatorFollow(userAddress, creatorAddress, parsed?.following);
+      return reply.send(stats);
+    } catch (error) {
+      return failure(request, reply, error, 'Failed to update creator follow state');
     }
   });
 };
