@@ -1,6 +1,6 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { getWalletPair, getWalletPairsByAddresses, putWalletPair, getUserConsent, putUserConsent, getUserGuides, putUserGuides, parseAddress, updateProfile, getFollowedCreators, getCreatorFollowStats, toggleCreatorFollow } from './users.js';
+import { getWalletPair, getWalletPairByAddressOrNickname, getWalletPairsByAddresses, putWalletPair, getUserConsent, putUserConsent, getUserGuides, putUserGuides, parseAddress, updateProfile, getFollowedCreators, getCreatorFollowStats, toggleCreatorFollow } from './users.js';
 import { listSongsByCreator, listAllSongs, getFullSongProject, updateSong, deleteSong, getSongById, createSong, copySong, queryPublicSongs, getMarketFolds, incrementSongPlay, getSongComments, addSongComment, deleteSongComment, getUserLikedSongIds, toggleSongLike } from './songs.js';
 import * as songsModule from './songs.js';
 import { randomUUID } from 'node:crypto';
@@ -258,9 +258,18 @@ export const databaseRouter: FastifyPluginAsync = async app => {
   app.get('/user/:address', async (request, reply) => {
     try {
       const { address: raw } = request.params as { address: string };
+      const isAddr = address.safeParse(raw).success;
+      if (isAddr) {
+        const pair = await getWalletPair(raw);
+        return pair ? reply.send(pair) : reply.status(404).send({ error: 'Wallet pair not found' });
+      }
+      const byHandle = await getWalletPairByAddressOrNickname(raw);
+      if (byHandle) return reply.send(byHandle);
+      if ((request.query as { handle?: string })?.handle === '1') {
+        return reply.status(404).send({ error: 'Creator profile not found' });
+      }
       address.parse(raw);
-      const pair = await getWalletPair(raw);
-      return pair ? reply.send(pair) : reply.status(404).send({ error: 'Wallet pair not found' });
+      return reply.status(404).send({ error: 'Wallet pair not found' });
     } catch (error) { return failure(request, reply, error, 'Failed to lookup wallet pair'); }
   });
   const handleProfile = async (request: FastifyRequest, reply: FastifyReply) => {

@@ -597,6 +597,24 @@ export async function getWalletPair(rawAddress: string): Promise<WalletPair | nu
   });
 }
 
+export async function getWalletPairByAddressOrNickname(raw: string): Promise<WalletPair | null> {
+  if (!raw || !raw.trim()) return null;
+  try {
+    return await getWalletPair(raw);
+  } catch {
+    const clean = raw.trim().replace(/^@+/, '').trim().toLowerCase();
+    if (!clean || clean.length > 50) return null;
+    const rows = await userSql`
+      SELECT * FROM public.wallet_pairs
+      WHERE LOWER(TRIM(nickname)) = ${clean}
+      LIMIT 1
+    `;
+    const pair = pairFromRow(rows[0]);
+    if (pair) await cachePair(pair);
+    return pair;
+  }
+}
+
 export async function resolveIdentityAddresses(rawAddress: string): Promise<string[]> {
   const parsed = parseAddress(rawAddress);
   const addresses = [parsed.value];
