@@ -396,7 +396,9 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
         reply.header('Cache-Control', 'public, max-age=604800, immutable');
         return reply.send(memPeaks);
       }
-      const cached = await getCachedPeaks(cacheKey);
+      const cached =
+        (await getCachedPeaks(cacheKey)) ??
+        (targetBins === 512 ? await getCachedPeaks(url) : null);
       if (cached) {
         setInMemoryPeaks(cacheKey, cached);
         if (targetBins === 512) setInMemoryPeaks(url, cached);
@@ -421,7 +423,10 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
           }
           const computed = extractWavBipolarPeaks(buf, targetBins);
           setInMemoryPeaks(cacheKey, computed);
-          if (targetBins === 512) setInMemoryPeaks(url, computed);
+          if (targetBins === 512) {
+            setInMemoryPeaks(url, computed);
+            void setCachedPeaks(url, computed).catch(() => { });
+          }
           void setCachedPeaks(cacheKey, computed).catch(() => { });
           return computed;
         })().finally(() => {
