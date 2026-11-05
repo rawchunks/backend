@@ -378,6 +378,15 @@ export interface UpdateProfileInput {
   evmAddress?: string | null;
 }
 
+function normalizeHandleComparison(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^@+/, '')
+    .replace(/^https?:\/\/(www\.)?[^/]+\//i, '')
+    .replace(/\/+$/, '')
+    .toLowerCase();
+}
+
 export async function updateProfile(input: UpdateProfileInput): Promise<WalletPair> {
   await ensureWalletPairsColumns();
   const parsed = parseAddress(input.address);
@@ -394,6 +403,42 @@ export async function updateProfile(input: UpdateProfileInput): Promise<WalletPa
   const socialsJson = JSON.stringify(socials);
 
   const existing = await getWalletPair(parsed.value);
+
+  // Check for social account collision across other creators
+  if (hasSocials && socials.length > 0 && typeof userSql === 'function') {
+    const selfEvm = existing?.evmAddress || (parsed.kind === 'evm' ? parsed.value : (input.evmAddress ? parseAddress(input.evmAddress).value : null));
+    const selfSvm = existing?.svmAddress || (parsed.kind === 'svm' ? parsed.value : (input.svmAddress ? parseAddress(input.svmAddress).value : null));
+    const otherRows = await userSql`
+      SELECT evm_address, svm_address, socials
+      FROM public.wallet_pairs
+      WHERE socials IS NOT NULL
+        AND jsonb_typeof(socials) = 'array'
+        AND jsonb_array_length(socials) > 0
+    `;
+    for (const row of otherRows) {
+      const rowEvm = typeof row.evm_address === 'string' ? row.evm_address.toLowerCase() : null;
+      const rowSvm = typeof row.svm_address === 'string' ? row.svm_address : null;
+      if ((selfEvm && rowEvm === selfEvm.toLowerCase()) || (selfSvm && rowSvm === selfSvm)) {
+        continue;
+      }
+      const rowSocials = normalizeSocialsList(row.socials);
+      for (const candidate of socials) {
+        const candidateHandle = normalizeHandleComparison(candidate.handle || candidate.url);
+        const candidateProviderId = candidate.providerId?.trim().toLowerCase();
+        const conflict = rowSocials.some((other) => {
+          if (other.platform !== candidate.platform) return false;
+          if (candidateProviderId && other.providerId && other.providerId.trim().toLowerCase() === candidateProviderId) {
+            return true;
+          }
+          const otherHandle = normalizeHandleComparison(other.handle || other.url);
+          return Boolean(candidateHandle && otherHandle && candidateHandle === otherHandle);
+        });
+        if (conflict) {
+          throw new RequestError('Account already linked to a different Creator.', 409);
+        }
+      }
+    }
+  }
 
   if (existing) {
     const nextSvm = input.svmAddress && !existing.svmAddress ? parseAddress(input.svmAddress).value : null;
