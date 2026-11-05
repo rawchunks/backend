@@ -27,6 +27,29 @@ function isSvmAddress(value: string): boolean {
   return bytes === 32;
 }
 
+export type SocialPlatform =
+  | 'x'
+  | 'instagram'
+  | 'tiktok'
+  | 'farcaster'
+  | 'spotify'
+  | 'soundcloud'
+  | 'youtube'
+  | 'discord'
+  | 'telegram'
+  | 'github'
+  | 'twitch'
+  | 'google'
+  | 'apple';
+
+export interface SocialLinkRecord {
+  platform: SocialPlatform;
+  handle: string;
+  url: string;
+  verified?: boolean;
+  providerId?: string;
+}
+
 export interface WalletPair {
   evmAddress: string;
   svmAddress: string;
@@ -38,6 +61,8 @@ export interface WalletPair {
   nickname?: string | null;
   avatar?: string | null;
   bio?: string | null;
+  banner?: string | null;
+  socials?: SocialLinkRecord[];
   guidesSeen?: string[];
 }
 
@@ -90,6 +115,65 @@ async function cachePair(pair: WalletPair): Promise<void> {
   }
 }
 
+const VALID_SOCIAL_PLATFORMS = new Set<SocialPlatform>([
+  'x',
+  'instagram',
+  'tiktok',
+  'farcaster',
+  'spotify',
+  'soundcloud',
+  'youtube',
+  'discord',
+  'telegram',
+  'github',
+  'twitch',
+  'google',
+  'apple',
+]);
+
+function normalizeSocialsList(raw: unknown): SocialLinkRecord[] {
+  if (!Array.isArray(raw)) return [];
+  const out: SocialLinkRecord[] = [];
+  const seenPlatforms = new Set<string>();
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Record<string, unknown>;
+    const platform = typeof rec.platform === 'string' ? (rec.platform.trim().toLowerCase() as SocialPlatform) : null;
+    if (!platform || !VALID_SOCIAL_PLATFORMS.has(platform) || seenPlatforms.has(platform)) continue;
+    const handle = typeof rec.handle === 'string' ? rec.handle.trim().slice(0, 120) : '';
+    const url = typeof rec.url === 'string' ? rec.url.trim().slice(0, 512) : '';
+    const providerId = typeof rec.providerId === 'string' && rec.providerId.trim() ? rec.providerId.trim().slice(0, 160) : undefined;
+    const verified = Boolean(rec.verified);
+    if (!handle && !url && !providerId) continue;
+    seenPlatforms.add(platform);
+    out.push({
+      platform,
+      handle,
+      url,
+      ...(verified ? { verified: true } : {}),
+      ...(providerId ? { providerId } : {}),
+    });
+  }
+  return out;
+}
+
+let walletPairsColumnsEnsured: Promise<void> | null = null;
+function ensureWalletPairsColumns(): Promise<void> {
+  if (typeof userSql !== 'function') return Promise.resolve();
+  if (!walletPairsColumnsEnsured) {
+    walletPairsColumnsEnsured = userSql`
+      ALTER TABLE public.wallet_pairs
+      ADD COLUMN IF NOT EXISTS banner TEXT,
+      ADD COLUMN IF NOT EXISTS socials JSONB DEFAULT '[]'::jsonb NOT NULL
+    `
+      .then(() => undefined)
+      .catch(() => {
+        walletPairsColumnsEnsured = null;
+      });
+  }
+  return walletPairsColumnsEnsured;
+}
+
 function pairFromRow(row: any): WalletPair | null {
   if (!row) return null;
   const evm = row.evm_address ? parseAddress(row.evm_address) : null;
@@ -108,6 +192,8 @@ function pairFromRow(row: any): WalletPair | null {
     nickname: row.nickname ?? null,
     avatar: row.avatar ?? null,
     bio: row.bio ?? null,
+    banner: row.banner ?? null,
+    socials: normalizeSocialsList(row.socials),
     guidesSeen: Array.isArray(row.guides_seen)
       ? row.guides_seen.filter((item: unknown): item is string => typeof item === 'string')
       : [],
@@ -286,18 +372,29 @@ export interface UpdateProfileInput {
   nickname?: string | null;
   avatar?: string | null;
   bio?: string | null;
+  banner?: string | null;
+  socials?: SocialLinkRecord[] | null;
   svmAddress?: string | null;
   evmAddress?: string | null;
 }
 
 export async function updateProfile(input: UpdateProfileInput): Promise<WalletPair> {
+  await ensureWalletPairsColumns();
   const parsed = parseAddress(input.address);
-  const nickname = input.nickname !== undefined ? (input.nickname ? input.nickname.trim() : null) : undefined;
-  const avatar = input.avatar !== undefined ? (input.avatar ? input.avatar.trim() : null) : undefined;
+  const hasNickname = input.nickname !== undefined;
+  const nickname = hasNickname ? (input.nickname ? input.nickname.trim() : null) : null;
+  const hasAvatar = input.avatar !== undefined;
+  const avatar = hasAvatar ? (input.avatar ? input.avatar.trim() : null) : null;
   const hasBio = input.bio !== undefined;
   const bio = hasBio ? (input.bio ? input.bio.trim().slice(0, 280) : null) : null;
+  const hasBanner = input.banner !== undefined;
+  const banner = hasBanner ? (input.banner ? input.banner.trim() : null) : null;
+  const hasSocials = input.socials !== undefined;
+  const socials = hasSocials ? normalizeSocialsList(input.socials) : [];
+  const socialsJson = JSON.stringify(socials);
 
   const existing = await getWalletPair(parsed.value);
+
   if (existing) {
     const nextSvm = input.svmAddress && !existing.svmAddress ? parseAddress(input.svmAddress).value : null;
     const nextEvm = input.evmAddress && !existing.evmAddress ? parseAddress(input.evmAddress).value : null;
@@ -306,9 +403,11 @@ export async function updateProfile(input: UpdateProfileInput): Promise<WalletPa
           UPDATE public.wallet_pairs
           SET
             svm_address = COALESCE(${nextSvm}, svm_address),
-            nickname = COALESCE(${nickname !== undefined ? nickname : null}, nickname),
-            avatar = COALESCE(${avatar !== undefined ? avatar : null}, avatar),
-            bio = CASE WHEN ${hasBio} THEN ${bio} ELSE bio END
+            nickname = CASE WHEN ${hasNickname} THEN ${nickname} ELSE nickname END,
+            avatar = CASE WHEN ${hasAvatar} THEN ${avatar} ELSE avatar END,
+            bio = CASE WHEN ${hasBio} THEN ${bio} ELSE bio END,
+            banner = CASE WHEN ${hasBanner} THEN ${banner} ELSE banner END,
+            socials = CASE WHEN ${hasSocials} THEN ${socialsJson}::jsonb ELSE COALESCE(socials, '[]'::jsonb) END
           WHERE evm_address = ${existing.evmAddress}
           RETURNING *
         `
@@ -316,9 +415,11 @@ export async function updateProfile(input: UpdateProfileInput): Promise<WalletPa
           UPDATE public.wallet_pairs
           SET
             evm_address = COALESCE(${nextEvm}, evm_address),
-            nickname = COALESCE(${nickname !== undefined ? nickname : null}, nickname),
-            avatar = COALESCE(${avatar !== undefined ? avatar : null}, avatar),
-            bio = CASE WHEN ${hasBio} THEN ${bio} ELSE bio END
+            nickname = CASE WHEN ${hasNickname} THEN ${nickname} ELSE nickname END,
+            avatar = CASE WHEN ${hasAvatar} THEN ${avatar} ELSE avatar END,
+            bio = CASE WHEN ${hasBio} THEN ${bio} ELSE bio END,
+            banner = CASE WHEN ${hasBanner} THEN ${banner} ELSE banner END,
+            socials = CASE WHEN ${hasSocials} THEN ${socialsJson}::jsonb ELSE COALESCE(socials, '[]'::jsonb) END
           WHERE svm_address = ${existing.svmAddress}
           RETURNING *
         `;
@@ -331,13 +432,15 @@ export async function updateProfile(input: UpdateProfileInput): Promise<WalletPa
   if (parsed.kind === 'evm') {
     const svm = input.svmAddress ? parseAddress(input.svmAddress).value : null;
     const rows = await userSql`
-      INSERT INTO public.wallet_pairs (evm_address, svm_address, nickname, avatar, bio)
-      VALUES (${parsed.value}, ${svm}, ${nickname ?? null}, ${avatar ?? null}, ${bio ?? null})
+      INSERT INTO public.wallet_pairs (evm_address, svm_address, nickname, avatar, bio, banner, socials)
+      VALUES (${parsed.value}, ${svm}, ${nickname ?? null}, ${avatar ?? null}, ${bio ?? null}, ${banner ?? null}, ${socialsJson}::jsonb)
       ON CONFLICT (evm_address) DO UPDATE SET
         svm_address = COALESCE(wallet_pairs.svm_address, EXCLUDED.svm_address),
-        nickname = COALESCE(EXCLUDED.nickname, wallet_pairs.nickname),
-        avatar = COALESCE(EXCLUDED.avatar, wallet_pairs.avatar),
-        bio = CASE WHEN ${hasBio} THEN EXCLUDED.bio ELSE wallet_pairs.bio END
+        nickname = CASE WHEN ${hasNickname} THEN EXCLUDED.nickname ELSE wallet_pairs.nickname END,
+        avatar = CASE WHEN ${hasAvatar} THEN EXCLUDED.avatar ELSE wallet_pairs.avatar END,
+        bio = CASE WHEN ${hasBio} THEN EXCLUDED.bio ELSE wallet_pairs.bio END,
+        banner = CASE WHEN ${hasBanner} THEN EXCLUDED.banner ELSE wallet_pairs.banner END,
+        socials = CASE WHEN ${hasSocials} THEN EXCLUDED.socials ELSE COALESCE(wallet_pairs.socials, '[]'::jsonb) END
       RETURNING *
     `;
     const pair = pairFromRow(rows[0]);
@@ -348,13 +451,15 @@ export async function updateProfile(input: UpdateProfileInput): Promise<WalletPa
   } else {
     const evm = input.evmAddress ? parseAddress(input.evmAddress).value : null;
     const rows = await userSql`
-      INSERT INTO public.wallet_pairs (evm_address, svm_address, nickname, avatar, bio)
-      VALUES (${evm}, ${parsed.value}, ${nickname ?? null}, ${avatar ?? null}, ${bio ?? null})
+      INSERT INTO public.wallet_pairs (evm_address, svm_address, nickname, avatar, bio, banner, socials)
+      VALUES (${evm}, ${parsed.value}, ${nickname ?? null}, ${avatar ?? null}, ${bio ?? null}, ${banner ?? null}, ${socialsJson}::jsonb)
       ON CONFLICT (svm_address) DO UPDATE SET
         evm_address = COALESCE(wallet_pairs.evm_address, EXCLUDED.evm_address),
-        nickname = COALESCE(EXCLUDED.nickname, wallet_pairs.nickname),
-        avatar = COALESCE(EXCLUDED.avatar, wallet_pairs.avatar),
-        bio = CASE WHEN ${hasBio} THEN EXCLUDED.bio ELSE wallet_pairs.bio END
+        nickname = CASE WHEN ${hasNickname} THEN EXCLUDED.nickname ELSE wallet_pairs.nickname END,
+        avatar = CASE WHEN ${hasAvatar} THEN EXCLUDED.avatar ELSE wallet_pairs.avatar END,
+        bio = CASE WHEN ${hasBio} THEN EXCLUDED.bio ELSE wallet_pairs.bio END,
+        banner = CASE WHEN ${hasBanner} THEN EXCLUDED.banner ELSE wallet_pairs.banner END,
+        socials = CASE WHEN ${hasSocials} THEN EXCLUDED.socials ELSE COALESCE(wallet_pairs.socials, '[]'::jsonb) END
       RETURNING *
     `;
     const pair = pairFromRow(rows[0]);

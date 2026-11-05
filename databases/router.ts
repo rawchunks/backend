@@ -41,11 +41,35 @@ const pairBody = z.object({
   evmAddress: address.optional(),
   svmAddress: address.optional(),
 }).refine(data => Boolean(data.evmAddress || data.svmAddress), 'At least one wallet address is required');
+const socialLinkSchema = z.object({
+  platform: z.enum([
+    'x',
+    'instagram',
+    'tiktok',
+    'farcaster',
+    'spotify',
+    'soundcloud',
+    'youtube',
+    'discord',
+    'telegram',
+    'github',
+    'twitch',
+    'google',
+    'apple',
+  ]),
+  handle: z.string().max(120),
+  url: z.string().max(512),
+  verified: z.boolean().optional(),
+  providerId: z.string().max(160).optional(),
+});
+
 const profileBody = z.object({
   address: address.optional(),
   nickname: z.string().max(50).nullable().optional(),
   avatar: z.string().max(2048).nullable().optional(),
   bio: z.string().max(280).nullable().optional(),
+  banner: z.string().max(2048).nullable().optional(),
+  socials: z.array(socialLinkSchema).max(16).nullable().optional(),
   svmAddress: address.optional(),
   evmAddress: address.optional(),
 });
@@ -250,6 +274,8 @@ export const databaseRouter: FastifyPluginAsync = async app => {
         nickname: parsed.nickname,
         avatar: parsed.avatar,
         bio: parsed.bio,
+        banner: parsed.banner,
+        socials: parsed.socials,
         svmAddress: parsed.svmAddress,
         evmAddress: parsed.evmAddress,
       });

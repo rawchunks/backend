@@ -19,11 +19,13 @@ export async function runMigrations() {
       nickname TEXT,
       avatar TEXT,
       bio TEXT,
+      banner TEXT,
+      socials JSONB DEFAULT '[]'::jsonb NOT NULL,
       guides_seen JSONB DEFAULT '[]'::jsonb NOT NULL
     );
   `;
   await userSql`DROP TABLE IF EXISTS public.users;`;
-  await userSql`ALTER TABLE public.wallet_pairs ADD COLUMN IF NOT EXISTS nickname TEXT, ADD COLUMN IF NOT EXISTS avatar TEXT, ADD COLUMN IF NOT EXISTS bio TEXT, ADD COLUMN IF NOT EXISTS guides_seen JSONB DEFAULT '[]'::jsonb NOT NULL;`;
+  await userSql`ALTER TABLE public.wallet_pairs ADD COLUMN IF NOT EXISTS nickname TEXT, ADD COLUMN IF NOT EXISTS avatar TEXT, ADD COLUMN IF NOT EXISTS bio TEXT, ADD COLUMN IF NOT EXISTS banner TEXT, ADD COLUMN IF NOT EXISTS socials JSONB DEFAULT '[]'::jsonb NOT NULL, ADD COLUMN IF NOT EXISTS guides_seen JSONB DEFAULT '[]'::jsonb NOT NULL;`;
   await userSql`UPDATE public.wallet_pairs SET svm_address = NULL WHERE svm_address LIKE 'svm_pending_%';`;
   await userSql`
     DO $$ BEGIN
