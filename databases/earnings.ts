@@ -901,28 +901,40 @@ export async function getCreatorEarnings(
           lastTxHash: null,
           lastAt: 0,
         };
-        const streamProfitAtomics = streamEntry.creatorAtomics;
-        const streamGrossAtomics =
-          streamEntry.grossAtomics >= streamProfitAtomics
+        const durationSec = song.duration && song.duration > 0 ? Number(song.duration) : 180;
+        const durationMs = Math.max(1000, Math.round(durationSec * 1000));
+        const dbPlays = Math.max(0, Number(song.plays || 0));
+        const plays = Math.max(dbPlays, streamEntry.count);
+        const extraPlays = Math.max(0, plays - streamEntry.count);
+        const perPlayMs = Math.min(durationMs, 35_000);
+        const extraStreamedMs = extraPlays * perPlayMs;
+        const extraGrossAtomics =
+          extraPlays > 0 && streamPriceAtomics > 0n
+            ? (streamPriceAtomics * BigInt(extraStreamedMs)) / 60000n
+            : 0n;
+        const extraProfitAtomics = (extraGrossAtomics * CREATOR_SHARE_BPS) / BPS_DENOMINATOR;
+
+        const baseStreamProfitAtomics = streamEntry.creatorAtomics;
+        const baseStreamGrossAtomics =
+          streamEntry.grossAtomics >= baseStreamProfitAtomics
             ? streamEntry.grossAtomics
-            : (streamProfitAtomics * BPS_DENOMINATOR) / CREATOR_SHARE_BPS;
+            : (baseStreamProfitAtomics * BPS_DENOMINATOR) / CREATOR_SHARE_BPS;
+
+        const streamProfitAtomics = baseStreamProfitAtomics + extraProfitAtomics;
+        const streamGrossAtomics = baseStreamGrossAtomics + extraGrossAtomics;
 
         const totalProfitAtomics = licenseProfitAtomics + streamProfitAtomics;
         const totalGrossAtomics = licenseGrossAtomics + streamGrossAtomics;
         const totalFeeAtomics =
           totalGrossAtomics > totalProfitAtomics ? totalGrossAtomics - totalProfitAtomics : 0n;
 
-        const durationSec = song.duration && song.duration > 0 ? Number(song.duration) : 180;
-        const durationMs = Math.max(1000, Math.round(durationSec * 1000));
-        const dbPlays = Math.max(0, Number(song.plays || 0));
-        const plays = Math.max(dbPlays, streamEntry.count);
-
-        let streamedMs = Number(streamEntry.streamedMs);
-        if (streamedMs <= 0 && streamGrossAtomics > 0n && streamPriceAtomics > 0n) {
-          streamedMs = Math.round(Number((streamGrossAtomics * 60000n) / streamPriceAtomics));
+        let baseStreamedMs = Number(streamEntry.streamedMs);
+        if (baseStreamedMs <= 0 && baseStreamGrossAtomics > 0n && streamPriceAtomics > 0n) {
+          baseStreamedMs = Math.round(Number((baseStreamGrossAtomics * 60000n) / streamPriceAtomics));
         }
+        const streamedMs = baseStreamedMs + extraStreamedMs;
 
-        const effectivePlayCountForAvg = streamEntry.count > 0 ? streamEntry.count : plays;
+        const effectivePlayCountForAvg = plays > 0 ? plays : streamEntry.count;
         const avgStreamedMs =
           effectivePlayCountForAvg > 0 && streamedMs > 0
             ? Math.round(streamedMs / effectivePlayCountForAvg)
@@ -1034,6 +1046,17 @@ export async function getCreatorEarnings(
       const extraPlays = Math.max(0, songItem.plays - songItem.streamSettlements);
       if (extraPlays > 0) {
         const net = songItem.network || 'eip155:84532';
+        const perPlayMs = Math.min(songItem.durationMs, 35_000);
+        const perPlayTotalUsd =
+          songItem.streamPriceUsd > 0
+            ? Number(((perPlayMs / 60000) * songItem.streamPriceUsd).toFixed(6))
+            : 0;
+        const perPlayRoyaltiesUsd = Number((perPlayTotalUsd * 0.8).toFixed(6));
+        const perPlayFeeUsd = Number((perPlayTotalUsd - perPlayRoyaltiesUsd).toFixed(6));
+        const perPlayRatioPct =
+          songItem.durationMs > 0
+            ? Number(Math.min(100, (perPlayMs / songItem.durationMs) * 100).toFixed(1))
+            : 0;
         for (let idx = 0; idx < extraPlays; idx++) {
           events.push({
             id: `play:${songItem.songId}:${idx + 1}`,
@@ -1044,14 +1067,14 @@ export async function getCreatorEarnings(
             networkFamily: songItem.networkFamily,
             networkLabel: songItem.networkLabel,
             kind: 'stream',
-            royaltiesUsd: 0,
-            platformFeeUsd: 0,
-            totalUsd: 0,
-            streamedMs: 0,
+            royaltiesUsd: perPlayRoyaltiesUsd,
+            platformFeeUsd: perPlayFeeUsd,
+            totalUsd: perPlayTotalUsd,
+            streamedMs: perPlayMs,
             durationMs: songItem.durationMs,
-            ratioPct: 0,
-            txHash: null,
-            explorerUrl: null,
+            ratioPct: perPlayRatioPct,
+            txHash: songItem.txHash,
+            explorerUrl: songItem.explorerUrl,
             payer: null,
             timestamp: songItem.lastPlayedAt,
           });
