@@ -670,7 +670,7 @@ export async function getCreatorEarnings(
   const normalizedInput = normalizeCreator(creatorInput);
   const addresses = await resolveIdentityAddresses(normalizedInput);
   const normalizedAddresses = Array.from(new Set([normalizedInput, ...addresses.map(normalizeCreator)]));
-  const cacheKey = `earnings:v2:creator:${normalizedAddresses.slice().sort().join(',')}`;
+  const cacheKey = `earnings:v3:creator:${normalizedAddresses.slice().sort().join(',')}`;
 
   let baseData: CreatorEarningsResponse | undefined;
   if (!options?.refresh) {
@@ -680,7 +680,7 @@ export async function getCreatorEarnings(
   if (!baseData) {
     const allCreatorSongs = await listSongsByCreator(normalizedInput);
     const publishedSongs = allCreatorSongs.filter(
-      (s) => Boolean((s.public || s.chain_song_id || s.metadata_cid) && !s.source),
+      (s) => Boolean(s.public || s.chain_song_id || s.metadata_cid),
     );
     const songMap = new Map<string, { creator: string; network: string | null; streamPrice: number }>();
     for (const s of allCreatorSongs) {
