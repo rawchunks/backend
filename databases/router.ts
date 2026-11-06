@@ -212,11 +212,28 @@ export async function resolveSongStreamPayment(request: FastifyRequest): Promise
   }
   (request as any).song = song;
 
-  if (typeof request.headers['x-wallet-auth-token'] === 'string') {
+  const creator = song.creator.startsWith('0x') ? song.creator.toLowerCase() : song.creator;
+  if (typeof request.headers['x-wallet-auth-token'] === 'string' && request.headers['x-wallet-auth-token'].trim().length > 0) {
     const { authenticate } = await import('../credits/auth.js');
     const identity = await authenticate(request);
-    const creator = song.creator.startsWith('0x') ? song.creator.toLowerCase() : song.creator;
     if (identity.addresses.includes(creator)) return null;
+  } else {
+    const token = extractSessionToken(request);
+    const payload = token ? parseComposeToken(token) : null;
+    const now = Math.floor(Date.now() / 1000);
+    if (payload?.sub && (!payload.exp || payload.exp >= now)) {
+      const sub = payload.sub.startsWith('0x') ? payload.sub.toLowerCase() : payload.sub;
+      const isCreator =
+        sub === creator ||
+        (await checkUserOrPair(sub, song.creator).then(
+          () => true,
+          () => false,
+        ));
+      if (isCreator) {
+        request.headers['x-session-user-address'] = payload.sub;
+        return null;
+      }
+    }
   }
   const rate = Math.round(song.stream_price * 1000000);
   const durationSec = song.duration && song.duration > 0 ? song.duration : 180;
