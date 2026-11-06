@@ -150,6 +150,35 @@ export async function getSongById(id: string): Promise<Song | null> {
   return result[0] || null;
 }
 
+export async function getSongByTitleSlug(raw: string): Promise<Song | null> {
+  const slug = normalizeUrlSlug(raw);
+  if (!slug) return null;
+  let decoded = raw;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    decoded = raw;
+  }
+  const clean = decoded.trim().toLowerCase();
+  const publishedOrder = sql`coalesce(${songs.published_at}, ${songs.created_at}) desc`;
+  try {
+    const rows = await songDb
+      .select()
+      .from(songs)
+      .where(
+        and(
+          eq(songs.public, true),
+          sql`(LOWER(TRIM(${songs.title})) = ${clean} OR REGEXP_REPLACE(LOWER(TRIM(${songs.title})), '[\\s-]+', '-', 'g') = ${slug})`,
+        ),
+      )
+      .orderBy(publishedOrder)
+      .limit(1);
+    return rows[0] ? toMarketSong(rows[0]) : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function listSongsByCreator(creatorAddress: string, limit?: number, offset = 0): Promise<Song[]> {
   validatePagination(limit, offset);
   const addresses = await resolveIdentityAddresses(creatorAddress);

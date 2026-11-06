@@ -465,6 +465,12 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       if (!project?.song && 'getDeletedParentSongProject' in songsModule && typeof songsModule.getDeletedParentSongProject === 'function') {
         project = await songsModule.getDeletedParentSongProject(id);
       }
+      if (!project?.song && 'getSongByTitleSlug' in songsModule && typeof songsModule.getSongByTitleSlug === 'function') {
+        const bySlug = await songsModule.getSongByTitleSlug(id);
+        if (bySlug) {
+          project = await getFullSongProject(bySlug.id);
+        }
+      }
       if (!project?.song) return reply.status(404).send({ error: 'Song not found' });
       return reply.send(project);
     } catch (error) { return failure(request, reply, error, 'Failed to retrieve song'); }
