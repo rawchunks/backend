@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const sql = vi.hoisted(() => vi.fn());
 vi.mock('../../databases/client.js', () => ({ userSql: sql, songSql: vi.fn() }));
-import { checkUserConsent, getUserConsent, getWalletPair, parseAddress, putUserConsent, putWalletPair } from '../../databases/users.js';
+import { checkUserConsent, getUserConsent, getWalletPair, getWalletPairByAddressOrNickname, normalizeUrlSlug, parseAddress, putUserConsent, putWalletPair } from '../../databases/users.js';
 
 const evm = `0x${'aB'.repeat(20)}`, normalized = evm.toLowerCase();
 const svm = 'So11111111111111111111111111111111111111112';
@@ -133,5 +133,24 @@ describe('consent lookup', () => {
   it('reports no consent for a missing pair or absent address', async () => {
     expect(await checkUserConsent(evm)).toEqual({ hasConsented: false, evmAddress: null, svmAddress: null, record: null });
     expect(await checkUserConsent('')).toEqual({ hasConsented: false, record: null });
+  });
+  it('resolves nicknames containing spaces via hyphenated or percent-encoded URL slugs', async () => {
+    expect(normalizeUrlSlug('DJ Shadow')).toBe('dj-shadow');
+    expect(normalizeUrlSlug('DJ%20Shadow')).toBe('dj-shadow');
+    expect(normalizeUrlSlug('@DJ-Shadow')).toBe('dj-shadow');
+    sql.mockResolvedValueOnce([row({ nickname: 'DJ Shadow' })]);
+    expect(await getWalletPairByAddressOrNickname('DJ-Shadow')).toMatchObject({
+      evmAddress: normalized,
+      svmAddress: svm,
+      nickname: 'DJ Shadow',
+    });
+    expect(sql.mock.calls[0].slice(1)).toEqual(['dj-shadow', 'dj-shadow']);
+    sql.mockResolvedValueOnce([row({ nickname: 'DJ Shadow' })]);
+    expect(await getWalletPairByAddressOrNickname('DJ%20Shadow')).toMatchObject({
+      evmAddress: normalized,
+      svmAddress: svm,
+      nickname: 'DJ Shadow',
+    });
+    expect(sql.mock.calls[1].slice(1)).toEqual(['dj shadow', 'dj-shadow']);
   });
 });

@@ -597,21 +597,50 @@ export async function getWalletPair(rawAddress: string): Promise<WalletPair | nu
   });
 }
 
+export function normalizeUrlSlug(raw: string): string {
+  if (!raw) return '';
+  let decoded = raw;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    decoded = raw;
+  }
+  return decoded
+    .trim()
+    .replace(/^@+/, '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
 export async function getWalletPairByAddressOrNickname(raw: string): Promise<WalletPair | null> {
   if (!raw || !raw.trim()) return null;
   try {
     return await getWalletPair(raw);
   } catch {
-    const clean = raw.trim().replace(/^@+/, '').trim().toLowerCase();
-    if (!clean || clean.length > 50) return null;
-    const rows = await userSql`
-      SELECT * FROM public.wallet_pairs
-      WHERE LOWER(TRIM(nickname)) = ${clean}
-      LIMIT 1
-    `;
-    const pair = pairFromRow(rows[0]);
-    if (pair) await cachePair(pair);
-    return pair;
+    let decoded = raw;
+    try {
+      decoded = decodeURIComponent(raw);
+    } catch {
+      decoded = raw;
+    }
+    const clean = decoded.trim().replace(/^@+/, '').trim().toLowerCase();
+    const slug = normalizeUrlSlug(raw);
+    if ((!clean && !slug) || clean.length > 50) return null;
+    try {
+      const rows = await userSql`
+        SELECT * FROM public.wallet_pairs
+        WHERE LOWER(TRIM(nickname)) = ${clean}
+           OR REGEXP_REPLACE(LOWER(TRIM(nickname)), '[\\s-]+', '-', 'g') = ${slug}
+        LIMIT 1
+      `;
+      const pair = pairFromRow(rows?.[0]);
+      if (pair) await cachePair(pair);
+      return pair;
+    } catch {
+      return null;
+    }
   }
 }
 
