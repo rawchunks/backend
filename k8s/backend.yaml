@@ -92,6 +92,88 @@ spec:
                   key: RAWCHUNKS_SOLANA_TREASURY_ADDRESS
             - name: COMPOSE_API_URL
               value: "https://api.compose.market"
+            - name: API_BASE_URL
+              value: "https://api.rawchunks.space"
+            - name: OAUTH_GCLOUD_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_GCLOUD_CLIENT_ID
+            - name: OAUTH_GCLOUD_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_GCLOUD_CLIENT_SECRET
+            - name: OAUTH_GITHUB_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_GITHUB_CLIENT_ID
+            - name: OAUTH_GITHUB_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_GITHUB_CLIENT_SECRET
+            - name: OAUTH_DISCORD_APPLICATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_DISCORD_APPLICATION_ID
+            - name: OAUTH_DISCORD_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_DISCORD_PUBLIC_KEY
+            - name: OAUTH_DISCORD_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_DISCORD_CLIENT_ID
+            - name: OAUTH_DISCORD_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_DISCORD_CLIENT_SECRET
+            - name: OAUTH_X_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_X_APP_ID
+            - name: OAUTH_X_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_X_BEARER_TOKEN
+            - name: OAUTH_X_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_X_ACCESS_TOKEN
+            - name: OAUTH_X_ACCESS_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_X_ACCESS_TOKEN_SECRET
+            - name: OAUTH_X_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_X_CLIENT_ID
+            - name: OAUTH_X_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_X_CLIENT_SECRET
+            - name: OAUTH_TELEGRAM_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_TELEGRAM_ACCESS_TOKEN
+            - name: OAUTH_TELEGRAM_BOT_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: OAUTH_TELEGRAM_BOT_NAME
           readinessProbe:
             httpGet:
               path: /health
