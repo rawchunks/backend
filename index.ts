@@ -20,6 +20,7 @@ import { creditsRouter } from './credits/router.js';
 import { creditStore } from './credits/store.js';
 import { PayPal } from './credits/paypal.js';
 import { installCreditBilling, recoverCreditServices } from './credits/billing.js';
+import { oauthRouter } from './oauth/router.js';
 
 dotenv.config({ path: resolve(process.cwd(), '.env') });
 
@@ -145,6 +146,8 @@ async function main() {
   await app.register(strudelRouter, { prefix: '/strudel' });
   await app.register(voiceRoutes, { prefix: '/api/voices' });
   await app.register(voiceRoutes, { prefix: '/voices' });
+  await app.register(oauthRouter, { prefix: '/api/oauth' });
+  await app.register(oauthRouter, { prefix: '/oauth' });
 
   // Top-level clean one-word developer endpoints for external integrations & SDK
   const forward = (url: string) => async (req: any, reply: any) => {
