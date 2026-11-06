@@ -4,7 +4,7 @@ import { songs, songComments, songLikes, type Song, type NewSong, type SongComme
 import { stems, type Stem, type NewStem } from './schema/stems.js';
 import { takes, type Take, type NewTake } from './schema/takes.js';
 import { commits } from './schema/commits.js';
-import { resolveIdentityAddresses, parseAddress, RequestError } from './users.js';
+import { resolveIdentityAddresses, getWalletPairByAddressOrNickname, normalizeUrlSlug, parseAddress, RequestError } from './users.js';
 import { cacheGet, cacheSet, cacheDel } from './cache.js';
 import { ensureGenreCovers, normalizeGenreSlug } from './genres.js';
 import { isNonGenreTag, partitionSongTags } from '../options.js';
@@ -343,7 +343,19 @@ export async function queryPublicSongs(params: MarketQueryParams = {}): Promise<
   const conditions: any[] = [eq(songs.public, true)];
 
   if (params.creator && params.creator !== 'all') {
-    const addresses = await resolveIdentityAddresses(params.creator);
+    let addresses: string[] = [];
+    try {
+      addresses = await resolveIdentityAddresses(params.creator);
+    } catch {
+      const pair = await getWalletPairByAddressOrNickname(params.creator);
+      if (pair) {
+        if (pair.evmAddress) addresses.push(pair.evmAddress);
+        if (pair.svmAddress) addresses.push(pair.svmAddress);
+      }
+    }
+    if (addresses.length === 0) {
+      return { items: [], total: 0, limit, offset, hasMore: false };
+    }
     conditions.push(inArray(songs.creator, addresses));
   }
 
@@ -357,8 +369,11 @@ export async function queryPublicSongs(params: MarketQueryParams = {}): Promise<
 
   if (params.search && params.search.trim()) {
     const pattern = `%${params.search.trim()}%`;
+    const searchSlug = normalizeUrlSlug(params.search);
+    const slugPattern = searchSlug ? `%${searchSlug}%` : pattern;
     conditions.push(sql`(
       ${songs.title} ILIKE ${pattern}
+      OR REGEXP_REPLACE(LOWER(${songs.title}), '[\\s-]+', '-', 'g') LIKE ${slugPattern}
       OR ${songs.creator} ILIKE ${pattern}
       OR EXISTS (
         SELECT 1 FROM jsonb_array_elements_text(${songs.genres}) AS tag
