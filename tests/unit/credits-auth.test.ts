@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 import { describe, expect, it, vi } from 'vitest';
-import { createWalletAuthenticator } from '../../credits/auth.js';
+import { createWalletAuthenticator, resolveCreditOwner } from '../../credits/auth.js';
 
 const admin = '0x1111111111111111111111111111111111111111';
 const smart = '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd';
@@ -79,5 +79,25 @@ describe('Credits wallet ownership', () => {
   });
   it('rejects missing account selection rather than silently choosing a wallet', async () => {
     expect((await request({ 'x-wallet-auth-token': token })).statusCode).toBe(400);
+  });
+  it('resolves single-account EVM and Solana browser wallets directly when no wallet_pairs row exists', async () => {
+    const app = Fastify();
+    app.get('/credits/owner', async req => resolveCreditOwner(req));
+    const evmRes = await app.inject({
+      method: 'GET',
+      url: '/credits/owner',
+      headers: { 'x-session-user-address': stranger.toUpperCase().replace('0X', '0x') },
+    });
+    expect(evmRes.statusCode).toBe(200);
+    expect(evmRes.json()).toEqual({ owner: stranger, userAddress: stranger, addresses: [stranger] });
+
+    const svmRes = await app.inject({
+      method: 'GET',
+      url: '/credits/owner',
+      headers: { 'x-session-user-address': svm },
+    });
+    expect(svmRes.statusCode).toBe(200);
+    expect(svmRes.json()).toEqual({ owner: svm, userAddress: svm, addresses: [svm] });
+    await app.close();
   });
 });
