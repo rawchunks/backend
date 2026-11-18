@@ -102,4 +102,14 @@ describe('mint reuse', () => {
     await mintSong(state.api);
     expect(state.calls).toEqual(['verify']);
   });
+
+  it('never writes network or metadata_cid to the database before confirmation succeeds', async () => {
+    const state = registry();
+    state.failConfirm = true;
+    await expect(mintSong(state.api)).rejects.toThrow('Receipt unavailable');
+    expect(state.calls).toEqual([]);
+    expect(state.song.network).toBeUndefined();
+    expect(state.song.metadata_cid).toBeUndefined();
+    expect(state.song.chain_song_id).toBeUndefined();
+  });
 });

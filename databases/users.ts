@@ -259,7 +259,7 @@ export async function seedStarterSongForNewUser(rawAddress: string): Promise<voi
         ${Number(template.licenses ?? 0)},
         ${Number(template.stream_price ?? 0.01)},
         ${Number(template.license_price ?? 5)},
-        ${template.network ?? null},
+        NULL,
         ${template.image ?? null},
         NULL,
         false,

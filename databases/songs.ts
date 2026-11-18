@@ -4,7 +4,7 @@ import { songs, songComments, songLikes, type Song, type NewSong, type SongComme
 import { stems, type Stem, type NewStem } from './schema/stems.js';
 import { takes, type Take, type NewTake } from './schema/takes.js';
 import { commits } from './schema/commits.js';
-import { resolveIdentityAddresses, getWalletPairByAddressOrNickname, normalizeUrlSlug, parseAddress, RequestError } from './users.js';
+import { getWalletPair, resolveIdentityAddresses, getWalletPairByAddressOrNickname, normalizeUrlSlug, parseAddress, RequestError } from './users.js';
 import { cacheGet, cacheSet, cacheDel } from './cache.js';
 import { ensureGenreCovers, normalizeGenreSlug } from './genres.js';
 import { isNonGenreTag, partitionSongTags } from '../options.js';
@@ -119,7 +119,7 @@ export async function copySong(id: string): Promise<Song> {
     insert into songs (id, title, family, basis, creator, source, is_remix, parent_chain_song_id, version, url, duration, tags, genres, production, mood, vocal, licenses, stream_price, license_price, network, image, album_id)
     select ${next}, title, ${family}, ${id}, creator, source, is_remix, parent_chain_song_id,
       (select coalesce(max(version), 0) + 1 from songs where coalesce(family, id) = ${family}),
-      url, duration, tags, genres, production, mood, vocal, case when source is null and not is_remix then licenses else 0 end, stream_price, case when source is null and not is_remix then license_price else 0 end, network, image, album_id
+      url, duration, tags, genres, production, mood, vocal, case when source is null and not is_remix then licenses else 0 end, stream_price, case when source is null and not is_remix then license_price else 0 end, case when source is not null or is_remix then network else null end, image, album_id
     from songs where id = ${id} and not exists (${draft})
     `),
   ];
@@ -214,7 +214,7 @@ function validatePagination(limit: number | undefined, offset: number) {
 export async function updateSong(id: string, updates: Partial<NewSong>): Promise<Song | null> {
   if (['id', 'creator', 'created_at', 'published_at'].some((key) => key in updates)) throw new Error('Song identity and ownership cannot be updated');
   let song: Song | null = null;
-  if (['url', 'duration', 'source', 'is_remix', 'version', 'family', 'basis', 'licenses', 'license_price', 'chain_song_id', 'tx_hash', 'public'].some(key => key in updates)) {
+  if (['url', 'duration', 'source', 'is_remix', 'version', 'family', 'basis', 'licenses', 'license_price', 'network', 'chain_song_id', 'tx_hash', 'public'].some(key => key in updates)) {
     song = await getSongById(id);
     if (song?.metadata_cid && ['url', 'duration', 'source', 'is_remix', 'version', 'family', 'basis'].some(key => key in updates)) throw new RequestError('Open an editable version before changing this song', 409);
     if ((song?.source || song?.is_remix || updates.source || updates.is_remix) && (updates.licenses || updates.license_price)) throw new RequestError('Remixes cannot be licensed');
@@ -222,6 +222,16 @@ export async function updateSong(id: string, updates: Partial<NewSong>): Promise
   const normalizedUpdates: Partial<NewSong> = { ...updates };
   if (updates.source) {
     normalizedUpdates.is_remix = true;
+  }
+  if (updates.chain_song_id && updates.network && song) {
+    const wantsEvm = updates.network.startsWith('eip155:');
+    const wantsSvm = updates.network.startsWith('solana:');
+    const hasEvm = song.creator.startsWith('0x');
+    if ((wantsEvm && !hasEvm) || (wantsSvm && hasEvm)) {
+      const pair = await getWalletPair(song.creator).catch(() => null);
+      const pairedCreator = wantsEvm ? pair?.evmAddress?.toLowerCase() : pair?.svmAddress;
+      if (pairedCreator) normalizedUpdates.creator = pairedCreator;
+    }
   }
   if (
     (updates.chain_song_id && !song?.chain_song_id) ||
@@ -511,7 +521,7 @@ export async function getMarketFolds(foldLimit = 50, windowMinutes = 60): Promis
   const safeLimit = Math.min(Math.max(Number(foldLimit) || 50, 4), 100);
   const safeWindow = [15, 30, 60].includes(Number(windowMinutes)) ? Number(windowMinutes) : 60;
   const cacheKey = `${MARKET_FOLDS_CACHE_PREFIX}${safeLimit}:${safeWindow}`;
-  const cached = await cacheGet<MarketFoldsResponse>(cacheKey);
+  const cached = await cacheGet<MarketFoldsResponse>(cacheKey, 0);
   if (cached) return cached;
 
   const rawFetchLimit = Math.min(safeLimit * 3, 250);
@@ -620,7 +630,7 @@ export async function getMarketFolds(foldLimit = 50, windowMinutes = 60): Promis
     creators,
   };
 
-  await cacheSet(cacheKey, payload, MARKET_FOLDS_TTL);
+  await cacheSet(cacheKey, payload, MARKET_FOLDS_TTL, 0);
   return payload;
 }
 
