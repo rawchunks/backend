@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { CreditStore } from './store.js';
+import { getActiveNetworkSet } from '../broker/payment.js';
 
 export const packs = [
   { id: 'usd-10', amountAtomics: '10000000', usd: '10.00' },
@@ -9,9 +10,9 @@ export const packs = [
 const fail = (message: string, statusCode = 502) => Object.assign(new Error(message), { statusCode });
 
 export function blockchainForNetwork(network?: string): 'base' | 'tempo' | 'solana' | null {
-  if (!network) return null;
-  if (network === 'eip155:84532' || network === 'eip155:8453') return 'base';
-  if (network === 'eip155:42431' || network === 'eip155:4217') return 'tempo';
+  if (!network || !getActiveNetworkSet().has(network)) return null;
+  if (network === 'eip155:84532') return 'base';
+  if (network === 'eip155:42431') return 'tempo';
   if (network.startsWith('solana:')) return 'solana';
   return null;
 }

@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { authenticate, resolveCreditOwner } from './auth.js';
 import { creditStore, type CreditLotSource } from './store.js';
-import type { SessionPaymentConfig, SessionPaymentOptions, SessionPaymentResolver } from '../broker/payment.js';
+import { getActiveNetworkSet, getNetworkMode, type SessionPaymentConfig, type SessionPaymentOptions, type SessionPaymentResolver } from '../broker/payment.js';
 
 interface Billing {
   owner: string;
@@ -32,7 +32,7 @@ async function resolveCardComposeSession(
   forceRefresh = false,
 ): Promise<{ token: string; userAddress: string } | null> {
   const composeUrl = (process.env.COMPOSE_API_URL || '').replace(/\/+$/, '');
-  if (!composeUrl || !network || !userAddress) return null;
+  if (!composeUrl || !network || !userAddress || !getActiveNetworkSet().has(network)) return null;
 
   const isSolana = network.startsWith('solana:');
   if (isSolana ? userAddress.startsWith('0x') : !userAddress.startsWith('0x')) {
@@ -150,6 +150,8 @@ async function buildBatchSettlementSignature(
   ).catch(() => null);
   const coinflowPaymentId =
     typeof latestOp?.context?.coinflowPaymentId === 'string' ? latestOp.context.coinflowPaymentId : undefined;
+  const thirdwebPaymentId =
+    typeof latestOp?.context?.thirdwebPaymentId === 'string' ? latestOp.context.thirdwebPaymentId : undefined;
   return Buffer.from(
     JSON.stringify({
       x402Version: 2,
@@ -160,6 +162,7 @@ async function buildBatchSettlementSignature(
         userAddress,
         holdId,
         ...(coinflowPaymentId ? { coinflowPaymentId } : {}),
+        ...(thirdwebPaymentId ? { thirdwebPaymentId } : {}),
       },
     }),
   ).toString('base64');
@@ -200,6 +203,13 @@ export async function admitCredits(
   const rawSource = req.headers['x-credit-source'];
   if (rawSource !== 'promo' && rawSource !== 'card') {
     throw Object.assign(new Error('Credit source (promo or card) required'), { statusCode: 400 });
+  }
+  const requestedNetwork =
+    typeof req.headers['x-network-id'] === 'string' && req.headers['x-network-id'].trim()
+      ? req.headers['x-network-id'].trim()
+      : undefined;
+  if (requestedNetwork && !getActiveNetworkSet().has(requestedNetwork)) {
+    throw Object.assign(new Error('Network is not active in current mode'), { statusCode: 402 });
   }
   const source: CreditLotSource = rawSource;
   const hasWalletToken =
@@ -251,10 +261,6 @@ export async function admitCredits(
   if (hold.context && !options?.metered) {
     throw Object.assign(new Error('This operation has already been admitted'), { statusCode: 409 });
   }
-  const requestedNetwork =
-    typeof req.headers['x-network-id'] === 'string' && req.headers['x-network-id'].trim()
-      ? req.headers['x-network-id'].trim()
-      : undefined;
   const billing: Billing = {
     owner: identity.owner,
     hold: hold.id,
@@ -270,7 +276,7 @@ export async function admitCredits(
       const song = (req as any).song;
       const durationSec = song.duration && song.duration > 0 ? song.duration : 180;
       const durationMs = Math.ceil(durationSec * 1000);
-      const streamNetwork: string | undefined = requestedNetwork || song.network;
+      const streamNetwork: string | undefined = requestedNetwork || song[getNetworkMode()] || undefined;
       let composePaymentIntentId: string | undefined;
       let composeToken: string | undefined;
       let composeUserAddress: string | undefined;
@@ -381,7 +387,13 @@ export async function checkpointCredits(req: FastifyRequest) {
     typeof req.headers['x-network-id'] === 'string' && req.headers['x-network-id'].trim()
       ? req.headers['x-network-id'].trim()
       : undefined;
+  if (requestedNetwork && !getActiveNetworkSet().has(requestedNetwork)) {
+    throw Object.assign(new Error('Network is not active in current mode'), { statusCode: 402 });
+  }
   const streamNetwork: string | undefined = row.context.network || requestedNetwork;
+  if (streamNetwork && !getActiveNetworkSet().has(streamNetwork)) {
+    throw Object.assign(new Error('Network is not active in current mode'), { statusCode: 402 });
+  }
   if (row.context.paymentIntentId && row.context.composeToken && process.env.COMPOSE_API_URL && streamNetwork) {
     const { settleStreamCheckpoint, PaymentError } = await import('../broker/payment.js');
     try {
@@ -414,7 +426,7 @@ export async function checkpointCredits(req: FastifyRequest) {
     ])
       .then(async ([{ getSongById }, { recordSongEarning }]) => {
         const song = await getSongById(row.context.songId);
-        const earningNetwork = streamNetwork || song?.network;
+        const earningNetwork = streamNetwork || song?.[getNetworkMode()] || undefined;
         if (!song || !earningNetwork) return;
         await recordSongEarning({
           id: `crd:${row.id}`,

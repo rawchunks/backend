@@ -124,7 +124,7 @@ interface CachedTokenEntry {
 
 const TOKEN_L2_TTL_SEC = 15 * 60; // 15 minutes
 const TOKEN_L1_TTL_MS = 15 * 60 * 1000;
-const tokenCacheKey = (hash: string) => `rawchunks:id:tw:${hash}`;
+const tokenCacheKey = (hash: string) => `id:tw:${hash}`;
 
 function identityFromEntry(entry: CachedTokenEntry, userAddress: string): CreditIdentity | null {
   const pair = entry.pairs.find(([evm, svm]) => evm.toLowerCase() === userAddress || svm === userAddress);

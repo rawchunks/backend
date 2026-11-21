@@ -1,6 +1,7 @@
 import { Pool, neonConfig } from '@neondatabase/serverless';
 import ws from 'ws';
 import { cacheDel, cacheGet, cacheSet, singleFlight } from '../databases/cache.js';
+import { getNetworkMode } from '../broker/payment.js';
 
 const schema = `
 CREATE TABLE IF NOT EXISTS credit_accounts (environment text NOT NULL,owner text NOT NULL,available bigint NOT NULL DEFAULT 0 CHECK(available>=0),spent bigint NOT NULL DEFAULT 0 CHECK(spent>=0),suspended bigint NOT NULL DEFAULT 0 CHECK(suspended>=0),PRIMARY KEY(environment,owner));
@@ -54,14 +55,14 @@ const PROMO_COUNT_L2_TTL_SEC = 60;
 const PROMO_COUNT_L1_TTL_MS = 15_000;
 
 export class CreditStore {
-  constructor(public readonly pool: CreditPool, public readonly environment: 'sandbox' | 'live') {}
+  constructor(public readonly pool: CreditPool, public readonly environment: 'sandbox' | 'live') { }
 
   private promoCountKey(): string {
-    return `rawchunks:cr:promo:${this.environment}`;
+    return `cr:promo:${this.environment}`;
   }
 
   private ownerSnapKey(owner: string): string {
-    return `rawchunks:cr:snap:${this.environment}:${owner.toLowerCase()}`;
+    return `cr:snap:${this.environment}:${owner.toLowerCase()}`;
   }
 
   async invalidateOwner(owner: string, invalidatePromoCount = false): Promise<void> {
@@ -391,8 +392,10 @@ export class CreditStore {
     await this.invalidateOwner(owner);
   }
 
-  async creditCapture(owner: string, id: string, captureId: string, amount: bigint) {
+  async creditCapture(owner: string, id: string, captureId: string, amount: bigint, deliveredAtomics?: bigint) {
+    const credited = deliveredAtomics ?? amount;
     positive(amount);
+    positive(credited);
     await this.tx(async c => {
       await this.account(c, owner);
       const op = (await c.query('SELECT * FROM credit_operations WHERE environment=$1 AND id=$2 AND owner=$3 FOR UPDATE', [this.environment, id, owner])).rows[0];
@@ -402,23 +405,45 @@ export class CreditStore {
         if (op.capture_id !== captureId) throw fail('Capture replay mismatch');
         return;
       }
-      if (await this.posting(c, owner, `capture:${captureId}`, amount, 'purchase')) {
-        await c.query('INSERT INTO credit_lots(environment,id,owner,capture_id,amount,available) VALUES($1,$2,$3,$4,$5,$5)', [this.environment, id, owner, captureId, String(amount)]);
-        await c.query('UPDATE credit_accounts SET available=available+$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(amount)]);
+      if (await this.posting(c, owner, `capture:${captureId}`, credited, 'purchase')) {
+        await c.query('INSERT INTO credit_lots(environment,id,owner,capture_id,amount,available) VALUES($1,$2,$3,$4,$5,$5)', [this.environment, id, owner, captureId, String(credited)]);
+        await c.query('UPDATE credit_accounts SET available=available+$3 WHERE environment=$1 AND owner=$2', [this.environment, owner, String(credited)]);
       } else {
         throw fail('Capture is already attributed to another operation');
       }
-      await c.query("UPDATE credit_operations SET status='credited',capture_id=$3,updated_at=now() WHERE environment=$1 AND id=$2", [this.environment, id, captureId]);
+      await c.query(
+        "UPDATE credit_operations SET status='credited',capture_id=$3,context=context||$4::jsonb,updated_at=now() WHERE environment=$1 AND id=$2",
+        [this.environment, id, captureId, JSON.stringify({ creditedAtomics: String(credited) })],
+      );
     });
     await this.invalidateOwner(owner);
+  }
+
+  async completeOperation(owner: string, id: string, captureId: string, contextPatch?: Record<string, unknown>) {
+    await this.tx(async c => {
+      await this.account(c, owner);
+      const op = (await c.query('SELECT * FROM credit_operations WHERE environment=$1 AND id=$2 AND owner=$3 FOR UPDATE', [this.environment, id, owner])).rows[0];
+      if (!op) throw fail('Unknown payment operation', 404);
+      if (op.status === 'completed') {
+        if (op.capture_id !== captureId) throw fail('Capture replay mismatch');
+        return;
+      }
+      await c.query(
+        "UPDATE credit_operations SET status='completed',capture_id=$3,context=context||$4::jsonb,updated_at=now() WHERE environment=$1 AND id=$2",
+        [this.environment, id, captureId, JSON.stringify(contextPatch ?? {})],
+      );
+    });
   }
 }
 
 let store: CreditStore | undefined;
 export function creditStore(): CreditStore {
-  if (store) return store;
-  const environment = process.env.PAYPAL_ENV;
-  if (environment !== 'sandbox' && environment !== 'live') throw new Error('PayPal environment must be explicit');
+  const mode = getNetworkMode();
+  const environment = mode === 'mainnet' ? 'live' : 'sandbox';
+  if (mode === 'testnet' && process.env.PAYPAL_ENV && process.env.PAYPAL_ENV !== 'sandbox') {
+    throw new Error("PAYPAL_ENV conflicts with NETWORK_MODE='testnet'");
+  }
+  if (store && store.environment === environment) return store;
   const url = process.env.CREDITS_DATABASE_URL || process.env.USER_DATABASE_URL;
   if (!url) throw new Error('Credits database unavailable');
   neonConfig.webSocketConstructor = ws;

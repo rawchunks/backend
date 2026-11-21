@@ -1,6 +1,63 @@
 import { createHash, createHmac, timingSafeEqual, randomUUID } from 'node:crypto';
 import type { FastifyRequest, FastifyReply } from 'fastify';
+import { fetchChains, type FacilitatorChain, type NetworkId } from '@compose-market/sdk/chains';
 import { valkey, getTaskContext, withJobLock, type JobLease } from './valkey.js';
+
+export type NetworkMode = 'testnet' | 'mainnet';
+
+export const TESTNET_NETWORKS: readonly NetworkId[] = [
+  'eip155:84532',
+  'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
+  'eip155:42431',
+];
+
+export const MAINNET_NETWORKS: readonly NetworkId[] = [
+  'eip155:8453',
+];
+
+const TESTNET_NETWORK_SET: ReadonlySet<string> = new Set(TESTNET_NETWORKS);
+const MAINNET_NETWORK_SET: ReadonlySet<string> = new Set(MAINNET_NETWORKS);
+
+export function getNetworkMode(): NetworkMode {
+  const raw = process.env.NETWORK_MODE?.trim().toLowerCase();
+  if (raw === 'testnet' || raw === 'mainnet') return raw;
+  throw new Error("NETWORK_MODE must be explicitly set to 'testnet' or 'mainnet'");
+}
+
+export function getActiveNetworks(): readonly NetworkId[] {
+  return getNetworkMode() === 'mainnet' ? MAINNET_NETWORKS : TESTNET_NETWORKS;
+}
+
+export function getActiveNetworkSet(): ReadonlySet<string> {
+  return getNetworkMode() === 'mainnet' ? MAINNET_NETWORK_SET : TESTNET_NETWORK_SET;
+}
+
+let facilitatorChainsCache: { baseUrl: string; expiresAt: number; chains: FacilitatorChain[] } | null = null;
+
+export async function getFacilitatorChains(forceRefresh = false): Promise<FacilitatorChain[]> {
+  const baseUrl = getComposeApiUrl();
+  const now = Date.now();
+  if (!forceRefresh && facilitatorChainsCache && facilitatorChainsCache.baseUrl === baseUrl && facilitatorChainsCache.expiresAt > now) {
+    const active = getActiveNetworkSet();
+    return facilitatorChainsCache.chains.filter((chain) => active.has(chain.network));
+  }
+  const response = await fetchChains({ baseUrl, fetch: globalThis.fetch });
+  facilitatorChainsCache = { baseUrl, expiresAt: now + 5 * 60 * 1000, chains: response.chains };
+  const active = getActiveNetworkSet();
+  return response.chains.filter((chain) => active.has(chain.network));
+}
+
+export async function getFacilitatorChain(network: string): Promise<FacilitatorChain> {
+  if (!getActiveNetworkSet().has(network)) {
+    throw Object.assign(new Error(`Network is not active in current mode: ${network}`), { statusCode: 409 });
+  }
+  const chains = await getFacilitatorChains();
+  const match = chains.find((chain) => chain.network === network);
+  if (!match) {
+    throw Object.assign(new Error(`Compose facilitator does not advertise network: ${network}`), { statusCode: 502 });
+  }
+  return match;
+}
 
 export interface KeyPayload {
   sub: string;
@@ -101,6 +158,7 @@ export function parseComposeToken(token: string): KeyPayload | null {
     const jsonStr = Buffer.from(parts[1], 'base64url').toString('utf8');
     const payload = JSON.parse(jsonStr) as KeyPayload;
     if (!payload.sub || !payload.keyId) return null;
+    if (!payload.network || !getActiveNetworkSet().has(payload.network)) return null;
     return payload;
   } catch {
     return null;
@@ -300,8 +358,8 @@ interface PlaybackPayment {
   pending?: PaymentObligation;
   obligations: PaymentObligation[];
 }
-const recoverySet = 'rawchunks:payments';
-const playbackKey = (intent: string) => `rawchunks:payment:${intent}`;
+const recoverySet = 'payments';
+const playbackKey = (intent: string) => `payment:${intent}`;
 const durableStatuses = new Set(['queued', 'submitted', 'confirmed']);
 
 async function sendPayment(state: PlaybackPayment, operation: string, body: PaymentBody) {
@@ -467,7 +525,7 @@ async function drainPayment(state: PlaybackPayment, lease: JobLease): Promise<Pl
             payer: state.account,
           }),
         )
-        .catch(() => {});
+        .catch(() => { });
     }
     state.billedWei = pending.cumulativeWei;
     state.acceptedMs = pending.millis;
@@ -499,6 +557,9 @@ export async function settleStreamCheckpoint(params: {
   streamPriceUsd?: number; creatorAddress?: string; payTo?: string;
 }): Promise<PlaybackReceipt> {
   if (!Number.isFinite(params.listenedSeconds) || params.listenedSeconds < 0) throw new PaymentError(400, { error: 'Invalid playback checkpoint' });
+  if (!params.network || !getActiveNetworkSet().has(params.network)) {
+    throw new PaymentError(402, { error: 'Network is not active in current mode', code: 'inactive_network' });
+  }
   const id = await valkey.get(playbackKey(params.paymentIntentId));
   if (!id) throw new PaymentError(404, { error: 'Unknown playback identifier; restart playback' });
   return withJobLock(id, async lease => {
@@ -548,7 +609,7 @@ export async function recoverPayments() {
                     payer: state.account,
                   }),
                 )
-                .catch(() => {});
+                .catch(() => { });
             }
           }
         }
@@ -559,11 +620,39 @@ export async function recoverPayments() {
   }
 }
 
+function extractX402SignatureNetwork(raw: unknown): string | null | 'malformed' {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  try {
+    const decoded = JSON.parse(Buffer.from(raw.trim(), 'base64').toString('utf8')) as Record<string, any>;
+    if (!decoded || typeof decoded !== 'object') return 'malformed';
+    const net = typeof decoded.network === 'string' && decoded.network
+      ? decoded.network
+      : typeof decoded.accepted?.network === 'string' && decoded.accepted.network
+        ? decoded.accepted.network
+        : null;
+    return net || 'malformed';
+  } catch {
+    return 'malformed';
+  }
+}
+
 export function requireSessionPayment(
   configOrResolver: SessionPaymentConfig | SessionPaymentResolver,
   options?: SessionPaymentOptions
 ) {
   return async function sessionPaymentPreHandler(request: FastifyRequest, reply: FastifyReply) {
+    const activeNetworks = getActiveNetworkSet();
+    const rawHeaderNetwork = typeof request.headers['x-network-id'] === 'string' ? request.headers['x-network-id'].trim() : '';
+    if (rawHeaderNetwork && !activeNetworks.has(rawHeaderNetwork)) {
+      return reply.status(402).send({ error: 'Network is not active in current mode', code: 'inactive_network' });
+    }
+    const rawPaymentSig = request.headers['payment-signature'] ?? request.headers['x-payment'];
+    if (rawPaymentSig !== undefined) {
+      const sigNet = extractX402SignatureNetwork(rawPaymentSig);
+      if (sigNet === 'malformed' || !sigNet || !activeNetworks.has(sigNet) || (rawHeaderNetwork && rawHeaderNetwork !== sigNet)) {
+        return reply.status(402).send({ error: 'Network is not active in current mode', code: 'inactive_network' });
+      }
+    }
     if (request.headers['x-credit-source']) {
       const { admitCredits } = await import('../credits/billing.js');
       return admitCredits(request, reply, configOrResolver, options);
