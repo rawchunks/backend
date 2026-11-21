@@ -1,4 +1,4 @@
-import type { LyricsAlignment } from '../../databases/schema/takes.js';
+import { extractBracketTags, readStoredAlignment } from '../../scribe/service.js';
 import {
   DRUMS_LIBRARY,
   DRUM_TOKEN_CATEGORIES,
@@ -216,14 +216,7 @@ export async function resolveSongStrudelMetadata(
 
     const inherited = baseTake ? sourceSettings(baseTake, takes, commits) : {};
 
-    let alignment: LyricsAlignment | null = null;
-    for (const take of takes) {
-      const candidate = (take.provenance as any)?.lyricsAlignment;
-      if (candidate && Array.isArray(candidate.lines) && candidate.lines.length > 0) {
-        alignment = candidate as LyricsAlignment;
-        break;
-      }
-    }
+    const alignment = readStoredAlignment(takes);
 
     let activeSection: string | undefined;
     let activeLyrics: string | undefined;
@@ -235,9 +228,10 @@ export async function resolveSongStrudelMetadata(
       for (const line of alignment.lines) {
         const text = (line.text || '').trim();
         if (!text) continue;
-        if (line.isTag || /^\s*\[[^\]]+\]\s*$/.test(text)) {
+        if (line.isTag) {
           if (line.start === null || line.start <= windowEndSec) {
-            currentSection = text.replace(/^\[|\]$/g, '').trim();
+            const tags = extractBracketTags(text);
+            if (tags[0]) currentSection = tags[0];
           }
           continue;
         }
@@ -252,9 +246,9 @@ export async function resolveSongStrudelMetadata(
         activeLyrics = matchingLines.slice(0, 2).join(' / ').slice(0, 160);
       }
     } else if (rawLyrics.trim()) {
-      const tagMatches = Array.from(rawLyrics.matchAll(/\[([A-Za-z0-9\s#-]+)\]/g)).map((m) => m[1].trim());
-      if (tagMatches.length > 0) {
-        activeSection = tagMatches[0];
+      const tags = extractBracketTags(rawLyrics);
+      if (tags.length > 0) {
+        activeSection = tags[0];
       }
     }
 
