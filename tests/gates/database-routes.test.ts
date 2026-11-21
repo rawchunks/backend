@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => ({
   listStemsBySong: vi.fn(), listTakesBySong: vi.fn(), deleteTake: vi.fn(),
 }));
 vi.mock('../../databases/users.js', async importOriginal => ({ ...await importOriginal<any>(), ...mocks, readTake: scope.readTake }));
-vi.mock('../../databases/songs.js', () => mocks);
+vi.mock('../../databases/songs.js', async importOriginal => ({ ...await importOriginal<any>(), ...mocks }));
 vi.mock('../../databases/stems.js', () => mocks);
 vi.mock('../../databases/takes.js', () => mocks);
 import { databaseRouter } from '../../databases/router.js';
@@ -15,6 +15,7 @@ const evm = `0x${'a'.repeat(40)}`;
 const svm = 'So11111111111111111111111111111111111111112';
 let app: FastifyInstance;
 beforeEach(async () => {
+  process.env.NETWORK_MODE = 'testnet';
   for (const fn of Object.values(mocks)) fn.mockReset();
   const { RequestError } = await import('../../databases/users.js');
   scope.readTake.mockReset().mockRejectedValue(new RequestError('userAddress header is required'));
@@ -34,17 +35,17 @@ describe('userAddress header and resource scope', () => {
     expect(mocks.deleteTake).not.toHaveBeenCalled();
   });
   it('creates a private remix without mint linkage from a public source', async () => {
-    const source = { id: 'source', public: true, creator: svm, title: 'Song', url: 'audio.wav', chain_song_id: '1', network: 'network', licenses: 10, license_price: 25, stream_price: 0.02, tags: [], duration: 60 };
+    const source = { id: 'source', public: true, creator: svm, title: 'Song', url: 'audio.wav', chain_song_id: { testnet: '1' }, testnet: 'eip155:84532', licenses: 10, license_price: 25, stream_price: 0.02, tags: [], duration: 60 };
     mocks.getSongById.mockResolvedValueOnce(source);
     mocks.createSong.mockImplementationOnce(async song => ({ ...song, public: false }));
     const response = await app.inject({ method: 'POST', url: '/api/songs/source/remix', headers: { 'x-session-user-address': evm } });
     expect(response.statusCode).toBe(201);
-    expect(response.json()).toMatchObject({ source: 'source', creator: evm, public: false, url: 'audio.wav', licenses: 0, license_price: 0 });
+    expect(response.json()).toMatchObject({ source: 'source', creator: evm, public: false, url: 'audio.wav', licenses: 0, license_price: 0, network: 'eip155:84532' });
     expect(response.json().chain_song_id).toBeUndefined();
     expect(response.json().tx_hash).toBeUndefined();
   });
   it('rejects a minted public remix as a source before creating another song', async () => {
-    mocks.getSongById.mockResolvedValueOnce({ id: 'remix', public: true, creator: svm, source: 'original', chain_song_id: '2', network: 'network', url: 'audio.wav' });
+    mocks.getSongById.mockResolvedValueOnce({ id: 'remix', public: true, creator: svm, source: 'original', chain_song_id: { testnet: '2' }, testnet: 'eip155:84532', url: 'audio.wav' });
     const response = await app.inject({ method: 'POST', url: '/api/songs/remix/remix', headers: { 'x-session-user-address': evm } });
     expect(response.statusCode).toBe(409);
     expect(response.json()).toEqual({ error: 'Remixes cannot be remixed' });

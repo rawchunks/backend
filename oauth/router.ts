@@ -152,7 +152,7 @@ export function deriveDeterministicSessionId(
   }
   const secret = getProviderSecret(provider);
   return createHmac('sha256', secret)
-    .update(`rawchunks:oauth:${provider}:${normalizedId}`)
+    .update(`oauth:${provider}:${normalizedId}`)
     .digest('hex');
 }
 

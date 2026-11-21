@@ -17,6 +17,7 @@ function createMockJwt(payload: Record<string, unknown>): string {
 
 describe('Session Gate (Zero Latency Payment Wrapper)', () => {
   beforeEach(() => {
+    process.env.NETWORK_MODE = 'mainnet';
     process.env.RAWCHUNKS_TREASURY_ADDRESS = '0x974A6e338a397e52E69A50dAEa131F7FDFED4332';
     process.env.RAWCHUNKS_SOLANA_TREASURY_ADDRESS = '139ckThCRxYDDFXgfRjH4TCiaTJETbb1UMLwACvWJ1fq';
     process.env.COMPOSE_API_URL = 'https://api.compose.market';
@@ -56,17 +57,46 @@ describe('Session Gate (Zero Latency Payment Wrapper)', () => {
   });
 
   it('rejects a session from another network before allowing a Tempo endpoint request', async () => {
+    process.env.NETWORK_MODE = 'testnet';
     const app = fastify();
     const run = vi.fn(async () => ({ ok: true }));
     app.post('/generate', { preHandler: [requireSessionPayment({ amountWei: '50000', priceUsd: 0.05, action: 'generate' })] }, run);
-    const token = createMockJwt({ sub: '0x2222222222222222222222222222222222222222', keyId: 'wrong-network', network: 'eip155:8453', budgetLimit: 1000000, budgetUsed: 0 });
+    const token = createMockJwt({ sub: '0x2222222222222222222222222222222222222222', keyId: 'wrong-network', network: 'eip155:84532', budgetLimit: 1000000, budgetUsed: 0 });
     const res = await app.inject({ method: 'POST', url: '/generate', headers: { authorization: `Bearer ${token}`, 'x-network-id': 'eip155:42431' } });
     expect(res.statusCode).toBe(401);
     expect(run).not.toHaveBeenCalled();
     await app.close();
   });
 
+  it('rejects cross-mode Compose keys and x-network-id headers synchronously fail-closed', async () => {
+    const app = fastify();
+    const run = vi.fn(async () => ({ ok: true }));
+    app.post('/generate', { preHandler: [requireSessionPayment({ amountWei: '50000', priceUsd: 0.05, action: 'generate' })] }, run);
+
+    process.env.NETWORK_MODE = 'mainnet';
+    for (const inactive of ['eip155:84532', 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1', 'eip155:42431', 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp']) {
+      const badToken = createMockJwt({ sub: '0x2222222222222222222222222222222222222222', keyId: 'bad', network: inactive, budgetLimit: 1000000, budgetUsed: 0 });
+      expect(parseComposeToken(badToken)).toBeNull();
+      const keyRes = await app.inject({ method: 'POST', url: '/generate', headers: { authorization: `Bearer ${badToken}` } });
+      expect(keyRes.statusCode).toBe(401);
+      const netRes = await app.inject({ method: 'POST', url: '/generate', headers: { 'x-network-id': inactive, 'x-test-require-session': 'true' } });
+      expect(netRes.statusCode).toBe(402);
+    }
+
+    process.env.NETWORK_MODE = 'testnet';
+    const mainnetToken = createMockJwt({ sub: '0x2222222222222222222222222222222222222222', keyId: 'main', network: 'eip155:8453', budgetLimit: 1000000, budgetUsed: 0 });
+    expect(parseComposeToken(mainnetToken)).toBeNull();
+    const mainKeyRes = await app.inject({ method: 'POST', url: '/generate', headers: { authorization: `Bearer ${mainnetToken}` } });
+    expect(mainKeyRes.statusCode).toBe(401);
+    const mainNetRes = await app.inject({ method: 'POST', url: '/generate', headers: { 'x-network-id': 'eip155:8453', 'x-test-require-session': 'true' } });
+    expect(mainNetRes.statusCode).toBe(402);
+
+    expect(run).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it('carries the Moderato session and universal address through Rawchunks prepare and settle', async () => {
+    process.env.NETWORK_MODE = 'testnet';
     const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
       const body = JSON.parse(String(init?.body));
       return new Response(JSON.stringify(body.paymentIntentId ? { status: 'confirmed', txHash: '0x01' } : { paymentIntentId: 'tempo-intent' }));
@@ -215,6 +245,7 @@ describe('Session Gate (Zero Latency Payment Wrapper)', () => {
   });
 
   it('charges $0.02 (20000 wei) for individual editing actions', async () => {
+    process.env.NETWORK_MODE = 'testnet';
     const app = fastify();
     const editPrice = { amountWei: '20000', priceUsd: 0.02, action: 'edit-repaint' };
 
@@ -225,7 +256,7 @@ describe('Session Gate (Zero Latency Payment Wrapper)', () => {
     const token = createMockJwt({
       sub: '0xEditUser',
       keyId: 'edit-key-1',
-      network: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',
+      network: 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
       budgetLimit: 50000,
       budgetUsed: 0,
       exp: Math.floor(Date.now() / 1000) + 3600,

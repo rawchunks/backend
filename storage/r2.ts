@@ -60,15 +60,47 @@ async function providerResult(response: Response, operation: string): Promise<an
 /** Returns an encoded permanent edge URL without changing the raw object key. */
 export function getR2Url(bucket: R2Bucket, key: string): string { return `${bucketDomain(bucket)}/${encodedKey(objectKey(key))}`; }
 
-export async function uploadToR2(bucket: R2Bucket, key: string, data: Buffer | Uint8Array, contentType = 'audio/wav'): Promise<string> {
+export async function uploadToR2(
+  bucket: R2Bucket,
+  key: string,
+  data: Buffer | Uint8Array,
+  contentType = 'audio/wav',
+  cacheControl?: string
+): Promise<string> {
   const cleanKey = objectKey(key);
   const url = apiUrl(bucket, cleanKey);
   if (!(data instanceof Uint8Array) || !data.byteLength || data.byteLength > MAX_OBJECT_BYTES) throw new Error('Invalid or oversized R2 upload body');
   if (typeof contentType !== 'string' || !/^[\w!#$&^.+-]+\/[\w!#$&^.+-]+(?:\s*;[^\r\n]*)?$/.test(contentType)) throw new Error('Invalid upload content type');
-  await request(url, { method: 'PUT', headers: { Authorization: `Bearer ${cfToken()}`, 'Content-Type': contentType }, body: data as any }, async res => {
-    const result = await providerResult(res, `Failed to upload object to R2 bucket "${bucket}"`);
-    if (!result.result || result.result.key !== cleanKey) throw new Error('R2 upload did not acknowledge the requested object');
-  });
+  const maxAttempts = process.env.VITEST ? 1 : 3;
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await request(
+        url,
+        {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${cfToken()}`,
+            'Content-Type': contentType,
+            ...(cacheControl ? { 'Cache-Control': cacheControl } : {}),
+          },
+          body: data as any,
+        },
+        async res => {
+          const result = await providerResult(res, `Failed to upload object to R2 bucket "${bucket}"`);
+          if (!result.result || result.result.key !== cleanKey) throw new Error('R2 upload did not acknowledge the requested object');
+        }
+      );
+      lastError = null;
+      break;
+    } catch (err: any) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      const retryable = /Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout|timed out|10001/i.test(lastError.message);
+      if (!retryable || attempt >= maxAttempts) throw lastError;
+      await new Promise((r) => setTimeout(r, attempt * 800));
+    }
+  }
+  if (lastError) throw lastError;
   const destination = `${bucketDomain(bucket)}/${encodedKey(cleanKey)}`;
   if (!process.env.VITEST && (bucket === 'versions' || bucket === 'songs') && /^audio\//i.test(contentType)) {
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
@@ -298,6 +330,25 @@ export async function persistAudioToR2(bucket: R2Bucket, key: string, sourceUrl:
     return destination;
   }
   return uploadToR2(bucket, key, buffer, contentType);
+}
+
+export async function readFromR2(bucket: R2Bucket, key: string): Promise<{ buffer: Buffer; contentType: string }> {
+  const cleanKey = objectKey(key);
+  const url = useAuthenticatedR2Read() ? apiUrl(bucket, cleanKey) : getR2Url(bucket, cleanKey);
+  const headers: Record<string, string> = useAuthenticatedR2Read()
+    ? { Authorization: `Bearer ${cfToken()}` }
+    : {};
+  return request(url, { method: 'GET', headers }, async (res) => {
+    if (!res.ok) {
+      throw new Error(`Failed to read object from R2 bucket "${bucket}": ${res.status} ${res.statusText}`);
+    }
+    const contentType = res.headers.get('content-type') || 'application/octet-stream';
+    const buffer = Buffer.from(await res.arrayBuffer());
+    if (!buffer.byteLength || buffer.byteLength > MAX_OBJECT_BYTES) {
+      throw new Error('Empty or oversized R2 object');
+    }
+    return { buffer, contentType };
+  });
 }
 
 export async function deleteFromR2(bucket: R2Bucket, key: string): Promise<boolean> {

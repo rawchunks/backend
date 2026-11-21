@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: api
-          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/backend@sha256:64f152deafe836aa8986ae2a7f8138d8a93d745315139dbf3b805d26de3f2a21
+          image: us-east1-docker.pkg.dev/gen-lang-client-0035632562/compose/backend@sha256:082b632c707df9ae7f5dfc3cd98d8c9f31fc0e27eb768a41ea869748e8254d11
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 3005
@@ -80,6 +80,21 @@ spec:
                 secretKeyRef:
                   name: backend-secrets
                   key: CARTESIA_API_KEY
+            - name: NETWORK_MODE
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: NETWORK_MODE
+            - name: THIRDWEB_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: THIRDWEB_CLIENT_ID
+            - name: THIRDWEB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: THIRDWEB_WEBHOOK_SECRET
             - name: RAWCHUNKS_TREASURY_ADDRESS
               valueFrom:
                 secretKeyRef:

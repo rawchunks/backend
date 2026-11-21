@@ -2,11 +2,11 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   getWalletPair: vi.fn(), putWalletPair: vi.fn(), getUserConsent: vi.fn(), putUserConsent: vi.fn(), checkUserConsent: vi.fn(),
-  getSongById: vi.fn(), listSongsByCreator: vi.fn(), listAllSongs: vi.fn(), getFullSongProject: vi.fn(), updateSong: vi.fn(), deleteSong: vi.fn(),
+  getSongById: vi.fn(), listSongsByCreator: vi.fn(), listAllSongs: vi.fn(), getFullSongProject: vi.fn(), updateSong: vi.fn(), deleteSong: vi.fn(), preserveLicensedRemixesBeforeDelete: vi.fn(),
   listStemsBySong: vi.fn(), listTakesBySong: vi.fn(), deleteTake: vi.fn(),
 }));
 vi.mock('../../databases/users.js', async original => ({ ...await original<any>(), ...mocks, readTake: async () => ({ song: { id: 'song-1' } }) }));
-vi.mock('../../databases/songs.js', () => mocks);
+vi.mock('../../databases/songs.js', async original => ({ ...await original<any>(), ...mocks }));
 vi.mock('../../databases/stems.js', () => mocks);
 vi.mock('../../databases/takes.js', () => mocks);
 import { databaseRouter } from '../../databases/router.js';
@@ -14,6 +14,7 @@ const evm = `0x${'a'.repeat(40)}`;
 const svm = 'So11111111111111111111111111111111111111112';
 let app: FastifyInstance;
 beforeEach(async () => {
+  process.env.NETWORK_MODE = 'testnet';
   for (const fn of Object.values(mocks)) fn.mockReset();
   mocks.putWalletPair.mockResolvedValue({ evmAddress: evm, svmAddress: svm });
   mocks.getWalletPair.mockResolvedValue({ evmAddress: evm, svmAddress: svm });

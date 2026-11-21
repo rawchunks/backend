@@ -27,6 +27,7 @@ function result(table: any, record: Record<string, unknown>) {
 const query = (index = 0) => mocks.driver.mock.calls[index][0] as string;
 const params = (index = 0) => mocks.driver.mock.calls[index][1] as unknown[];
 beforeEach(() => {
+  process.env.NETWORK_MODE = 'testnet';
   mocks.driver.mockReset().mockResolvedValue({ rows: [], rowCount: 0 });
   mocks.userSql.mockReset().mockResolvedValue([]);
 });
@@ -105,12 +106,16 @@ describe('song and voice read/filter/update behavior', () => {
     await listAllSongs();
     expect(query()).toContain('coalesce("songs"."published_at", "songs"."created_at") desc');
     expect(query()).not.toContain(' limit ');
-    expect(params()).toEqual([true]);
+    expect(params()).toEqual([true, 'eip155:84532', 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1', 'eip155:42431']);
   });
-  it('forwards an explicit song limit', async () => { await listAllSongs(3); expect(params()).toEqual([true, 3]); });
+  it('forwards an explicit song limit', async () => {
+    await listAllSongs(3);
+    expect(params()).toEqual([true, 'eip155:84532', 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1', 'eip155:42431', 3]);
+  });
   it('binds a requested catalog limit and offset', async () => {
-    await listAllSongs(5, 10); expect(params()).toEqual([true, 5, 10]);
-    expect(query()).toContain('limit $2 offset $3');
+    await listAllSongs(5, 10);
+    expect(params()).toEqual([true, 'eip155:84532', 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1', 'eip155:42431', 5, 10]);
+    expect(query()).toContain('limit $5 offset $6');
   });
   it('binds explicitly requested creator pagination', async () => {
     await listSongsByCreator(evm, 5, 10); expect(params()).toEqual([evm.toLowerCase(), 5, 10]);
@@ -121,10 +126,14 @@ describe('song and voice read/filter/update behavior', () => {
     mocks.driver.mockClear(); await listVoicesByCreator(svm); expect(params()).toEqual([svm]);
   });
   it.each([[updateSong, songs, song, { title: 'Renamed' }], [updateVoice, voices, voice, { status: 'training' }]])('updates a bound ID and returns decoded row', async (update, table, fixture, changes) => {
+    if (update === updateSong) {
+      mocks.driver.mockResolvedValueOnce(result(table, fixture));
+    }
     mocks.driver.mockResolvedValueOnce(result(table, { ...fixture, ...changes }));
     expect(await (update as any)(fixture.id, changes)).toMatchObject(changes);
-    expect(query()).toMatch(/^update "/);
-    expect(params()).toContain(fixture.id);
+    const updateIdx = update === updateSong ? 1 : 0;
+    expect(query(updateIdx)).toMatch(/^update "/);
+    expect(params(updateIdx)).toContain(fixture.id);
   });
   it.each([updateSong, updateVoice])('returns null for updating a missing row', async (update) => {
     expect(await (update as any)('missing', { name: 'x', title: 'x' })).toBeNull();
