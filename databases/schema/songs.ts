@@ -1,6 +1,11 @@
 import { pgTable, text, integer, real, boolean, timestamp, jsonb, bigint, index, check, primaryKey } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
+export type Modes = {
+  testnet?: string;
+  mainnet?: string;
+};
+
 export const songs = pgTable('songs', {
   id: text('id').primaryKey(),
   title: text('title').notNull(),
@@ -9,8 +14,8 @@ export const songs = pgTable('songs', {
   basis: text('basis'),
   source: text('source'), // Original song ID if forked / remixed
   is_remix: boolean('is_remix').default(false).notNull(),
-  parent_chain_song_id: text('parent_chain_song_id'), // On-chain songId of parent song for remixes
-  creator: text('creator').notNull(), // User EVM address
+  parent_chain_song_id: text('parent_chain_song_id'), // Preserved on-chain parent ID if original source is deleted
+  creator: text('creator').notNull(), // User EVM or SVM address
   url: text('url').notNull(), // Master stereo audio URL
   licenses: integer('licenses').default(0).notNull(), // Amount of licenses minted/available
   stream_price: real('stream_price').default(0.02).notNull(), // $ per minute
@@ -23,11 +28,13 @@ export const songs = pgTable('songs', {
   vocal: jsonb('vocal').$type<string[]>().default([]).notNull(),
   metadata_cid: text('metadata_cid'), // IPFS Pinata CID for immutable decentralized metadata
   image: text('image'), // Album or song cover art URL / Data URL
+  video: text('video'), // Persisted silent background video URL (R2)
   album_id: text('album_id'), // Associated album ID
   public: boolean('public').default(false).notNull(),
-  network: text('network'),
-  chain_song_id: text('chain_song_id'),
-  tx_hash: text('tx_hash'),
+  testnet: text('testnet'),
+  mainnet: text('mainnet'),
+  chain_song_id: jsonb('chain_song_id').$type<Modes | null>(),
+  tx_hash: jsonb('tx_hash').$type<Modes | null>(),
   plays: integer('plays').default(0).notNull(),
   likes: integer('likes').default(0).notNull(),
   comments_count: integer('comments_count').default(0).notNull(),
@@ -39,6 +46,8 @@ export const songs = pgTable('songs', {
   index('songs_created_idx').on(table.created_at.desc()),
   index('songs_public_created_idx').on(table.created_at.desc()).where(sql`${table.public} = true`),
   index('songs_public_plays_idx').on(table.plays.desc(), table.created_at.desc()).where(sql`${table.public} = true`),
+  index('songs_testnet_public_idx').on(table.testnet, table.created_at.desc()).where(sql`${table.public} = true and ${table.testnet} is not null`),
+  index('songs_mainnet_public_idx').on(table.mainnet, table.created_at.desc()).where(sql`${table.public} = true and ${table.mainnet} is not null`),
   index('songs_family_idx').on(table.family, table.version),
   index('songs_basis_idx').on(table.basis),
   check('songs_values_check', sql`${table.version} > 0 and ${table.licenses} >= 0 and ${table.stream_price} >= 0 and ${table.stream_price} < 'Infinity'::real and ${table.license_price} >= 0 and ${table.license_price} < 'Infinity'::real and (${table.duration} is null or (${table.duration} >= 0 and ${table.duration} < 'Infinity'::real))`),

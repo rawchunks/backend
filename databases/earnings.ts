@@ -1,25 +1,34 @@
 import { createPublicClient, http } from 'viem';
 import { address as svmAddress, getAddressDecoder, getProgramDerivedAddress } from '@solana/kit';
+import type { FacilitatorChain } from '@compose-market/sdk/chains';
 import { songSql } from './client.js';
 import { resolveIdentityAddresses } from './users.js';
 import { listSongsByCreator } from './songs.js';
 import { cacheGet, cacheSet, cacheDel } from './cache.js';
 import { valkey } from '../broker/valkey.js';
-import { getComposeApiUrl } from '../broker/payment.js';
+import { getActiveNetworkSet, getActiveNetworks, getFacilitatorChains, getNetworkMode } from '../broker/payment.js';
+import type { Modes } from './schema/songs.js';
 
 const EARNINGS_CACHE_TTL = 45;
-const CHAINS_CACHE_KEY = 'earnings:compose:chains';
-const CHAINS_CACHE_TTL = 600;
 const CREATOR_SHARE_BPS = 8000n;
 const BPS_DENOMINATOR = 10000n;
 
-const DEFAULT_FACTORY_EVM = (process.env.FACTORY_ADDRESS || process.env.VITE_FACTORY_ADDRESS || '0x4Ac838b970D44AB9056b4201e9ED3c1Ce271545e') as `0x${string}`;
-const TEMPO_TESTNET_FACTORY_EVM = (process.env.TEMPO_TESTNET_FACTORY_ADDRESS || '0x76ab653224be0e5fb7ab6f8ba7fd23c0fb5e29e7') as `0x${string}`;
-const DEFAULT_FACTORY_SVM = process.env.FACTORY_PROGRAM_ID || process.env.VITE_FACTORY_PROGRAM_ID || 'EPKxVRtMaZbnoPgtpycYhXX7EGM3PzyCM36upmwJyenD';
-
 function resolveEvmFactoryAddress(network: string): `0x${string}` {
-  if (network === 'eip155:42431') return TEMPO_TESTNET_FACTORY_EVM;
-  return DEFAULT_FACTORY_EVM;
+  if (network === 'eip155:42431') {
+    const tempoAddr = process.env.TEMPO_TESTNET_FACTORY_ADDRESS?.trim();
+    return (tempoAddr || '0x76ab653224be0e5fb7ab6f8ba7fd23c0fb5e29e7') as `0x${string}`;
+  }
+  const addr = (process.env.LICENSE_FACTORY_ADDRESS || process.env.FACTORY_ADDRESS || process.env.VITE_FACTORY_ADDRESS || '0x4Ac838b970D44AB9056b4201e9ED3c1Ce271545e').trim();
+  return addr as `0x${string}`;
+}
+
+function resolveSolanaFactoryProgramId(): string | null {
+  const mode = getNetworkMode();
+  const raw =
+    mode === 'mainnet'
+      ? process.env.VITE_FACTORY_PROGRAM_ID || process.env.FACTORY_PROGRAM_ID
+      : process.env.VITE_DEVNET_FACTORY_PROGRAM_ID || process.env.FACTORY_PROGRAM_ID;
+  return raw?.trim() || null;
 }
 
 const FACTORY_GET_SONG_ABI = [
@@ -158,15 +167,6 @@ export interface CreatorEarningsResponse {
   events: EarningEventItem[];
 }
 
-interface ComposeChainInfo {
-  id: number | string;
-  caip2?: string;
-  name: string;
-  type: 'evm' | 'solana';
-  rpcUrl: string;
-  explorer?: string;
-}
-
 function normalizeCreator(addr: string): string {
   const trimmed = addr.trim();
   return trimmed.startsWith('0x') ? trimmed.toLowerCase() : trimmed;
@@ -245,74 +245,29 @@ function matchesNetworkFilter(network: string | null | undefined, filter?: strin
   return family === f;
 }
 
-async function getComposeChains(): Promise<Map<string, ComposeChainInfo>> {
-  const cached = await cacheGet<ComposeChainInfo[]>(CHAINS_CACHE_KEY, 60_000);
-  if (cached && Array.isArray(cached) && cached.length > 0) {
-    const map = new Map<string, ComposeChainInfo>();
-    for (const c of cached) {
-      const caip = c.caip2 || (c.type === 'evm' ? `eip155:${c.id}` : `solana:${c.id}`);
-      map.set(caip, c);
-    }
-    return map;
-  }
-
-  const map = new Map<string, ComposeChainInfo>();
+async function getActiveChainMap(): Promise<Map<string, FacilitatorChain>> {
+  const map = new Map<string, FacilitatorChain>();
   try {
-    const res = await fetch(`${getComposeApiUrl()}/api/chains`, {
-      headers: { accept: 'application/json' },
-      signal: AbortSignal.timeout(5000),
-    });
-    if (res.ok) {
-      const body = (await res.json()) as { chains?: ComposeChainInfo[] };
-      const list = Array.isArray(body?.chains) ? body.chains : [];
-      if (list.length > 0) {
-        await cacheSet(CHAINS_CACHE_KEY, list, CHAINS_CACHE_TTL);
-        for (const c of list) {
-          const caip = c.caip2 || (c.type === 'evm' ? `eip155:${c.id}` : `solana:${c.id}`);
-          map.set(caip, c);
-        }
-      }
+    const chains = await getFacilitatorChains();
+    for (const chain of chains) {
+      map.set(chain.network, chain);
     }
   } catch {
-    // Non-fatal; fallback RPC URLs below handle offline facilitator
+    // Facilitator temporarily unreachable; DB earnings still render without on-chain RPC augmentation
   }
   return map;
 }
 
-function resolveRpcUrl(network: string, chains: Map<string, ComposeChainInfo>): string | null {
-  const chain = chains.get(network);
-  if (chain?.rpcUrl) return chain.rpcUrl;
-  const qnUrl = process.env.QUICKNODE_RPC_URL?.trim();
-  if (network === 'eip155:84532') return process.env.BASE_SEPOLIA_RPC_URL || qnUrl || 'https://sepolia.base.org';
-  if (network === 'eip155:8453') return process.env.BASE_RPC_URL || qnUrl || 'https://mainnet.base.org';
-  if (network === 'eip155:42431') return process.env.TEMPO_TESTNET_RPC_URL || 'https://rpc.moderato.tempo.xyz';
-  if (network.startsWith('solana:')) {
-    return network.includes('EtWTRAB')
-      ? (process.env.SOLANA_DEVNET_RPC_URL || 'https://api.devnet.solana.com')
-      : (process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com');
-  }
-  return null;
-}
-
-function resolveExplorerTxUrl(network: string | null, txHash: string | null, chains: Map<string, ComposeChainInfo>): string | null {
+function resolveExplorerTxUrl(
+  network: string | null,
+  txHash: string | null,
+  chains: Map<string, FacilitatorChain>,
+): string | null {
   if (!network || !txHash) return null;
   const chain = chains.get(network);
-  const base = chain?.explorer
-    || (network === 'eip155:84532'
-      ? 'https://sepolia.basescan.org'
-      : network === 'eip155:8453'
-        ? 'https://basescan.org'
-        : network === 'eip155:42431'
-          ? 'https://explore.tempo.xyz'
-          : network.startsWith('solana:')
-            ? 'https://explorer.solana.com'
-            : null);
-  if (!base) return null;
-  if (network.startsWith('solana:')) {
-    const cluster = network.includes('EtWTRAB') ? '?cluster=devnet' : '';
-    return `${base.replace(/\/+$/, '')}/tx/${txHash}${cluster}`;
-  }
-  return `${base.replace(/\/+$/, '')}/tx/${txHash}`;
+  if (!chain?.explorer) return null;
+  const query = chain.explorerQuery ? `?${chain.explorerQuery.replace(/^\?/, '')}` : '';
+  return `${chain.explorer.replace(/\/+$/, '')}/tx/${txHash}${query}`;
 }
 
 export async function recordSongEarning(input: RecordSongEarningInput): Promise<void> {
@@ -354,7 +309,13 @@ export async function recordSongEarning(input: RecordSongEarningInput): Promise<
       created_at = LEAST(song_earnings.created_at, EXCLUDED.created_at)
   `;
 
-  await cacheDel(`earnings:creator:${creator}`);
+  const idAddrs = await resolveIdentityAddresses(creator).catch(() => [creator]);
+  const sortedKey = Array.from(new Set([creator, ...idAddrs.map(normalizeCreator)])).sort().join(',');
+  await Promise.all([
+    cacheDel(`earnings:creator:${creator}`),
+    cacheDel(`earnings:v4:testnet:creator:${sortedKey}`),
+    cacheDel(`earnings:v4:mainnet:creator:${sortedKey}`),
+  ]);
 }
 
 interface OnChainSongState {
@@ -365,11 +326,13 @@ interface OnChainSongState {
 
 async function readEvmSongState(rpcUrl: string, network: string, chainSongId: string): Promise<OnChainSongState | null> {
   try {
+    const factoryAddress = resolveEvmFactoryAddress(network);
+    if (!factoryAddress) return null;
     const client = createPublicClient({
       transport: http(rpcUrl, { timeout: 5000 }),
     });
     const data = await client.readContract({
-      address: resolveEvmFactoryAddress(network),
+      address: factoryAddress,
       abi: FACTORY_GET_SONG_ABI,
       functionName: 'getSong',
       args: [BigInt(chainSongId)],
@@ -392,7 +355,9 @@ function encodeU64Le(val: bigint): Uint8Array {
 
 async function readSolanaSongState(rpcUrl: string, chainSongId: string): Promise<OnChainSongState | null> {
   try {
-    const programId = svmAddress(DEFAULT_FACTORY_SVM);
+    const rawProgramId = resolveSolanaFactoryProgramId();
+    if (!rawProgramId) return null;
+    const programId = svmAddress(rawProgramId);
     const [pda] = await getProgramDerivedAddress({
       programAddress: programId,
       seeds: [new TextEncoder().encode('song'), encodeU64Le(BigInt(chainSongId))],
@@ -433,13 +398,13 @@ async function syncValkeyStreamPayments(
 ): Promise<void> {
   try {
     const [activeIds, contextKeys] = await Promise.all([
-      valkey.smembers('rawchunks:payments').catch(() => [] as string[]),
-      valkey.keys('rawchunks:context:payment:*').catch(() => [] as string[]),
+      valkey.smembers('payments').catch(() => [] as string[]),
+      valkey.keys('context:payment:*').catch(() => [] as string[]),
     ]);
     const allKeys = Array.from(
       new Set([
         ...contextKeys,
-        ...activeIds.map((id) => (id.startsWith('rawchunks:context:') ? id : `rawchunks:context:${id}`)),
+        ...activeIds.map((id) => (id.startsWith('context:') ? id : `context:${id}`)),
       ]),
     );
     if (!allKeys.length) return;
@@ -483,7 +448,7 @@ async function syncValkeyStreamPayments(
         const normalizedCreator = state.creator ? normalizeCreator(state.creator) : songMeta?.creator;
         if (!normalizedCreator || (!creatorAddresses.has(normalizedCreator) && !songMeta)) return;
 
-        const sessionId = state.id || key.replace(/^rawchunks:context:/, '');
+        const sessionId = state.id || key.replace(/^context:/, '');
         const billedAtomics = toBigIntSafe(state.billedWei);
 
         let sumObligationGross = 0n;
@@ -515,14 +480,14 @@ async function syncValkeyStreamPayments(
         }
 
         const creatorShare = (totalGross * CREATOR_SHARE_BPS) / BPS_DENOMINATOR;
-        const network = lastNetwork || 'eip155:84532';
+        if (!lastNetwork || !getActiveNetworkSet().has(lastNetwork)) return;
         const earningId = state.holdId ? `crd:${state.holdId}` : `x402:${sessionId}`;
 
         await recordSongEarning({
           id: earningId,
           songId: state.songId,
           creator: normalizedCreator,
-          network,
+          network: lastNetwork,
           kind: 'stream',
           grossAtomics: totalGross,
           creatorAtomics: creatorShare,
@@ -593,12 +558,14 @@ async function syncCreditStreamHolds(
       }
       const startedAtMs = Number(row.context?.startedAt || 0);
       const createdAt = startedAtMs > 0 ? new Date(startedAtMs) : row.created_at;
+      const holdNetwork = row.context?.network || meta.network;
+      if (!holdNetwork || !getActiveNetworkSet().has(holdNetwork)) continue;
 
       await recordSongEarning({
         id: `crd:${row.id}`,
         songId,
         creator: meta.creator,
-        network: row.context?.network || meta.network || 'eip155:84532',
+        network: holdNetwork,
         kind: 'stream',
         grossAtomics: gross,
         creatorAtomics: creatorShare,
@@ -615,15 +582,20 @@ async function syncCreditStreamHolds(
 async function syncLicensedRemixEarnings(allSongIds: string[]): Promise<void> {
   if (!allSongIds.length) return;
   try {
+    const mode = getNetworkMode();
+    const activeSet = getActiveNetworkSet();
     const rows = await songSql`
       SELECT
         r.id AS remix_id,
         r.source AS song_id,
         r.creator AS payer,
-        r.tx_hash,
+        r.tx_hash AS remix_tx_hash,
+        r.testnet AS remix_testnet,
+        r.mainnet AS remix_mainnet,
         r.created_at,
         p.creator AS parent_creator,
-        COALESCE(r.network, p.network, 'eip155:84532') AS network,
+        p.testnet AS parent_testnet,
+        p.mainnet AS parent_mainnet,
         COALESCE(p.license_price, 0) AS license_price
       FROM songs r
       JOIN songs p ON p.id = r.source
@@ -635,25 +607,33 @@ async function syncLicensedRemixEarnings(allSongIds: string[]): Promise<void> {
       remix_id: string;
       song_id: string;
       payer: string;
-      tx_hash: string | null;
+      remix_tx_hash: Modes | null;
+      remix_testnet: string | null;
+      remix_mainnet: string | null;
       created_at: Date | string;
       parent_creator: string;
-      network: string;
+      parent_testnet: string | null;
+      parent_mainnet: string | null;
       license_price: number;
     }>) {
+      const network =
+        mode === 'mainnet'
+          ? r.remix_mainnet || r.parent_mainnet
+          : r.remix_testnet || r.parent_testnet;
+      if (!network || !activeSet.has(network)) continue;
       const gross = BigInt(Math.round(Number(r.license_price) * 1_000_000));
       if (gross <= 0n) continue;
       const creatorShare = (gross * CREATOR_SHARE_BPS) / BPS_DENOMINATOR;
       await recordSongEarning({
-        id: `lic:${r.remix_id}`,
+        id: `lic:${mode}:${r.remix_id}`,
         songId: r.song_id,
         creator: r.parent_creator,
-        network: r.network,
+        network,
         kind: 'license',
         grossAtomics: gross,
         creatorAtomics: creatorShare,
         streamedMs: 0n,
-        txHash: r.tx_hash,
+        txHash: r.remix_tx_hash?.[mode] ?? null,
         payer: r.payer,
         createdAt: r.created_at,
       });
@@ -667,10 +647,13 @@ export async function getCreatorEarnings(
   creatorInput: string,
   options?: { network?: string; refresh?: boolean },
 ): Promise<CreatorEarningsResponse> {
+  const mode = getNetworkMode();
+  const activeNetworks = [...getActiveNetworks()];
+  const activeSet = getActiveNetworkSet();
   const normalizedInput = normalizeCreator(creatorInput);
   const addresses = await resolveIdentityAddresses(normalizedInput);
   const normalizedAddresses = Array.from(new Set([normalizedInput, ...addresses.map(normalizeCreator)]));
-  const cacheKey = `earnings:v3:creator:${normalizedAddresses.slice().sort().join(',')}`;
+  const cacheKey = `earnings:v4:${mode}:creator:${normalizedAddresses.slice().sort().join(',')}`;
 
   let baseData: CreatorEarningsResponse | undefined;
   if (!options?.refresh) {
@@ -679,14 +662,16 @@ export async function getCreatorEarnings(
 
   if (!baseData) {
     const allCreatorSongs = await listSongsByCreator(normalizedInput);
-    const publishedSongs = allCreatorSongs.filter(
-      (s) => Boolean(s.public || s.chain_song_id || s.metadata_cid),
-    );
+    const publishedSongs = allCreatorSongs.filter((s) => {
+      const songNet = s[mode];
+      return Boolean(s.chain_song_id?.[mode] && songNet && activeSet.has(songNet));
+    });
     const songMap = new Map<string, { creator: string; network: string | null; streamPrice: number }>();
     for (const s of allCreatorSongs) {
+      const modeNet = s[mode];
       songMap.set(s.id, {
         creator: normalizeCreator(s.creator),
-        network: s.network || null,
+        network: modeNet && activeSet.has(modeNet) ? modeNet : null,
         streamPrice: Math.max(0, Number(s.stream_price || 0)),
       });
     }
@@ -700,23 +685,26 @@ export async function getCreatorEarnings(
       syncLicensedRemixEarnings(allSongIds),
     ]);
 
-    const chains = await getComposeChains();
+    const chains = await getActiveChainMap();
+    const modeCol = mode === 'mainnet' ? songSql`mainnet` : songSql`testnet`;
 
     const [rawEarningsRows, rawRemixRows] = allSongIds.length > 0
       ? await Promise.all([
-          songSql`
+        songSql`
             SELECT id, song_id, kind, creator_atomics, gross_atomics, streamed_ms, tx_hash, payer, network, created_at
             FROM song_earnings
             WHERE song_id = ANY(${allSongIds})
+              AND network = ANY(${activeNetworks})
             ORDER BY created_at DESC
           `,
-          songSql`
+        songSql`
             SELECT source, COUNT(DISTINCT creator)::int AS cnt
             FROM songs
             WHERE source = ANY(${allSongIds})
+              AND (${modeCol} IS NULL OR ${modeCol} = ANY(${activeNetworks}))
             GROUP BY source
           `,
-        ])
+      ])
       : [[], []];
 
     const dbEarningsRows = rawEarningsRows as Array<{
@@ -807,16 +795,18 @@ export async function getCreatorEarnings(
 
     await Promise.all(
       publishedSongs.map(async (song) => {
-        const network = song.network || null;
+        const network = song[mode] || null;
+        const chainSongId = song.chain_song_id?.[mode] || null;
+        const modeTxHash = song.tx_hash?.[mode] || null;
         const { family, label } = classifyNetwork(network);
         let onChain: OnChainSongState | null = null;
 
-        if (song.chain_song_id && network) {
-          const rpcUrl = resolveRpcUrl(network, chains);
+        if (chainSongId && network) {
+          const rpcUrl = chains.get(network)?.rpcUrl ?? null;
           if (rpcUrl) {
             onChain = network.startsWith('solana:')
-              ? await readSolanaSongState(rpcUrl, song.chain_song_id)
-              : await readEvmSongState(rpcUrl, network, song.chain_song_id);
+              ? await readSolanaSongState(rpcUrl, chainSongId)
+              : await readEvmSongState(rpcUrl, network, chainSongId);
           }
         }
 
@@ -862,7 +852,7 @@ export async function getCreatorEarnings(
           const unitGross = licensePriceAtomics;
           const unitCreator = (unitGross * CREATOR_SHARE_BPS) / BPS_DENOMINATOR;
           for (let idx = 0; idx < missingCount; idx++) {
-            const synId = `onc:lic:${song.id}:${licenseEntry.count + idx + 1}`;
+            const synId = `onc:lic:${mode}:${song.id}:${licenseEntry.count + idx + 1}`;
             const synCreatedAt = song.last_played_at || song.created_at || new Date();
             await recordSongEarning({
               id: synId,
@@ -873,7 +863,7 @@ export async function getCreatorEarnings(
               grossAtomics: unitGross,
               creatorAtomics: unitCreator,
               streamedMs: 0n,
-              txHash: song.tx_hash || null,
+              txHash: modeTxHash,
               createdAt: synCreatedAt,
             });
             if (!dbEarningsRows.some((r) => r.id === synId)) {
@@ -884,7 +874,7 @@ export async function getCreatorEarnings(
                 creator_atomics: unitCreator.toString(),
                 gross_atomics: unitGross.toString(),
                 streamed_ms: '0',
-                tx_hash: song.tx_hash || null,
+                tx_hash: modeTxHash,
                 payer: null,
                 network,
                 created_at: synCreatedAt,
@@ -958,7 +948,7 @@ export async function getCreatorEarnings(
           song.created_at ? new Date(song.created_at).getTime() : 0,
         );
 
-        const txHash = song.tx_hash || streamEntry.lastTxHash || licenseEntry.lastTxHash || null;
+        const txHash = modeTxHash || streamEntry.lastTxHash || licenseEntry.lastTxHash || null;
 
         songsRecord[song.id] = {
           songId: song.id,
@@ -968,7 +958,7 @@ export async function getCreatorEarnings(
           primaryGenre,
           durationSec,
           durationMs,
-          chainSongId: song.chain_song_id || null,
+          chainSongId,
           network,
           networkFamily: family,
           networkLabel: label,
@@ -1007,7 +997,8 @@ export async function getCreatorEarnings(
           : (creatorAtomics * BPS_DENOMINATOR) / CREATOR_SHARE_BPS;
       const feeAtomics = grossAtomics > creatorAtomics ? grossAtomics - creatorAtomics : 0n;
 
-      const net = row.network || songItem.network || 'eip155:84532';
+      const net = row.network || songItem.network;
+      if (!net || !activeSet.has(net)) continue;
       const { family, label } = classifyNetwork(net);
       let evStreamedMs = Number(toBigIntSafe(row.streamed_ms));
       if (row.kind === 'stream' && evStreamedMs <= 0 && songItem.streamPriceUsd > 0) {
@@ -1044,8 +1035,8 @@ export async function getCreatorEarnings(
 
     for (const songItem of Object.values(songsRecord)) {
       const extraPlays = Math.max(0, songItem.plays - songItem.streamSettlements);
-      if (extraPlays > 0) {
-        const net = songItem.network || 'eip155:84532';
+      const net = songItem.network;
+      if (extraPlays > 0 && net) {
         const perPlayMs = Math.min(songItem.durationMs, 35_000);
         const perPlayTotalUsd =
           songItem.streamPriceUsd > 0

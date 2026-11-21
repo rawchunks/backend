@@ -9,7 +9,7 @@ export const STARTER_SONG_ID = 'sng-95ee3b8a-e8a0-4f6d-bef4-69bac7528e35';
 
 const PAIR_L2_TTL_SEC = 3600;
 const PAIR_L1_TTL_MS = 300_000;
-const pairCacheKey = (addr: string) => `rawchunks:id:pair:${addr}`;
+const pairCacheKey = (addr: string) => `id:pair:${addr}`;
 
 export class RequestError extends Error {
   constructor(message: string, public readonly statusCode = 400) { super(message); }

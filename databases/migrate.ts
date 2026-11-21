@@ -72,6 +72,21 @@ export async function runMigrations() {
   // 2. Song Database Migrations
   console.log('Migrating Song Database (songs, stems, takes, commits)...');
   await songSql`
+    CREATE TABLE IF NOT EXISTS albums (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      creator TEXT NOT NULL,
+      description TEXT,
+      concept TEXT,
+      genre TEXT,
+      cover TEXT,
+      gallery JSONB DEFAULT '[]'::jsonb NOT NULL,
+      release_config JSONB DEFAULT '{}'::jsonb NOT NULL,
+      public BOOLEAN DEFAULT FALSE NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+    );
+  `;
+  await songSql`
     CREATE TABLE IF NOT EXISTS songs (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
@@ -93,51 +108,22 @@ export async function runMigrations() {
       mood JSONB DEFAULT '[]'::jsonb NOT NULL,
       vocal JSONB DEFAULT '[]'::jsonb NOT NULL,
       metadata_cid TEXT,
+      image TEXT,
+      video TEXT,
+      album_id TEXT REFERENCES albums(id) ON DELETE SET NULL,
       public BOOLEAN DEFAULT FALSE NOT NULL,
-      network TEXT,
-      chain_song_id TEXT,
-      tx_hash TEXT,
+      testnet TEXT,
+      mainnet TEXT,
+      chain_song_id JSONB,
+      tx_hash JSONB,
+      plays INTEGER DEFAULT 0 NOT NULL,
+      likes INTEGER DEFAULT 0 NOT NULL,
+      comments_count INTEGER DEFAULT 0 NOT NULL,
+      last_played_at TIMESTAMPTZ,
       published_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
     );
   `;
-  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS metadata_cid TEXT;`;
-  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS public BOOLEAN DEFAULT FALSE NOT NULL, ADD COLUMN IF NOT EXISTS network TEXT, ADD COLUMN IF NOT EXISTS chain_song_id TEXT, ADD COLUMN IF NOT EXISTS tx_hash TEXT, ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ;`;
-  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS family TEXT, ADD COLUMN IF NOT EXISTS basis TEXT;`;
-  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS is_remix BOOLEAN DEFAULT FALSE NOT NULL, ADD COLUMN IF NOT EXISTS parent_chain_song_id TEXT;`;
-  await songSql`UPDATE songs SET is_remix = TRUE WHERE source IS NOT NULL AND is_remix = FALSE;`;
-  await songSql`
-    UPDATE songs r
-    SET parent_chain_song_id = s.chain_song_id,
-        network = COALESCE(r.network, s.network)
-    FROM songs s
-    WHERE r.source = s.id
-      AND r.parent_chain_song_id IS NULL
-      AND s.chain_song_id IS NOT NULL;
-  `;
-  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS genres JSONB DEFAULT '[]'::jsonb NOT NULL, ADD COLUMN IF NOT EXISTS production JSONB DEFAULT '[]'::jsonb NOT NULL, ADD COLUMN IF NOT EXISTS mood JSONB DEFAULT '[]'::jsonb NOT NULL, ADD COLUMN IF NOT EXISTS vocal JSONB DEFAULT '[]'::jsonb NOT NULL;`;
-
-  await songSql`
-    CREATE TABLE IF NOT EXISTS albums (
-      id TEXT PRIMARY KEY,
-      title TEXT NOT NULL,
-      creator TEXT NOT NULL,
-      description TEXT,
-      concept TEXT,
-      genre TEXT,
-      cover TEXT,
-      gallery JSONB DEFAULT '[]'::jsonb NOT NULL,
-      release_config JSONB DEFAULT '{}'::jsonb NOT NULL,
-      public BOOLEAN DEFAULT FALSE NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
-    );
-  `;
-  await songSql`ALTER TABLE albums ADD COLUMN IF NOT EXISTS concept TEXT, ADD COLUMN IF NOT EXISTS genre TEXT, ADD COLUMN IF NOT EXISTS gallery JSONB DEFAULT '[]'::jsonb NOT NULL, ADD COLUMN IF NOT EXISTS release_config JSONB DEFAULT '{}'::jsonb NOT NULL;`;
-  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS image TEXT;`;
-  await songSql`UPDATE songs SET image = '' WHERE image = '/hero.png';`;
-  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS album_id TEXT REFERENCES albums(id) ON DELETE SET NULL;`;
-  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS plays INTEGER DEFAULT 0 NOT NULL, ADD COLUMN IF NOT EXISTS last_played_at TIMESTAMPTZ;`;
-  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS likes INTEGER DEFAULT 0 NOT NULL, ADD COLUMN IF NOT EXISTS comments_count INTEGER DEFAULT 0 NOT NULL;`;
 
   await songSql`
     CREATE TABLE IF NOT EXISTS comments (
@@ -208,30 +194,6 @@ export async function runMigrations() {
       AND se.kind = 'stream'
       AND se.streamed_ms = 0
       AND se.gross_atomics > 0;
-  `;
-
-  // Backfill license earnings from remix purchases where buyer != original creator
-  await songSql`
-    INSERT INTO song_earnings (
-      id, song_id, creator, network, kind, gross_atomics, creator_atomics, streamed_ms, tx_hash, payer, created_at
-    )
-    SELECT
-      'lic:' || r.id,
-      s.id,
-      CASE WHEN s.creator LIKE '0x%' THEN LOWER(s.creator) ELSE s.creator END,
-      COALESCE(r.network, s.network, 'eip155:84532'),
-      'license',
-      ROUND(GREATEST(COALESCE(s.license_price, 0), 0) * 1000000)::bigint,
-      ROUND(GREATEST(COALESCE(s.license_price, 0), 0) * 800000)::bigint,
-      0,
-      COALESCE(r.tx_hash, s.tx_hash),
-      r.creator,
-      r.created_at
-    FROM songs r
-    JOIN songs s ON s.id = r.source
-    WHERE LOWER(r.creator) <> LOWER(s.creator)
-      AND COALESCE(s.license_price, 0) > 0
-    ON CONFLICT (id) DO NOTHING;
   `;
 
   await songSql`
@@ -394,6 +356,7 @@ export async function runMigrations() {
   `;
   // Repair older installations as well as new CREATE TABLE definitions.
   await songSql`ALTER TABLE songs ALTER COLUMN duration DROP NOT NULL, ALTER COLUMN duration DROP DEFAULT;`;
+  await songSql`ALTER TABLE songs ADD COLUMN IF NOT EXISTS video TEXT;`;
   await songSql`ALTER TABLE voices ADD COLUMN IF NOT EXISTS sample_url TEXT, ADD COLUMN IF NOT EXISTS hash TEXT, ADD COLUMN IF NOT EXISTS source_song_id TEXT, ADD COLUMN IF NOT EXISTS canonical_id TEXT, ADD COLUMN IF NOT EXISTS task_id TEXT, ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb NOT NULL, ADD COLUMN IF NOT EXISTS training_group TEXT, ADD COLUMN IF NOT EXISTS error TEXT;`;
   await songSql`
     DO $$ BEGIN
@@ -464,6 +427,8 @@ export async function runMigrations() {
   await songSql`CREATE INDEX IF NOT EXISTS songs_created_idx ON songs (created_at DESC);`;
   await songSql`CREATE INDEX IF NOT EXISTS songs_public_created_idx ON songs (created_at DESC) WHERE public = true;`;
   await songSql`CREATE INDEX IF NOT EXISTS songs_public_plays_idx ON songs (plays DESC, created_at DESC) WHERE public = true;`;
+  await songSql`CREATE INDEX IF NOT EXISTS songs_testnet_public_idx ON songs (testnet, created_at DESC) WHERE public = true AND testnet IS NOT NULL;`;
+  await songSql`CREATE INDEX IF NOT EXISTS songs_mainnet_public_idx ON songs (mainnet, created_at DESC) WHERE public = true AND mainnet IS NOT NULL;`;
   await songSql`CREATE INDEX IF NOT EXISTS playlists_creator_created_idx ON playlists (creator, created_at DESC);`;
   await songSql`CREATE INDEX IF NOT EXISTS playlists_public_created_idx ON playlists (created_at DESC) WHERE public = true;`;
   await songSql`CREATE INDEX IF NOT EXISTS playlists_public_plays_idx ON playlists (plays DESC, created_at DESC) WHERE public = true;`;
