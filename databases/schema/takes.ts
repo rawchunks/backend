@@ -20,7 +20,7 @@ export interface AlignedLine {
 }
 
 export interface LyricsAlignment {
-  source: 'scribe_v2' | 'forced_alignment';
+  source: 'scribe' | 'aligned';
   updatedAt: string;
   lines: AlignedLine[];
   words: AlignedWord[];

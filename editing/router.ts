@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { service } from './service.js';
-import { generateStrudelPattern } from '../agents/strudel/service.js';
+import { generateStrudelPattern } from '../agents/composer/service.js';
 import { readSong, readTake, readUser, checkUser } from '../databases/users.js';
 import { songSql } from '../databases/client.js';
 import { uploadToR2, readAudio } from '../storage/r2.js';
@@ -690,35 +690,6 @@ export const editingRouter: FastifyPluginAsync = async (fastify) => {
     try {
       const history = await service.getTimelineHistory(songId);
       return reply.send(history);
-    } catch (err: any) {
-      return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({ error: err.message });
-    }
-  });
-
-  fastify.get('/lyrics/:songId', async (request, reply) => {
-    const { songId } = request.params as { songId: string };
-    const { language } = (request.query ?? {}) as { language?: string };
-    try {
-      const result = await service.getSongLyrics(songId, language);
-      return reply.send(result);
-    } catch (err: any) {
-      return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({ error: err.message });
-    }
-  });
-
-  fastify.post('/lyrics/:songId', async (request, reply) => {
-    const { songId } = request.params as { songId: string };
-    const body = (request.body ?? {}) as {
-      vocalLanguage?: string;
-      lyrics?: string;
-      mode?: 'extract' | 'align';
-    };
-    try {
-      const result = await service.extractSongLyrics(songId, body.vocalLanguage, {
-        mode: body.mode,
-        lyrics: body.lyrics,
-      });
-      return reply.send(result);
     } catch (err: any) {
       return reply.status(err instanceof z.ZodError ? 400 : err.statusCode || 500).send({ error: err.message });
     }

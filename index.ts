@@ -1,4 +1,4 @@
-import { recoverPayments } from './broker/payment.js';
+import { getNetworkMode, recoverPayments } from './broker/payment.js';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
@@ -7,10 +7,13 @@ import fastifySwaggerUi from '@fastify/swagger-ui';
 import * as dotenv from 'dotenv';
 import { resolve } from 'path';
 import { databaseRouter } from './databases/router.js';
+import { showcaseRouter } from './databases/showcase.js';
 import { generationRouter } from './generation/router.js';
 import { editingRouter } from './editing/router.js';
+import { scribeRouter } from './scribe/router.js';
+import { scribeQueue } from './scribe/service.js';
 import { vibeRouter } from './agents/vibe/router.js';
-import { strudelRouter } from './agents/strudel/router.js';
+import { strudelRouter } from './agents/composer/router.js';
 import voiceRoutes from './voice/index.js';
 import { voiceService } from './voice/service.js';
 import { runMigrations } from './databases/migrate.js';
@@ -19,6 +22,7 @@ import { valkey, closeSubscriptions } from './broker/valkey.js';
 import { creditsRouter } from './credits/router.js';
 import { creditStore } from './credits/store.js';
 import { PayPal } from './credits/paypal.js';
+import { Thirdweb } from './credits/thirdweb.js';
 import { installCreditBilling, recoverCreditServices } from './credits/billing.js';
 import { oauthRouter } from './oauth/router.js';
 
@@ -37,6 +41,7 @@ const app = Fastify({
 let databaseReady = false;
 
 async function main() {
+  const mode = getNetworkMode();
   if (process.env.CREDITS_ENABLED === 'true') installCreditBilling(app);
   // Ensure database tables exist
   try {
@@ -106,11 +111,19 @@ async function main() {
   // Register Namespaced Service Routes
   await app.register(optionsRouter, { prefix: '/api' });
   if (process.env.CREDITS_ENABLED === 'true') {
-    if (!process.env.THIRDWEB_CLIENT_ID || !process.env.CREDITS_IDENTITY_RPC_URL || !process.env.CREDITS_IDENTITY_FACTORY_ADDRESS) throw new Error('Credit ownership verification is not configured');
+    if (!process.env.THIRDWEB_CLIENT_ID || !process.env.CREDITS_IDENTITY_FACTORY_ADDRESS) {
+      throw new Error('Credit ownership verification is not configured');
+    }
+    if (mode === 'testnet' && (!process.env.PAYPAL_CLIENT_ID || !process.env.PAYPAL_CLIENT_SECRET || !process.env.COINFLOW_SANDBOX_API_KEY)) {
+      throw new Error('Testnet credit payment configuration is incomplete');
+    }
+    if (mode === 'mainnet' && !process.env.THIRDWEB_WEBHOOK_SECRET) {
+      throw new Error('Mainnet Thirdweb webhook secret is not configured');
+    }
     const credits = creditStore();
     await credits.migrate();
     await app.register(creditsRouter, { prefix: '/api' });
-    const paypal = new PayPal(credits);
+    const provider = mode === 'mainnet' ? new Thirdweb(credits) : new PayPal(credits);
     let recovering = false;
     const recover = async () => {
       if (recovering) return;
@@ -118,7 +131,7 @@ async function main() {
       try {
         const pending = await credits.tx(c => c.query("SELECT id FROM credit_operations WHERE environment=$1 AND kind='purchase' AND status='pending' AND created_at>now()-interval '3 days' ORDER BY created_at LIMIT 20", [credits.environment]));
         for (const row of pending.rows) {
-          try { await paypal.reconcile(row.id); }
+          try { await provider.reconcile(row.id); }
           catch { app.log.warn({ operationId: row.id }, 'Payment reconciliation will retry'); }
         }
         await recoverCreditServices();
@@ -138,12 +151,15 @@ async function main() {
   paymentRecovery.unref();
   app.addHook('onClose', async () => { clearInterval(paymentRecovery); });
   await app.register(databaseRouter, { prefix: '/api' });
+  await app.register(showcaseRouter, { prefix: '/api' });
   await app.register(generationRouter, { prefix: '/api/generation' });
   await app.register(editingRouter, { prefix: '/api/editing' });
   await app.register(vibeRouter, { prefix: '/api/vibe' });
   await app.register(vibeRouter, { prefix: '/vibe' });
   await app.register(strudelRouter, { prefix: '/api/strudel' });
   await app.register(strudelRouter, { prefix: '/strudel' });
+  await app.register(scribeRouter, { prefix: '/api/lyrics' });
+  await app.register(scribeRouter, { prefix: '/lyrics' });
   await app.register(voiceRoutes, { prefix: '/api/voices' });
   await app.register(voiceRoutes, { prefix: '/voices' });
   await app.register(oauthRouter, { prefix: '/api/oauth' });
@@ -195,7 +211,7 @@ async function main() {
     return forward(`/api/user/guides/${encodeURIComponent(req.params.address)}`)(req, reply);
   });
 
-  app.addHook('onClose', async () => { await voiceService.stop(); await closeSubscriptions(); await valkey.quit(); });
+  app.addHook('onClose', async () => { await scribeQueue.stop(); await voiceService.stop(); await closeSubscriptions(); await valkey.quit(); });
   const shutdown = () => {
     void app.close().catch(error => {
       app.log.error(error, 'Failed to drain API connections');
@@ -211,7 +227,10 @@ async function main() {
 
   try {
     await app.listen({ port: PORT, host: HOST });
-    if (databaseReady) voiceService.start();
+    if (databaseReady) {
+      voiceService.start();
+      scribeQueue.start();
+    }
     app.log.info(`RawChunks Backend running at http://${HOST}:${PORT}`);
   } catch (err) {
     app.log.error(err);

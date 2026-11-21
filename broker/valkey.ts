@@ -108,7 +108,7 @@ export interface SongWipState {
 
 export async function getWipState(songId: string): Promise<SongWipState | null> {
   assertId(songId);
-  const key = `rawchunks:wip:${songId}`;
+  const key = `wip:${songId}`;
   const raw = await valkeyWipsReader.get(key).catch(() => valkeyWips.get(key));
   if (!raw) return null;
   try {
@@ -128,13 +128,13 @@ export async function setWipState(songId: string, state: Omit<SongWipState, 'son
     songId,
     updatedAt: Date.now(),
   };
-  await valkeyWips.set(`rawchunks:wip:${songId}`, JSON.stringify(payload), 'EX', WIP_TTL_SECONDS);
+  await valkeyWips.set(`wip:${songId}`, JSON.stringify(payload), 'EX', WIP_TTL_SECONDS);
   return payload;
 }
 
 export async function deleteWipState(songId: string): Promise<boolean> {
   assertId(songId);
-  const removed = await valkeyWips.del(`rawchunks:wip:${songId}`);
+  const removed = await valkeyWips.del(`wip:${songId}`);
   return removed > 0;
 }
 
@@ -239,13 +239,13 @@ export async function setTaskContext(taskId: string, context: unknown, options: 
   assertId(taskId);
   const raw = JSON.stringify(context);
   if (raw === undefined) throw new Error('Task context is required');
-  const key = `rawchunks:context:${taskId}`;
+  const key = `context:${taskId}`;
   if (options.terminal) await valkey.set(key, raw, 'EX', retention);
   else await valkey.set(key, raw);
 }
 export async function getTaskContext<T>(taskId: string): Promise<T | null> {
   assertId(taskId);
-  const raw = await valkey.get(`rawchunks:context:${taskId}`);
+  const raw = await valkey.get(`context:${taskId}`);
   if (!raw) return null;
   try { return JSON.parse(raw) as T; }
   catch { throw new Error('Invalid task context'); }
@@ -267,7 +267,7 @@ else redis.call('SET', KEYS[2], ARGV[2]) end
 return 1`;
 export async function withJobLock<T>(resource: string, operation: (assertLease: JobLease) => Promise<T>): Promise<T> {
   assertId(resource);
-  const key = `rawchunks:lock:${resource}`;
+  const key = `lock:${resource}`;
   const token = randomUUID();
   const leaseMs = 120000;
   const deadline = Date.now() + leaseMs;
@@ -297,7 +297,7 @@ export async function withJobLock<T>(resource: string, operation: (assertLease: 
         const raw = JSON.stringify(context);
         if (raw === undefined) throw new Error('Task context is required');
         if (renewing) await renewing;
-        if (lost || await valkey.eval(saveContextScript, 2, key, `rawchunks:context:${taskId}`, token, raw, options.terminal ? '1' : '0', retention) !== 1) throw new Error('Finalization lease lost');
+        if (lost || await valkey.eval(saveContextScript, 2, key, `context:${taskId}`, token, raw, options.terminal ? '1' : '0', retention) !== 1) throw new Error('Finalization lease lost');
       },
     });
     const result = await operation(assertLease);
@@ -339,15 +339,15 @@ async function subscribeChannel(channel: string, message: (value: string) => voi
 }
 export async function subscribeTask(taskId: string, message: (value: string) => void, error: (error: Error) => void): Promise<() => Promise<void>> {
   assertId(taskId);
-  return subscribeChannel(`rawchunks:worker:events:${taskId}`, message, error);
+  return subscribeChannel(`worker:events:${taskId}`, message, error);
 }
 export async function subscribeVoice(voiceId: string, message: (value: string) => void, error: (error: Error) => void): Promise<() => Promise<void>> {
   assertId(voiceId);
-  return subscribeChannel(`rawchunks:voice:events:${voiceId}`, message, error);
+  return subscribeChannel(`voice:events:${voiceId}`, message, error);
 }
 export async function publishVoice(voiceId: string): Promise<void> {
   assertId(voiceId);
-  await valkey.publish(`rawchunks:voice:events:${voiceId}`, JSON.stringify({ voice_id: voiceId }));
+  await valkey.publish(`voice:events:${voiceId}`, JSON.stringify({ voice_id: voiceId }));
 }
 export async function closeSubscriptions(): Promise<void> {
   for (const observers of subscriptions.values()) for (const observer of observers) observer.error(new Error('Server is shutting down'));
@@ -357,7 +357,7 @@ export async function closeSubscriptions(): Promise<void> {
 }
 
 function peakCacheKey(url: string): string {
-  return `rawchunks:peaks:${url}`;
+  return `peaks:${url}`;
 }
 
 export async function getCachedPeaks(
@@ -387,4 +387,90 @@ export async function setCachedPeaks(
   } catch {
     // Non-fatal cache write failure
   }
+}
+
+const SCRIBE_URGENT_KEY = 'queue:scribe:urgent';
+const SCRIBE_BACKFILL_KEY = 'queue:scribe:backfill';
+const SCRIBE_SET_KEY = 'queue:scribe:set';
+
+const enqueueScribeScript = `-- enqueue_scribe
+if ARGV[3] == '1' then redis.call('SET', KEYS[4], '1', 'EX', 3600) end
+if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 1 then
+  if ARGV[2] == 'urgent' then
+    local removed = redis.call('LREM', KEYS[2], 0, ARGV[1])
+    if removed > 0 then redis.call('RPUSH', KEYS[1], ARGV[1]) end
+  end
+  return 0
+end
+redis.call('SADD', KEYS[3], ARGV[1])
+if ARGV[2] == 'urgent' then
+  redis.call('RPUSH', KEYS[1], ARGV[1])
+else
+  redis.call('RPUSH', KEYS[2], ARGV[1])
+end
+return 1`;
+
+const dequeueScribeScript = `-- dequeue_scribe
+local id = redis.call('LPOP', KEYS[1])
+local tier = 'urgent'
+if not id then
+  id = redis.call('LPOP', KEYS[2])
+  tier = 'backfill'
+end
+if not id then return nil end
+return { id, tier }`;
+
+const finishScribeScript = `-- finish_scribe
+redis.call('SREM', KEYS[1], ARGV[1])
+redis.call('DEL', KEYS[2])
+return 1`;
+
+export async function enqueueScribe(
+  songId: string,
+  options?: { priority?: 'urgent' | 'backfill'; force?: boolean }
+): Promise<boolean> {
+  assertId(songId);
+  const priority = options?.priority ?? 'urgent';
+  const force = options?.force ? '1' : '0';
+  const added = await valkey.eval(
+    enqueueScribeScript,
+    4,
+    SCRIBE_URGENT_KEY,
+    SCRIBE_BACKFILL_KEY,
+    SCRIBE_SET_KEY,
+    `scribe:force:${songId}`,
+    songId,
+    priority,
+    force
+  );
+  return added === 1;
+}
+
+export async function dequeueScribe(): Promise<{ songId: string; tier: 'urgent' | 'backfill'; force: boolean } | null> {
+  const popped = (await valkey.eval(
+    dequeueScribeScript,
+    2,
+    SCRIBE_URGENT_KEY,
+    SCRIBE_BACKFILL_KEY
+  )) as [string, 'urgent' | 'backfill'] | null;
+  if (!popped || !Array.isArray(popped) || typeof popped[0] !== 'string') return null;
+  const [songId, tier] = popped;
+  const force = (await valkey.get(`scribe:force:${songId}`).catch(() => null)) === '1';
+  return { songId, tier, force };
+}
+
+export async function finishScribe(songId: string): Promise<void> {
+  assertId(songId);
+  await valkey
+    .eval(finishScribeScript, 2, SCRIBE_SET_KEY, `scribe:force:${songId}`, songId)
+    .catch(() => {});
+}
+
+export async function isScribePending(songId: string): Promise<boolean> {
+  assertId(songId);
+  const [queued, locked] = await Promise.all([
+    valkey.sismember(SCRIBE_SET_KEY, songId).catch(() => 0),
+    valkey.exists(`lock:scribe:${songId}`).catch(() => 0),
+  ]);
+  return queued === 1 || locked === 1;
 }

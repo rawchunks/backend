@@ -9,7 +9,7 @@ import { createStem, updateStemMixer, listStemsBySong } from '../databases/stems
 import { createCommit, listCommitsBySong } from '../databases/commits.js';
 import { persistAudioToR2, readAudio, uploadToR2 } from '../storage/r2.js';
 import { composeEdit, decodeWave, mixWaves, readWave, sliceWave, padWave, silentWave, getInMemoryPeaks } from './audio.js';
-import { transcribeVocalStemOnce, alignVocalStemLyrics, getSongLyricsStatus } from './scribe.js';
+import { scribeQueue } from '../scribe/service.js';
 
 export interface Edit {
   songId: string;
@@ -583,9 +583,7 @@ export class Service {
     }
     const vocalsStem = extracted.find((s: any) => s && typeof s.name === 'string' && s.name.toLowerCase() === 'vocals');
     if (vocalsStem?.url) {
-      void transcribeVocalStemOnce(ctx.params.songId, vocalsStem.url).catch((err) => {
-        console.warn(`[scribe] Background vocal stem transcription failed for song ${ctx.params.songId}:`, err);
-      });
+      await scribeQueue.enqueue(ctx.params.songId, { priority: 'urgent', force: true }).catch(() => {});
     }
     ctx.result = { status: 'ready', progress: 100, stems: ctx.extracted };
     await setTaskContext(taskId, ctx, { terminal: true }); return ctx.result;
@@ -692,6 +690,9 @@ export class Service {
         timeline_snapshot: { stems: mergedStems, takes: takes.filter(item => !consume?.includes(item.id)).map(item => item.id === takeId ? mergedTake : item.stem_id === targetStemId ? { ...item, is_active: false } : item), activeTakeId: takeId, action, provenance: finalTake.provenance, timestamp: new Date().toISOString() },
       };
       await guarded(assertLease, () => activateTake(songId, targetStemId, takeId, { stem: layer, consume, master, commit, url: finalTake.url, provenance: finalTake.provenance, duration: master ? finalTake.provenance?.outputDuration ?? undefined : undefined }));
+      if (master) {
+        void scribeQueue.enqueue(songId, { priority: 'urgent', force: true }).catch(() => {});
+      }
       return { success: true, activeTakeId: takeId, take: mergedTake, commit, versionState: action === 'merge' ? 'merged' : 'active' };
     });
   }
@@ -741,6 +742,7 @@ export class Service {
     const take = { id, song_id: songId, stem_id: master?.id ?? null, take_number: nextTake(takes), task: 'merge', model: candidates[0]?.model ?? 'daw-mixdown', prompt: null, lyrics: null, url, is_active: true, provenance };
     const commit = { id: `commit-${id}`, song_id: songId, user_address: address(userAddress ?? song.creator), parent_commit_id: commits[0]?.id ?? merge.commitId, message: 'Merged section', timeline_snapshot: { action: 'merge', activeTakeId: id, takes: candidates, provenance, timestamp: new Date().toISOString() } };
     await guarded(assertLease, () => activateTake(songId, master?.id ?? null, id, { take, consume, remaining, master: true, url, duration: provenance.outputDuration!, commit }));
+    void scribeQueue.enqueue(songId, { priority: 'urgent', force: true }).catch(() => {});
     return { success: true, activeTakeId: id, take, commit, versionState: 'merged' };
   }
 
@@ -756,44 +758,6 @@ export class Service {
 
   async updateTrackMixer(stemId: string, mixer: { volume?: number; pan?: number; is_muted?: boolean; is_solo?: boolean }) {
     return updateStemMixer(stemId, mixer);
-  }
-
-  async getSongLyrics(songId: string, vocalLanguage?: string) {
-    return getSongLyricsStatus(songId, vocalLanguage);
-  }
-
-  async extractSongLyrics(
-    songId: string,
-    vocalLanguage?: string,
-    options?: { mode?: 'extract' | 'align'; lyrics?: string }
-  ) {
-    const stems = await listStemsBySong(songId);
-    const vocalsStem = stems.find((s) => s.name.toLowerCase() === 'vocals' && s.url);
-    const masterStem =
-      stems.find((s) => s.name.toLowerCase() === 'master' && s.url) ||
-      stems.find((s) => Boolean(s.url));
-    const song = !vocalsStem?.url && !masterStem?.url ? await getSongById(songId) : null;
-    const targetAudioUrl = vocalsStem?.url || masterStem?.url || song?.url;
-    if (!targetAudioUrl) {
-      throw failure('No audio available for lyrics processing', 409);
-    }
-    const mode = options?.mode ?? (options?.lyrics?.trim() ? 'align' : 'extract');
-    const res =
-      mode === 'align'
-        ? await alignVocalStemLyrics(songId, options?.lyrics, targetAudioUrl, {
-            force: true,
-            languageCode: vocalLanguage,
-          })
-        : await transcribeVocalStemOnce(songId, targetAudioUrl, {
-            force: true,
-            languageCode: vocalLanguage,
-          });
-    return {
-      lyrics: res?.lyrics ?? options?.lyrics ?? '',
-      vocalLanguage: res?.vocalLanguage ?? (vocalLanguage || 'en'),
-      alignment: res?.alignment ?? null,
-      status: res ? 'cached' : 'none',
-    };
   }
 
   async getTimelineHistory(songId: string) {

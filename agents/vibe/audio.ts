@@ -749,7 +749,7 @@ export async function transcribeAudioFast(
   if (elevenKey) {
     try {
       const form = new FormData();
-      form.append('model_id', 'scribe_v2');
+      form.append('model_id', 'scribe_v3');
       form.append('tag_audio_events', 'true');
       form.append('file', new Blob([new Uint8Array(buffer)], { type: mimeType }), `vibe.${ext}`);
 

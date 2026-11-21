@@ -6,7 +6,7 @@ import { createSong, finalizeSong, getSongById, countUntitledSongsByCreator } fr
 import { addSongToAlbum } from '../databases/albums.js';
 import { resolveVoice } from '../voice/service.js';
 import { persistAudioToR2 } from '../storage/r2.js';
-import { alignVocalStemLyrics, transcribeVocalStemOnce } from '../editing/scribe.js';
+import { scribeQueue } from '../scribe/service.js';
 import { partitionSongTags } from '../options.js';
 
 export interface Generate {
@@ -223,7 +223,6 @@ export class Service {
         title: index === 0 ? parent.title : `${parent.title} (Var ${index + 1})`,
         version: 1, source: index === 0 ? parent.source : songId, creator: parent.creator, url,
         is_remix: Boolean(parent.is_remix || parent.source),
-        parent_chain_song_id: parent.parent_chain_song_id ?? null,
         licenses: index === 0 ? parent.licenses : 0, stream_price: parent.stream_price, license_price: index === 0 ? parent.license_price : 0,
         duration: ctx.durations?.[index],
         tags: parent.genres?.length ? parent.genres : parent.tags,
@@ -233,11 +232,20 @@ export class Service {
         vocal: parent.vocal ?? [],
         image: parent.image, album_id: parent.album_id,
       }));
+      const isInstrumental = Boolean(ctx.submitted?.instrumental ?? ctx.dispatch?.instrumental);
       const versions = audioUrls.map((url, index) => ({
         id: `take-${identity}-${index + 1}`, song_id: songId, stem_id: master.id, take_number: index + 1,
         model: ctx.model, task: 'text2music', prompt: ctx.prompt || null, lyrics: ctx.lyrics || ctx.metas?.[index]?.lyrics || null,
         repainting_start: null, repainting_end: null, url, waveform_url: null, is_active: index === 0, seed: ctx.submitted?.seed ?? ctx.metas?.[index]?.seed ?? null,
-        provenance: { taskId, sourceUrl: url, sourceTakeId: null, sourceDuration: ctx.durations?.[index] ?? null, target: 'master' as const, targetStemId: master.id, region: null, outputDuration: ctx.durations?.[index] ?? null, parameters: { submitted: ctx.submitted ?? ctx.dispatch ?? {}, resolved: ctx.metas?.[index] ?? {}, ...(ctx.voice ? { voice: ctx.voice } : {}) } },
+        provenance: {
+          taskId, sourceUrl: url, sourceTakeId: null, sourceDuration: ctx.durations?.[index] ?? null, target: 'master' as const, targetStemId: master.id, region: null, outputDuration: ctx.durations?.[index] ?? null,
+          parameters: {
+            submitted: ctx.submitted ?? ctx.dispatch ?? {},
+            resolved: ctx.metas?.[index] ?? {},
+            ...(ctx.voice ? { voice: ctx.voice } : {}),
+            ...(isInstrumental ? { lyricsStatus: 'instrumental' } : {}),
+          },
+        },
       }));
       try {
         await guarded(assertLease, () => finalizeSong(songId, outputs, master, versions));
@@ -245,21 +253,8 @@ export class Service {
         if (urlsChanged || missingIndices.length > 0) await save();
         throw err;
       }
-      const isInstrumental = Boolean(ctx.submitted?.instrumental ?? ctx.dispatch?.instrumental);
-      const primaryLyrics = (ctx.lyrics || ctx.metas?.[0]?.lyrics || '').trim();
-      const vocalLanguage = ctx.submitted?.vocalLanguage || ctx.dispatch?.vocal_language || 'en';
       if (!isInstrumental && audioUrls[0]) {
-        if (primaryLyrics && primaryLyrics.toLowerCase() !== '[instrumental]') {
-          void alignVocalStemLyrics(songId, primaryLyrics, audioUrls[0], {
-            languageCode: vocalLanguage,
-            force: true,
-          }).catch(() => {});
-        } else {
-          void transcribeVocalStemOnce(songId, audioUrls[0], {
-            languageCode: vocalLanguage,
-            force: true,
-          }).catch(() => {});
-        }
+        await scribeQueue.enqueue(songId, { priority: 'urgent' }).catch(() => {});
       }
       const completedResult = {
         status: 'ready' as const, progress: 100, primaryUrl: audioUrls[0], audioUrls: ctx.audioUrls, songAId: songId,

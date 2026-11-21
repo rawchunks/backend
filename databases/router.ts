@@ -1,13 +1,14 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { getWalletPair, getWalletPairByAddressOrNickname, getWalletPairsByAddresses, putWalletPair, getUserConsent, putUserConsent, getUserGuides, putUserGuides, parseAddress, updateProfile, getFollowedCreators, getCreatorFollowStats, toggleCreatorFollow } from './users.js';
-import { listSongsByCreator, listAllSongs, getFullSongProject, updateSong, deleteSong, getSongById, createSong, copySong, queryPublicSongs, getMarketFolds, incrementSongPlay, getSongComments, addSongComment, deleteSongComment, getUserLikedSongIds, toggleSongLike } from './songs.js';
+import { listSongsByCreator, listAllSongs, getFullSongProject, updateSong, deleteSong, getSongById, createSong, copySong, queryPublicSongs, getMarketFolds, incrementSongPlay, getSongComments, addSongComment, deleteSongComment, getUserLikedSongIds, toggleSongLike, isPublicInMode, projectSongs, type MarketFoldsResponse } from './songs.js';
+import type { NewSong } from './schema/songs.js';
 import * as songsModule from './songs.js';
 import { randomUUID } from 'node:crypto';
 import { listStemsBySong } from './stems.js';
 import { listTakesBySong, deleteTake } from './takes.js';
 import { RequestError, readUser, readSong, readTake, checkUser, checkUserOrPair } from './users.js';
-import { requireSessionPayment, extractSessionToken, parseComposeToken, PaymentError, settleStreamCheckpoint, type SessionPaymentConfig } from '../broker/payment.js';
+import { requireSessionPayment, extractSessionToken, parseComposeToken, PaymentError, settleStreamCheckpoint, getNetworkMode, type SessionPaymentConfig } from '../broker/payment.js';
 import { waitForInFlightAudio } from '../storage/r2.js';
 import {
   createAlbum,
@@ -96,7 +97,7 @@ const listQuery = z.object({
 const consentQuery = z.object({ version: text.optional(), type: text.optional() });
 const songPatch = z.object({
   title: text.optional(), version: z.number().int().positive().optional(), source: text.nullable().optional(),
-  is_remix: z.boolean().optional(), parent_chain_song_id: text.nullable().optional(),
+  is_remix: z.boolean().optional(),
   url: text.optional(), licenses: z.number().int().nonnegative().optional(),
   stream_price: z.number().finite().nonnegative().optional(), license_price: z.number().finite().nonnegative().optional(),
   duration: z.number().finite().nonnegative().nullable().optional(),
@@ -107,9 +108,33 @@ const songPatch = z.object({
   vocal: z.array(z.string()).optional(),
   metadata_cid: z.string().nullable().optional(),
   image: z.string().nullable().optional(),
+  video: z.string().nullable().optional(),
   album_id: z.string().nullable().optional(),
-  public: z.boolean().optional(), network: text.optional(), chain_song_id: text.optional(), tx_hash: text.optional(),
+  public: z.boolean().optional(),
+  network: text.nullable().optional(),
+  chain_song_id: text.nullable().optional(),
+  tx_hash: text.nullable().optional(),
 }).strict().refine(data => Object.keys(data).length > 0, 'At least one song field is required');
+
+async function projectOne<T extends Partial<NewSong>>(song: T) {
+  return (await projectSongs([song]))[0];
+}
+
+async function projectFolds(folds: MarketFoldsResponse) {
+  const [newReleasesSongs, popularSongs, genres, creators] = await Promise.all([
+    projectSongs(folds.newReleases.songs),
+    projectSongs(folds.popular.songs),
+    Promise.all(folds.genres.map(async group => ({ ...group, songs: await projectSongs(group.songs) }))),
+    Promise.all(folds.creators.map(async group => ({ ...group, songs: await projectSongs(group.songs) }))),
+  ]);
+  return {
+    ...folds,
+    newReleases: { ...folds.newReleases, songs: newReleasesSongs },
+    popular: { ...folds.popular, songs: popularSongs },
+    genres,
+    creators,
+  };
+}
 
 const albumReleaseConfigSchema = z.object({
   targetNetwork: z.string().nullable().optional(),
@@ -364,7 +389,7 @@ export const databaseRouter: FastifyPluginAsync = async app => {
         const rows = query.limit === undefined && query.offset === undefined
           ? await listSongsByCreator(query.creator)
           : await listSongsByCreator(query.creator, query.limit, query.offset);
-        return reply.send(rows);
+        return reply.send(await projectSongs(rows));
       }
       if (query.paginated === 'true' || query.sort || query.genre || query.search || query.sinceMinutes) {
         const result = await queryPublicSongs({
@@ -376,10 +401,11 @@ export const databaseRouter: FastifyPluginAsync = async app => {
           search: query.search,
           sinceMinutes: query.sinceMinutes,
         });
-        return reply.send(query.paginated === 'true' ? result : result.items);
+        const items = await projectSongs(result.items);
+        return reply.send(query.paginated === 'true' ? { ...result, items } : items);
       }
       const rows = query.limit === undefined && query.offset === undefined ? await listAllSongs() : await listAllSongs(query.limit, query.offset);
-      return reply.send(rows);
+      return reply.send(await projectSongs(rows));
     } catch (error) { return failure(request, reply, error, 'Failed to list songs'); }
   });
   app.get('/songs/new', async (request, reply) => {
@@ -394,7 +420,7 @@ export const databaseRouter: FastifyPluginAsync = async app => {
         search: query.search,
         sinceMinutes: query.sinceMinutes,
       });
-      return reply.send(result);
+      return reply.send({ ...result, items: await projectSongs(result.items) });
     } catch (error) { return failure(request, reply, error, 'Failed to list new songs'); }
   });
   app.get('/songs/popular', async (request, reply) => {
@@ -408,7 +434,7 @@ export const databaseRouter: FastifyPluginAsync = async app => {
         genre: query.genre,
         search: query.search,
       });
-      return reply.send(result);
+      return reply.send({ ...result, items: await projectSongs(result.items) });
     } catch (error) { return failure(request, reply, error, 'Failed to list popular songs'); }
   });
   app.get('/market/folds', async (request, reply) => {
@@ -417,7 +443,7 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       const foldLimit = limit ? Math.min(Math.max(Number(limit) || 50, 4), 100) : 50;
       const winMin = windowMinutes ? Number(windowMinutes) || 60 : 60;
       const folds = await getMarketFolds(foldLimit, winMin);
-      return reply.send(folds);
+      return reply.send(await projectFolds(folds));
     } catch (error) { return failure(request, reply, error, 'Failed to load market folds'); }
   });
   app.get('/genres/covers', async (request, reply) => {
@@ -457,22 +483,20 @@ export const databaseRouter: FastifyPluginAsync = async app => {
   app.get('/songs/:id', async (request, reply) => {
     try {
       const { id } = request.params as { id: string };
-      const existing = await getSongById(id);
-      if (existing && !existing.public) {
-        await readSong(request, id);
+      const creator = typeof (request.query as { creator?: string })?.creator === 'string'
+        ? (request.query as { creator?: string }).creator!.trim()
+        : undefined;
+      let existing = await getSongById(id);
+      if (!existing && 'getSongByTitleSlug' in songsModule && typeof songsModule.getSongByTitleSlug === 'function') {
+        existing = await songsModule.getSongByTitleSlug(id, creator);
       }
-      let project = await getFullSongProject(id);
-      if (!project?.song && 'getDeletedParentSongProject' in songsModule && typeof songsModule.getDeletedParentSongProject === 'function') {
-        project = await songsModule.getDeletedParentSongProject(id);
+      if (!existing) return reply.status(404).send({ error: 'Song not found' });
+      if (!isPublicInMode(existing)) {
+        await readSong(request, existing.id);
       }
-      if (!project?.song && 'getSongByTitleSlug' in songsModule && typeof songsModule.getSongByTitleSlug === 'function') {
-        const bySlug = await songsModule.getSongByTitleSlug(id);
-        if (bySlug) {
-          project = await getFullSongProject(bySlug.id);
-        }
-      }
+      const project = await getFullSongProject(existing.id);
       if (!project?.song) return reply.status(404).send({ error: 'Song not found' });
-      return reply.send(project);
+      return reply.send({ ...project, song: await projectOne(project.song) });
     } catch (error) { return failure(request, reply, error, 'Failed to retrieve song'); }
   });
 
@@ -583,9 +607,16 @@ export const databaseRouter: FastifyPluginAsync = async app => {
     try {
       const { id } = request.params as { id: string };
       await readSong(request, id);
-      const patch = songPatch.parse(request.body);
+      const { network, chain_song_id, tx_hash, ...rest } = songPatch.parse(request.body);
+      const mode = getNetworkMode();
+      const patch: Partial<NewSong> = {
+        ...rest,
+        ...(network !== undefined ? { [mode]: network } : {}),
+        ...(chain_song_id !== undefined ? { chain_song_id: chain_song_id ? { [mode]: chain_song_id } : null } : {}),
+        ...(tx_hash !== undefined ? { tx_hash: tx_hash ? { [mode]: tx_hash } : null } : {}),
+      };
       const updated = await updateSong(id, patch);
-      return updated ? reply.send(updated) : reply.status(404).send({ error: 'Song not found' });
+      return updated ? reply.send(await projectOne(updated)) : reply.status(404).send({ error: 'Song not found' });
     } catch (error) { return failure(request, reply, error, 'Failed to update song'); }
   });
   app.post('/songs/:id/remix', async (request, reply) => {
@@ -593,19 +624,23 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       const { id } = request.params as { id: string };
       const creator = readUser(request);
       const source = await requireSongReader(request, id);
+      const mode = getNetworkMode();
+      const sourceNetwork = source[mode];
+      const sourceChainSongId = source.chain_song_id?.[mode];
       if (source.source || source.is_remix) throw new RequestError('Remixes cannot be remixed', 409);
-      if (!source.chain_song_id || !source.network || !source.url) throw new RequestError('The source song has not been minted', 409);
+      if (!sourceChainSongId || !sourceNetwork || !source.url) throw new RequestError('The source song has not been minted', 409);
       const ensureOnly = Boolean((request.body as { ensureOnly?: boolean } | null | undefined)?.ensureOnly);
       if (ensureOnly) {
         const existingSongs = (await listSongsByCreator(creator)) || [];
         const existing = existingSongs.find((s) => s.source === source.id);
         if (existing) {
-          return reply.status(200).send(existing);
+          return reply.status(200).send(await projectOne(existing));
         }
       }
       const song = await createSong({
         id: `sng-${randomUUID()}`, title: source.title, source: source.id,
-        is_remix: true, parent_chain_song_id: source.chain_song_id,
+        is_remix: true,
+        parent_chain_song_id: sourceChainSongId,
         creator, url: source.url,
         duration: source.duration,
         tags: source.genres?.length ? source.genres : source.tags,
@@ -614,24 +649,25 @@ export const databaseRouter: FastifyPluginAsync = async app => {
         mood: source.mood,
         vocal: source.vocal,
         licenses: 0, image: source.image,
-        stream_price: source.stream_price, license_price: 0, network: source.network,
+        stream_price: source.stream_price, license_price: 0,
+        ...(mode === 'mainnet' ? { mainnet: sourceNetwork } : { testnet: sourceNetwork }),
       });
-      if (creator.toLowerCase() !== source.creator.toLowerCase() && (source.license_price ?? 0) > 0 && source.network) {
+      if (creator.toLowerCase() !== source.creator.toLowerCase() && (source.license_price ?? 0) > 0 && sourceNetwork) {
         const gross = BigInt(Math.round(Number(source.license_price) * 1_000_000));
         void recordSongEarning({
           id: `lic:${song.id}`,
           songId: source.id,
           creator: source.creator,
-          network: source.network,
+          network: sourceNetwork,
           kind: 'license',
           grossAtomics: gross,
           creatorAtomics: (gross * 8000n) / 10000n,
           streamedMs: 0n,
-          txHash: source.tx_hash || null,
+          txHash: source.tx_hash?.[mode] || null,
           payer: creator,
         }).catch(() => {});
       }
-      return reply.status(201).send(song);
+      return reply.status(201).send(await projectOne(song));
     } catch (error) { return failure(request, reply, error, 'Could not create remix'); }
   });
   app.delete('/songs/:id', async (request, reply) => {
@@ -653,7 +689,7 @@ export const databaseRouter: FastifyPluginAsync = async app => {
     try {
       const { id } = request.params as { id: string };
       await readSong(request, id);
-      return reply.status(201).send(await copySong(id));
+      return reply.status(201).send(await projectOne(await copySong(id)));
     } catch (error) { return failure(request, reply, error, 'Could not open a song version'); }
   });
   app.get('/songs/:id/takes', async (request, reply) => {
@@ -724,7 +760,7 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       const album = await getAlbumById(id);
       if (!album) return reply.status(404).send({ error: 'Album not found' });
       const songs = await getSongsByAlbum(id);
-      return reply.send({ ...album, songs });
+      return reply.send({ ...album, songs: await projectSongs(songs) });
     } catch (error) {
       return failure(request, reply, error, 'Failed to get album');
     }
@@ -818,7 +854,7 @@ export const databaseRouter: FastifyPluginAsync = async app => {
       const { id } = request.params as { id: string };
       const result = await getPlaylistWithSongs(id);
       if (!result.playlist) return reply.status(404).send({ error: 'Playlist not found' });
-      return reply.send({ ...result.playlist, songs: result.songs });
+      return reply.send({ ...result.playlist, songs: await projectSongs(result.songs) });
     } catch (error) {
       return failure(request, reply, error, 'Failed to retrieve playlist');
     }
